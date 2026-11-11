@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "music",
+  "name": "YouTube Music",
+  "description": "Your music player and library.",
+  "icon": "music",
+  "accent": "#ff375f",
+  "order": 10,
+  "runtime": "native",
+  "hasSettings": true,
+  "surface": "desktop",
+  "nativeEntry": "native/mod.rs"
+}

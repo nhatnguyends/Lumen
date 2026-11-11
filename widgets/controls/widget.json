@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "controls",
+  "name": "Control Center",
+  "description": "Display, HDR, audio and volume controls.",
+  "icon": "controls",
+  "accent": "#9cc8ff",
+  "order": 50,
+  "runtime": "native",
+  "hasSettings": true,
+  "surface": "desktop",
+  "nativeEntry": "native/mod.rs"
+}

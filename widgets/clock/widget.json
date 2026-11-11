@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "clock",
+  "name": "Clock",
+  "description": "Time and expressive clock faces.",
+  "icon": "clock",
+  "accent": "#ff974f",
+  "order": 40,
+  "runtime": "native",
+  "hasSettings": true,
+  "surface": "desktop",
+  "nativeEntry": "native/mod.rs"
+}

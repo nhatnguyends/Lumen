@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "calendar",
+  "name": "Calendar",
+  "description": "Your dates and events.",
+  "icon": "calendar",
+  "accent": "#34d399",
+  "order": 30,
+  "runtime": "native",
+  "hasSettings": true,
+  "surface": "desktop",
+  "nativeEntry": "native/mod.rs"
+}

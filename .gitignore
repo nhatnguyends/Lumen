@@ -1,0 +1,17 @@
+node_modules/
+out/
+release/
+.scratch/
+config/
+*.log
+.dotnet/
+tools/**/bin/
+tools/**/obj/
+wpf/**/bin/
+wpf/**/obj/
+wpf/**/publish/
+native-dock/target/
+share/
+__pycache__/
+.codex-attachments/
+*.lnk

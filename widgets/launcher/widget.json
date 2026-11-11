@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "launcher",
+  "name": "App Dock",
+  "description": "The glass app launcher.",
+  "icon": "launcher",
+  "accent": "#7c9cff",
+  "order": 0,
+  "runtime": "native",
+  "hasSettings": true,
+  "surface": "desktop",
+  "nativeEntry": "native/host.rs",
+  "nativeModule": "window"
+}

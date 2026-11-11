@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "notes",
+  "name": "Sticky Notes",
+  "description": "Quick notes on a glass board.",
+  "icon": "notes",
+  "accent": "#fbbf24",
+  "order": 20,
+  "runtime": "native",
+  "hasSettings": true,
+  "surface": "desktop",
+  "nativeEntry": "native/mod.rs"
+}
