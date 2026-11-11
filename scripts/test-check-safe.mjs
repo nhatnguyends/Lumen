@@ -30,6 +30,12 @@ test('discovered source packages receive the same safety checks', () => {
 test('native source is accepted when it contains no prohibited APIs', () => {
   assert.deepEqual(check('fn main() { println!("Local dock"); }'), [])
 })
+test('optional portable Python entry points receive safety checks', () => {
+  for (const file of ['scripts/portable_python/launch_lumen.py','scripts/portable_python/Launch Lumen.pyw']) {
+    assert.equal(check('SendInput()',file).length,1)
+    assert.equal(check('powershell.exe',file).length,1)
+  }
+})
 for (const api of ['SendInput', 'GetAsyncKeyState', 'PrintWindow', 'NetUserEnum', 'powershell.exe']) {
   test(`native source guard rejects ${api}`, () => {
     const result = check(`extern "system" { fn ${api}(); }`)

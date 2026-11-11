@@ -29,6 +29,16 @@ local edits. GitHub HTTPS release metadata/digests provide integrity; this is no
 an independently signed update feed. All six native widget implementations
 currently update together with Lumen. Independent binary plugins remain planned.
 
+## Optional Python launch (portable)
+
+The portable ZIP also includes optional Python entry files: run
+`python runtime/launch_lumen.py` from its extracted folder, or double-click
+`runtime/Launch Lumen.pyw` if Python is associated with `.pyw` files. This option
+requires installed Python 3.10+ but no pip packages, Rust or build tools. It still
+launches the same Rust `Lumen.exe` and does not change Windows security checks.
+Keep the executable and all runtime files together. Launcher logs are written
+to `config/logs/python-launcher.log`.
+
 ## Run from source
 
 Double-click **Launch Lumen.pyw**, or run:

@@ -1,7 +1,14 @@
-Native Rust Lumen for Windows x64: App Dock, Clock, Calendar, YouTube Music,
-Sticky Notes and Control Center, with shared glass surfaces and snap/fuse.
+Lumen 0.1.1 adds optional Python entry points to the native portable ZIP:
 
-**Portable:** download `Lumen-0.1.0-windows-x86_64.zip`, extract the complete ZIP
+- `python runtime/launch_lumen.py`
+- Double-click `runtime/Launch Lumen.pyw` with Python associated to `.pyw`.
+
+Python 3.10+ must be installed for this optional method. No pip packages or
+build tools are needed. Both entry points launch the same native `Lumen.exe`;
+keep the full ZIP extracted. This does not change Defender or enterprise policy.
+Direct `Lumen.exe` launch remains available without installing Python.
+
+**Portable:** download `Lumen-0.1.1-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

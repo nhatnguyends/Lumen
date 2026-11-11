@@ -54,6 +54,9 @@ def main():
     copy(ROOT / "resources/tray.png", "resources/tray.png")
     copy(ROOT / "native-dock/lumen.manifest", "resources/lumen.manifest")
     copy(ROOT / "native-dock/target/debug/music-bridge.cjs", "runtime/music-bridge.cjs")
+    # runtime/ is allowed by the original portable updater, preserving upgrades.
+    copy(ROOT / "scripts/portable_python/launch_lumen.py", "runtime/launch_lumen.py")
+    copy(ROOT / "scripts/portable_python/Launch Lumen.pyw", "runtime/Launch Lumen.pyw")
     node = Path(shutil.which("node"))
     copy(node, "runtime/node.exe")
     node_version = subprocess.check_output([str(node), "--version"], text=True).strip()
@@ -78,6 +81,7 @@ def main():
     for manifest in (ROOT / "widgets").glob("*/widget.json"):
         copy(manifest, manifest.relative_to(ROOT).as_posix())
     readme = """# Lumen portable\n\nExtract the entire ZIP to a writable folder, then double-click Lumen.exe.\nNo Python, Rust, Visual Studio or Node installation is needed. Node for the\noptional Music adapter is included; browser playback requires installed Chrome\nor Edge and internet access. Other widgets do not require a browser.\n\nTarget: Windows 10/11 x64. ARM64 native and 32-bit builds are not provided.\nThis build has not yet been certified on a clean Windows VM or other PCs.\n\nKeep the full folder together. User data is stored in config/ next to Lumen.exe.\nUse a folder you can write to, such as Downloads or your user tools folder,\nnot Program Files. Settings enable Start with Windows by default; you can turn\nit off. Moving the folder requires launching Lumen once to refresh that entry.\n\nGeneral Settings > Updates checks official GitHub Releases. Download update\nthen Restart and apply update. Settings, notes, browser profile and geometry\nare preserved. All six native widget implementations update with the app.\nIndependent downloadable native plugins are not implemented yet.\n\nThe package is not code-signed. Windows may show an unknown-publisher warning.\nSource and release notes: https://github.com/nhatnguyends/Lumen\n"""
+    readme += "\nOptional Python entry point (requires installed Python 3.10+):\nRun `python runtime/launch_lumen.py`, or double-click `runtime/Launch Lumen.pyw`\nif .pyw files are associated with Python. This starts the same Lumen.exe; keep\nit and all runtime files. It does not change Defender or company security policy.\nLogs: config/logs/python-launcher.log. No pip packages or source build required.\n"
     (destination / "README.md").write_text(readme, encoding="utf-8")
     files = {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
              for p in sorted(destination.rglob("*")) if p.is_file() and p.name != "lumen-portable.json"}

@@ -27,7 +27,7 @@ export function checkSafe(root = process.cwd()) {
       problems.push(`${rel}: PowerShell script is not allowed in safe mode`)
       return
     }
-    if (!/\.(ts|tsx|js|mjs|cjs|cs|xaml|py|rs|toml)$/i.test(file)) return
+    if (!/\.(ts|tsx|js|mjs|cjs|cs|xaml|py|pyw|rs|toml)$/i.test(file)) return
     const normalized = rel.replace(/\\/g, '/')
     const pythonHelper = normalized === 'tools/icon_extract.py' || normalized === 'tools/system_controls.py'
     const widgetPackage = normalized.startsWith('widgets/')
@@ -70,6 +70,7 @@ export function checkSafe(root = process.cwd()) {
   for(const name of ['run_lumen.py','run_lumen.pyw','Launch Lumen.pyw']) if(fs.existsSync(path.join(root,name))) inspect(path.join(root,name))
   if(fs.existsSync(path.join(root,'startup_windows.py'))) inspect(path.join(root,'startup_windows.py'))
   for(const name of ['build-portable.py','export-source.py','verify-portable.py','test-portable.py']) if(fs.existsSync(path.join(root,'scripts',name))) inspect(path.join(root,'scripts',name))
+  walk(path.join(root,'scripts','portable_python'))
   return problems
 }
 

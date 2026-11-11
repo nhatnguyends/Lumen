@@ -33,5 +33,12 @@ def main():
         assert '"type":"ready"' in bridge.stdout
         assert '"type":"error"' not in bridge.stdout
         print('Relocated portable smoke test passed without developer tools on PATH')
+        # Python is optional. Test both entry files from an unrelated cwd, with
+        # spaces in the extracted path and no developer tools available on PATH.
+        for entry in ['launch_lumen.py','Launch Lumen.pyw']:
+            launcher=subprocess.run([sys.executable,str(root/'runtime'/entry),'--smoke-test'],cwd=ROOT,env=env,capture_output=True,text=True,timeout=30)
+            assert launcher.returncode==0,launcher.stderr
+        assert 'native-dock-ready' in (root/'config/logs/python-launcher.log').read_text(encoding='utf-8')
+        print('Optional Python and .pyw portable launchers passed')
 
 if __name__=='__main__':main()
