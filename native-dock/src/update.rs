@@ -931,4 +931,15 @@ mod tests {
         let result = check(&temp.0);
         assert!(result.is_ok(), "{result:?}");
     }
+    #[test]
+    #[ignore = "Downloads the official portable release into a private fixture; never updates the user's app"]
+    fn live_portable_stage_and_apply() {
+        let temp=Temp::new();let (old,files)=fixture("0.0.0");write_fixture(&temp.0,&old,&files);
+        fs::create_dir_all(temp.0.join("config")).unwrap();fs::write(temp.0.join("config/notes.json"),"preserve fixture notes").unwrap();
+        let release=check(&temp.0).unwrap().expect("A stable official portable release must exist for this opt-in integration test");
+        stage(&temp.0,&release).unwrap();assert!(pending(&temp.0));
+        apply(&temp.0).unwrap();assert_eq!(installed_version(&temp.0),release.version);
+        assert_eq!(fs::read_to_string(temp.0.join("config/notes.json")).unwrap(),"preserve fixture notes");
+        assert!(!pending(&temp.0));assert!(updates(&temp.0).join("backup/Lumen.exe").is_file());
+    }
 }
