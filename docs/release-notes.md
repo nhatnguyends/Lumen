@@ -1,10 +1,9 @@
-Lumen 0.1.2 adds credits and open-source license acknowledgements:
+Lumen 0.1.3 updates the default appearance, glass effects, and drag/resize behavior:
 
-- Created by Nhat Ng. Lumen's original code is now MIT licensed.
-- General Settings → Credits & licenses opens the acknowledgements.
-- Portable and source packages include an exact dependency inventory and upstream
-  license texts, including Lucide/Feather icon notices and bundled runtime notices.
-- Thank you to every library author, maintainer and contributor supporting Lumen.
+- Liquid Glass and Desktop icon sync are enabled by default.
+- Updated default widget themes, sizes, blur, and tint settings across App Dock and widgets (without personal data).
+- Low Power Mode skips wallpaper backdrop updates while dragging or resizing widgets, refreshing once at the final position/size.
+- Fixed compositor `fade_list` background restoration outside the scrolled viewport range.
 
 Optional Python entry points remain available:
 
@@ -16,7 +15,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.2-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.3-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.
