@@ -623,6 +623,14 @@ impl Buffer {
         let stride = self.width as usize * 4;
         let min_y = ((top * self.dpi).floor() as i32 - 2).max(0) as usize;
         let max_y = ((bottom * self.dpi).ceil() as i32 + 2).min(self.height) as usize;
+        if min_y > 0 {
+            let end = (min_y * stride).min(size);
+            pixels[..end].copy_from_slice(&background[..end]);
+        }
+        if max_y < self.height as usize {
+            let start = (max_y * stride).min(size);
+            pixels[start..size].copy_from_slice(&background[start..size]);
+        }
         for y in min_y..max_y {
             let dip = (y as f32 + 0.5) / self.dpi;
             let t = ((dip - top) / 14.).min((bottom - dip) / 26.).clamp(0., 1.);
