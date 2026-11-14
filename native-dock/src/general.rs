@@ -44,7 +44,7 @@ impl Default for Config {
             floating: false,
             snap_fuse: true,
             start_with_windows: true,
-            low_power: false,
+            low_power: true,
             liquid_glass: true,
             position: None,
         }
