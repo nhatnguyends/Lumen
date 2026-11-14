@@ -1,6 +1,28 @@
 //! Coverflow proportions follow CoverflowPlayer.tsx / coverflow.css, with an
 //! app-owned card cache for rounded artwork, type and soft Y perspective.
 use super::*;
+use std::time::Instant;
+
+pub(super) const ANIM_DURATION: f32 = 0.34;
+
+#[derive(Clone, Copy)]
+pub(super) struct Transition {
+    pub offset: f32,
+    pub started: Instant,
+}
+impl Transition {
+    pub fn progress(self) -> f32 {
+        (self.started.elapsed().as_secs_f32() / ANIM_DURATION).clamp(0., 1.)
+    }
+    pub fn finished(self) -> bool {
+        self.progress() >= 1.
+    }
+    pub fn remaining(self) -> f32 {
+        let t = self.progress();
+        let ease = 1. - (1. - t).powi(3);
+        self.offset * (1. - ease)
+    }
+}
 pub(super) struct Layout {
     pub deck: [f32; 4],
     pub now: [f32; 4],
@@ -12,8 +34,7 @@ pub(super) fn layout(w: f32, h: f32, queue: bool) -> Option<Layout> {
     layout_with_top(w, h, queue, crate::settings_ui::widget_content_top(w, h))
 }
 fn layout_with_top(w: f32, h: f32, queue: bool, gallery_top: f32) -> Option<Layout> {
-    let wrapped = w < 480.;
-    let deck_height = if wrapped { 70. } else { 48. };
+    let deck_height = 64.;
     let queue_rows = if queue {
         ((h - 390.) / 85.).floor().clamp(1., 5.) as usize
     } else {
@@ -24,11 +45,7 @@ fn layout_with_top(w: f32, h: f32, queue: bool, gallery_top: f32) -> Option<Layo
     } else {
         0.
     };
-    let deck_width = if wrapped {
-        w - 56.
-    } else {
-        (w * 0.78).max(400.).min(w - 44.).min(680.)
-    };
+    let deck_width = (w * 0.50).clamp(220., 340.).min(w - 48.);
     let deck = [
         (w - deck_width) / 2.,
         h - 24. - deck_height - queue_height,
@@ -40,11 +57,7 @@ fn layout_with_top(w: f32, h: f32, queue: bool, gallery_top: f32) -> Option<Layo
         return None;
     }
     let card_width = (w * 0.39).min(gallery_height - 52.).min(360.);
-    let now = if wrapped {
-        [deck[0] + 10., deck[1] + 38., deck[2] - 10., deck[3] - 6.]
-    } else {
-        [deck[0] + 132., deck[1] + 5., deck[2] - 96., deck[3] - 5.]
-    };
+    let now = [deck[0] + 20., deck[1] + 8., deck[2] - 20., deck[1] + 20.];
     Some(Layout {
         deck,
         now,
@@ -53,34 +66,69 @@ fn layout_with_top(w: f32, h: f32, queue: bool, gallery_top: f32) -> Option<Layo
         queue_rows,
     })
 }
-fn deck_controls(w: f32, d: [f32; 4]) -> [[f32; 4]; 5] {
-    let by = d[1] + if w < 480. { 7. } else { 10. };
-    std::array::from_fn(|i| {
-        if w < 480. {
-            let inner = d[2] - d[0] - 32.;
-            let gap = (inner - 28. * 5.) / 4.;
-            let x = d[0] + 16. + i as f32 * (28. + gap);
-            [x, by, x + 28., by + 28.]
-        } else {
-            let x = match i {
-                0 => d[0] + 20.,
-                1 => d[0] + 56.,
-                2 => d[0] + 92.,
-                3 => d[2] - 84.,
-                _ => d[2] - 48.,
-            };
-            [x, by, x + 28., by + 28.]
-        }
-    })
+fn deck_controls(_w: f32, d: [f32; 4]) -> [[f32; 4]; 4] {
+    let by = d[1] + 26.;
+    let cx = (d[0] + d[2]) / 2.;
+    let side = 28.;
+    let gap = 12.;
+    [
+        [cx - side / 2. - (side + gap), by, cx + side / 2. - (side + gap), by + side],
+        [cx - side / 2., by, cx + side / 2., by + side],
+        [cx - side / 2. + (side + gap), by, cx + side / 2. + (side + gap), by + side],
+        [d[2] - 16. - side, by, d[2] - 16., by + side],
+    ]
+}
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+fn card_metrics(w: f32, card_width: f32, v: f32, inset: f32) -> (f32, f32, f32) {
+    let mag = v.abs();
+    let scale = if mag <= 1. {
+        lerp(1., 0.91, mag)
+    } else if mag <= 2. {
+        lerp(0.91, 0.78, mag - 1.)
+    } else {
+        lerp(0.78, 0.68, (mag - 2.).min(1.))
+    };
+    let squeeze = if mag <= 1. {
+        lerp(1., 0.89, mag)
+    } else if mag <= 2. {
+        lerp(0.89, 0.82, mag - 1.)
+    } else {
+        lerp(0.82, 0.76, (mag - 2.).min(1.))
+    };
+    let outer = (card_width * 0.94).min((w / 2. - inset - card_width * 0.78 * 0.82 / 2.).max(0.));
+    let t1 = (card_width * 0.55).min(outer * 0.65);
+    let travel = if mag <= 1. {
+        t1 * mag
+    } else if mag <= 2. {
+        lerp(t1, outer, mag - 1.)
+    } else {
+        outer + (mag - 2.) * (card_width * 0.18)
+    };
+    let cx = if v == 0. {
+        w / 2.
+    } else {
+        w / 2. + v.signum() * travel
+    };
+    (cx, scale, squeeze)
 }
 fn card_center(w: f32, card_width: f32, slot: i32, inset: f32) -> f32 {
-    let outer = (card_width * 0.94).min((w / 2. - inset - card_width * 0.78 * 0.82 / 2.).max(0.));
-    let travel = match slot.abs() {
-        0 => 0.,
-        1 => (card_width * 0.55).min(outer * 0.65),
-        _ => outer,
-    };
-    w / 2. + slot.signum() as f32 * travel
+    card_metrics(w, card_width, slot as f32, inset).0
+}
+pub(super) fn neighbor_index(selected: Option<usize>, len: usize, slot: i32) -> Option<usize> {
+    let index = selected? as i64 + slot as i64;
+    (index >= 0 && index < len as i64).then_some(index as usize)
+}
+pub(super) fn selected_index(playback: &Playback) -> Option<usize> {
+    if !playback.video_id.is_empty() {
+        playback
+            .queue
+            .iter()
+            .position(|t| t.video_id == playback.video_id)
+    } else {
+        playback.queue.iter().position(|t| t.selected)
+    }
 }
 impl State {
     pub(super) unsafe fn coverflow_content(&mut self, c: &Canvas, dc: HDC, w: f32, h: f32) {
@@ -88,71 +136,104 @@ impl State {
             self.compact_content(c, dc, w, h);
             return;
         };
-        let selected = self.playback.queue.iter().position(|t| {
-            t.selected
-                || (!self.playback.video_id.is_empty() && t.video_id == self.playback.video_id)
-        });
-        for slot in [-2i32, 2, -1, 1, 0] {
-            let scale = match slot.abs() {
-                0 => 1.,
-                1 => 0.91,
-                _ => 0.78,
+        let shift = self
+            .coverflow_anim
+            .filter(|a| !a.finished())
+            .map_or(0., |a| a.remaining());
+        let animating = shift.abs() > 0.001;
+        let selected = selected_index(&self.playback);
+        let range = if animating { -4..=4 } else { -2..=2 };
+        let mut cards = Vec::with_capacity(9);
+        for slot in range {
+            let v = slot as f32 + shift;
+            if v.abs() > 2.65 {
+                continue;
+            }
+            let (title, artist, art) = if slot == 0 {
+                (
+                    self.playback.title.clone(),
+                    self.playback.artist.clone(),
+                    self.playback.art.clone().unwrap_or_default(),
+                )
+            } else if let Some(track) = neighbor_index(selected, self.playback.queue.len(), slot)
+                .and_then(|i| self.playback.queue.get(i))
+            {
+                (
+                    track.title.clone(),
+                    track.artist.clone(),
+                    track.thumb.clone(),
+                )
+            } else {
+                continue; // No real queue neighbor: do not invent a duplicate sleeve.
             };
-            let squeeze = match slot.abs() {
-                0 => 1.,
-                1 => 0.89,
-                _ => 0.82,
-            };
+            cards.push((slot, v, title, artist, art));
+        }
+        // Always paint farthest cards first and center-most card last so cards
+        // never intersect or pop in Z-order while flowing between slots.
+        cards.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+        for (slot, v, title, artist, art) in &cards {
+            let (slot, v) = (*slot, *v);
+            let (cx, scale, squeeze) =
+                card_metrics(w, layout.card_width, v, 24. / self.content_scale);
             let card_w = layout.card_width * scale;
             let card_h = (layout.card_width + 52.) * scale;
-            let cx = card_center(w, layout.card_width, slot, 24. / self.content_scale);
-            let y = layout.center_y - card_h / 2. + slot.abs() as f32 * 2.;
+            let y = layout.center_y - card_h / 2. + v.abs() * 2.;
             let r = [
                 cx - card_w * squeeze / 2.,
                 y,
                 cx + card_w * squeeze / 2.,
                 y + card_h,
             ];
-            let (id, title, artist, art) = if slot == 0 {
-                (
-                    self.playback.video_id.clone(),
-                    self.playback.title.clone(),
-                    self.playback.artist.clone(),
-                    self.playback.art.clone().unwrap_or_default(),
-                )
+            let lean = if !animating {
+                slot.signum()
+            } else if v.abs() < 0.25 {
+                0
+            } else if v < 0. {
+                -1
             } else {
-                let Some(index) = selected.map(|i| i as i32 + slot).filter(|i| *i >= 0) else {
-                    continue;
-                };
-                let Some(track) = self.playback.queue.get(index as usize) else {
-                    continue;
-                };
-                (
-                    track.video_id.clone(),
-                    track.title.clone(),
-                    track.artist.clone(),
-                    track.thumb.clone(),
-                )
+                1
             };
-            let key = format!(
-                "card:{card_w:.2}:{card_h:.2}:{}:{slot}:{art}:{title}:{artist}:{}:{}",
+            let liquid = crate::glass::liquid_glass();
+            let mut key = format!(
+                "card:{card_w:.2}:{card_h:.2}:{}:{lean}:{art}:{title}:{artist}:{}:{}:{liquid}",
                 self.dpi,
                 self.surface_color(),
                 self.light
             );
+            // Reuse the existing sleeve raster while dragging or animating.
+            if self.moving || animating {
+                let suffix = format!(
+                    ":{lean}:{art}:{title}:{artist}:{}:{}:{liquid}",
+                    self.surface_color(),
+                    self.light
+                );
+                let any_lean = format!(
+                    ":{art}:{title}:{artist}:{}:{}:{liquid}",
+                    self.surface_color(),
+                    self.light
+                );
+                if let Some(cached) = self
+                    .card_cache
+                    .keys()
+                    .find(|k| k.ends_with(&suffix))
+                    .or_else(|| self.card_cache.keys().find(|k| k.ends_with(&any_lean)))
+                {
+                    key = cached.clone();
+                }
+            }
             if !self.card_cache.contains_key(&key) {
                 if let Some(image) = self.album_card(
                     r,
                     [card_w, card_h],
                     scale,
                     squeeze,
-                    slot.signum(),
-                    &art,
-                    &title,
-                    &artist,
+                    lean,
+                    art,
+                    title,
+                    artist,
                     w,
                 ) {
-                    if self.card_cache.len() >= 24 {
+                    if self.card_cache.len() >= 64 {
                         self.card_cache.clear();
                     }
                     self.card_cache.insert(key.clone(), image);
@@ -162,16 +243,71 @@ impl State {
                 let pad = shadow_padding(scale, self.dpi) as f32 / self.dpi;
                 c.image(image, [r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad]);
             }
-            if slot == 0 && id.is_empty() {
+            if slot == 0 {
                 self.buttons.push(Button {
                     rect: r,
                     action: Action::Toggle,
                 });
-            } else if !id.is_empty() {
-                self.buttons.push(Button {
-                    rect: r,
-                    action: Action::Track(id),
-                });
+            }
+        }
+        // Pre-warm transition lean variants when idle so Next/Previous transitions
+        // never stall mid-flight at v = ±0.25 to rasterize or blur a new sleeve.
+        if !animating && !self.moving {
+            for (slot, _, title, artist, art) in &cards {
+                let target_slots: &[i32] = match *slot {
+                    0 => &[-1, 1],
+                    -1 | 1 => &[0],
+                    _ => continue,
+                };
+                for &target_slot in target_slots {
+                    let target_lean = target_slot.signum();
+                    let liquid = crate::glass::liquid_glass();
+                    let suffix = format!(
+                        ":{target_lean}:{art}:{title}:{artist}:{}:{}:{liquid}",
+                        self.surface_color(),
+                        self.light
+                    );
+                    if self.card_cache.keys().any(|k| k.ends_with(&suffix)) {
+                        continue;
+                    }
+                    let (cx, scale, squeeze) = card_metrics(
+                        w,
+                        layout.card_width,
+                        target_slot as f32,
+                        24. / self.content_scale,
+                    );
+                    let card_w = layout.card_width * scale;
+                    let card_h = (layout.card_width + 52.) * scale;
+                    let y = layout.center_y - card_h / 2. + (target_slot.abs() as f32) * 2.;
+                    let r = [
+                        cx - card_w * squeeze / 2.,
+                        y,
+                        cx + card_w * squeeze / 2.,
+                        y + card_h,
+                    ];
+                    let key = format!(
+                        "card:{card_w:.2}:{card_h:.2}:{}:{target_lean}:{art}:{title}:{artist}:{}:{}:{liquid}",
+                        self.dpi,
+                        self.surface_color(),
+                        self.light
+                    );
+                    if let Some(image) = self.album_card(
+                        r,
+                        [card_w, card_h],
+                        scale,
+                        squeeze,
+                        target_lean,
+                        art,
+                        title,
+                        artist,
+                        w,
+                    ) {
+                        if self.card_cache.len() >= 64 {
+                            self.card_cache.clear();
+                        }
+                        self.card_cache.insert(key, image);
+                    }
+                }
             }
         }
         let d = layout.deck;
@@ -182,9 +318,10 @@ impl State {
         c.round(d, 24., self.ink, 24, false, false);
         c.coating(d, 24.);
         // Keep the lens and its soft shadow inside the rounded deck. Narrow
-        // decks distribute all five controls evenly instead of crowding edges.
+        // decks distribute all visible controls evenly instead of crowding edges.
         let controls = deck_controls(w, d);
         let control = |i: usize| controls[i];
+        self.timeline(c, layout.now, false);
         self.media_button(
             c,
             control(0),
@@ -198,52 +335,7 @@ impl State {
             Action::Next,
             self.playback.available && self.playback.can_next,
         );
-        let n = layout.now;
-        c.round(
-            n,
-            16.,
-            self.ink,
-            if self.light { 7 } else { 12 },
-            false,
-            false,
-        );
-        let thumb = if w < 480. { 20. } else { 24. };
-        let art_top = n[1] + if w < 480. { 2. } else { 5. };
-        self.rounded_cover(
-            c,
-            self.playback.art.as_deref().unwrap_or(""),
-            [n[0] + 4., art_top, n[0] + 4. + thumb, art_top + thumb],
-            6.,
-        );
-        c.text(
-            if self.playback.title.is_empty() {
-                "Open your player"
-            } else {
-                &self.playback.title
-            },
-            [n[0] + 36., n[1], n[2] - 6., n[1] + 19.],
-            12.,
-            true,
-            self.ink,
-            0,
-        );
-        if w >= 480. {
-            c.text(
-                if self.playback.artist.is_empty() {
-                    "Browse music / account"
-                } else {
-                    &self.playback.artist
-                },
-                [n[0] + 36., n[1] + 18., n[2] - 6., n[1] + 31.],
-                10.,
-                false,
-                self.muted,
-                0,
-            );
-        }
-        self.timeline(c, [n[0] + 36., n[3] - 5., n[2] - 6., n[3] + 3.], false);
         self.media_button(c, control(3), Action::Browse, true);
-        self.media_button(c, control(4), Action::Queue, true);
         if layout.queue_rows > 0 {
             self.compact_queue(c, w, d[3] + 12., layout.queue_rows);
         }
@@ -265,7 +357,7 @@ impl State {
             (w * self.dpi).round().max(1.) as i32,
             (h * self.dpi).round().max(1.) as i32,
         );
-        let buffer = Buffer::plain(pw, ph, self.dpi)?;
+        let mut buffer = Buffer::plain(pw, ph, self.dpi)?;
         let batch = render::AlphaBatch::new(buffer.dc, self.dpi);
         let c = Canvas::new(buffer.dc, self.dpi);
         if let Some(frost) = self
@@ -286,6 +378,15 @@ impl State {
         }
         c.coating([0., 0., w, h], 20. * scale);
         render::flush(buffer.dc);
+        if crate::glass::liquid_glass() {
+            crate::glass::apply_liquid_glass_premul_bgra(
+                buffer.pixels_mut(),
+                pw as usize,
+                ph as usize,
+                20. * scale * self.dpi,
+                self.dpi * scale,
+            );
+        }
         let backing = buffer.snapshot();
         let art = [6. * scale, 6. * scale, w - 6. * scale, w - 6. * scale];
         self.cover(&c, url, art, 1.);
@@ -368,9 +469,13 @@ impl State {
                 pixels.swap(i, i + 2);
             }
         }
-        let dw = (pw as f32 * squeeze).round().max(1.) as usize;
         let sh = ph as usize;
         let sw = pw as usize;
+        let dw = if lean == 0 {
+            sw
+        } else {
+            (pw as f32 * squeeze).round().max(1.) as usize
+        };
         let out = if lean == 0 {
             pixels
         } else {
@@ -480,6 +585,15 @@ fn shadowed_card(
 mod tests {
     use super::*;
     #[test]
+    fn album_neighbors_follow_playlist_order_without_wrapping() {
+        assert_eq!(neighbor_index(Some(0), 8, -1), None);
+        assert_eq!(neighbor_index(Some(0), 8, -2), None);
+        assert_eq!(neighbor_index(Some(7), 8, 1), None);
+        assert_eq!(neighbor_index(None, 8, -1), None);
+        assert_eq!(neighbor_index(Some(0), 1, -2), None);
+        assert_eq!(neighbor_index(None, 0, 1), None);
+    }
+    #[test]
     fn album_fan_keeps_physical_side_insets_without_shrinking_center_art() {
         for (w, card_width) in [(320., 124.8), (560., 218.4), (1000., 360.)] {
             for scale in [0.5, 0.75, 1.] {
@@ -534,14 +648,14 @@ mod tests {
     fn legacy_coverflow_uses_large_cards_and_a_nested_bottom_deck() {
         let l = layout(560., 480., false).unwrap();
         assert!((l.card_width - 218.4).abs() < 0.01);
-        assert_eq!(l.deck[3] - l.deck[1], 48.);
-        assert!(l.deck[2] - l.deck[0] < 560. - 100.);
+        assert_eq!(l.deck[3] - l.deck[1], 64.);
+        assert!(l.deck[2] - l.deck[0] <= 340.);
         assert!((l.deck[0] + l.deck[2] - 560.).abs() < 0.01);
-        assert!(l.now[0] > 132. && l.now[2] < 560. - 94.);
+        assert!(l.now[3] <= l.deck[1] + 22.);
         assert!(l.center_y + (l.card_width + 52.) / 2. < l.deck[1]);
         let narrow = layout(320., 400., false).unwrap();
-        assert_eq!(narrow.deck[3] - narrow.deck[1], 70.);
-        assert!(narrow.now[1] >= narrow.deck[1] + 38.);
+        assert_eq!(narrow.deck[3] - narrow.deck[1], 64.);
+        assert!(narrow.now[3] <= narrow.deck[1] + 22.);
         assert!(layout(240., 180., false).is_none());
         assert!(layout(900., 180., false).is_none());
         let queue = layout(560., 480., true).unwrap();
@@ -568,10 +682,31 @@ mod tests {
                     for other in &controls[i + 1..] {
                         assert!(r[2] <= other[0] || other[2] <= r[0]);
                     }
-                    assert!(r[2] <= l.now[0] || l.now[2] <= r[0] || r[3] <= l.now[1]);
+                    assert!(l.now[3] <= r[1]);
                 }
                 assert!(l.center_y + (l.card_width + 52.) / 2. <= l.deck[1] - 20.);
             }
+        }
+    }
+    #[test]
+    fn deck_spacing_is_balanced_and_card_metrics_flow_monotonically() {
+        let l = layout(560., 480., false).unwrap();
+        let controls = deck_controls(560., l.deck);
+        assert!(((controls[1][0] + controls[1][2]) / 2. - 280.).abs() < 0.01);
+        assert!((l.deck[2] - controls[3][2] - 16.).abs() < 0.01);
+        assert!(l.now[3] < controls[0][1]);
+        let narrow = layout(320., 400., false).unwrap();
+        let nc = deck_controls(320., narrow.deck);
+        assert!(((nc[1][0] + nc[1][2]) / 2. - 160.).abs() < 0.01);
+        assert!(nc[2][2] < nc[3][0]);
+        let mut prev_cx = f32::NEG_INFINITY;
+        for step in -25..=25 {
+            let v = step as f32 * 0.1;
+            let (cx, scale, squeeze) = card_metrics(560., 218.4, v, 24.);
+            assert!(cx > prev_cx);
+            assert!(scale > 0.6 && scale <= 1.0);
+            assert!(squeeze > 0.7 && squeeze <= 1.0);
+            prev_cx = cx;
         }
     }
 }

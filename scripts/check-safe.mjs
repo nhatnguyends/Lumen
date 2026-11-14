@@ -69,7 +69,7 @@ export function checkSafe(root = process.cwd()) {
   inspect(path.join(root, 'run_native_clock.py'))
   for(const name of ['run_lumen.py','run_lumen.pyw','Launch Lumen.pyw']) if(fs.existsSync(path.join(root,name))) inspect(path.join(root,name))
   if(fs.existsSync(path.join(root,'startup_windows.py'))) inspect(path.join(root,'startup_windows.py'))
-  for(const name of ['build-portable.py','export-source.py','verify-portable.py','test-portable.py']) if(fs.existsSync(path.join(root,'scripts',name))) inspect(path.join(root,'scripts',name))
+  for(const name of ['build-portable.py','export-source.py','verify-portable.py','test-portable.py','third_party.py']) if(fs.existsSync(path.join(root,'scripts',name))) inspect(path.join(root,'scripts',name))
   walk(path.join(root,'scripts','portable_python'))
   return problems
 }

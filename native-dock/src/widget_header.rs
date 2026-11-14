@@ -17,6 +17,7 @@ use windows_sys::Win32::{
 };
 const SUBCLASS: usize = 0x4c484452;
 const TIMER: usize = 0x4c4844;
+const HEADER_FRAME: u32 = WM_APP + 18;
 const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.];
 pub struct Visual {
     pub alpha: f32,
@@ -32,6 +33,7 @@ struct Reveal {
     child_poll: bool,
     clock: Option<FrameClock>,
     period: u32,
+    frame_queued: bool,
 }
 impl Default for Reveal {
     fn default() -> Self {
@@ -44,6 +46,7 @@ impl Default for Reveal {
             child_poll: false,
             clock: None,
             period: 0,
+            frame_queued: false,
         }
     }
 }
@@ -319,6 +322,31 @@ unsafe extern "system" fn proc(
         {
             return 0;
         }
+    }
+    if msg == HEADER_FRAME {
+        HEADERS.with(|h| {
+            if let Some(s) = h.borrow_mut().get_mut(&(hwnd as usize)) {
+                s.frame_queued = false;
+                let time = now();
+                if s.moving(time) {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                schedule(hwnd, s, time);
+            }
+        });
+        return 0;
+    }
+    if msg == WM_PAINT {
+        let paint_started = Instant::now();
+        let res = DefSubclassProc(hwnd, msg, wp, lp);
+        HEADERS.with(|h| {
+            if let Some(s) = h.borrow_mut().get_mut(&(hwnd as usize)) {
+                if s.moving(now()) {
+                    crate::motion::pace_vsync(hwnd, paint_started, &mut s.frame_queued, HEADER_FRAME);
+                }
+            }
+        });
+        return res;
     }
     DefSubclassProc(hwnd, msg, wp, lp)
 }

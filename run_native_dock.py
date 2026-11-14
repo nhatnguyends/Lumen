@@ -11,7 +11,7 @@ import ctypes
 
 ROOT = Path(__file__).resolve().parent
 MANIFEST = ROOT / "native-dock" / "Cargo.toml"
-BINARY = ROOT / "native-dock" / "target" / "debug" / "lumen-native-dock.exe"
+BINARY = ROOT / "native-dock" / "target" / "debug" / "lumen.exe"
 
 
 def needs_build() -> bool:

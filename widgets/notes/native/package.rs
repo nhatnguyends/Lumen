@@ -19,12 +19,7 @@ impl WidgetHost for super::Host {
         self.apply_common(opacity, floating);
     }
     unsafe fn refresh(&mut self) {
-        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-            self.hwnd(),
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE,
-            0,
-            0,
-        );
+        self.refresh();
     }
     unsafe fn tick(&mut self) {}
 }

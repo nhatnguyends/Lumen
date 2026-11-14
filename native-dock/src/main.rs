@@ -2,9 +2,11 @@
 
 mod accent;
 mod catalog;
-mod compositor;
 mod color_picker;
+mod compositor;
 mod contrast;
+mod desktop_layer;
+mod desktop_sync;
 mod fusion;
 mod general;
 mod geometry;
@@ -12,17 +14,17 @@ mod glass;
 mod model;
 mod motion;
 include!(concat!(env!("OUT_DIR"), "/widget_modules.rs"));
-mod widget_packages;
-mod text_prompt;
 mod render;
 mod sampling;
 mod settings_ui;
-mod symbols;
+mod startup;
 mod surface;
+mod symbols;
+mod text_prompt;
 mod tray;
 mod update;
-mod startup;
 mod widget_header;
+mod widget_packages;
 
 // Win32 z-order/activation are process/desktop-wide, whereas production uses
 // one UI thread. Keep native HWND tests from changing that state concurrently;
@@ -34,16 +36,20 @@ pub(crate) fn native_ui_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn main() {
-    if update::dispatch() { return; }
+    if update::dispatch() {
+        return;
+    }
     if let Err(error) = window::run() {
         eprintln!("{error}");
-        if std::env::args().any(|arg|arg=="--smoke-test") {std::process::exit(1);}
+        if std::env::args().any(|arg| arg == "--smoke-test") {
+            std::process::exit(1);
+        }
         // Null owner is valid; the two UTF-16 buffers live until the dialog closes.
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 std::ptr::null_mut(),
                 model::wide(&error).as_ptr(),
-                model::wide("Lumen native dock").as_ptr(),
+                model::wide("Lumen").as_ptr(),
                 windows_sys::Win32::UI::WindowsAndMessaging::MB_OK
                     | windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
             );

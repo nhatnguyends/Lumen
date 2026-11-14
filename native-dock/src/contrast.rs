@@ -23,9 +23,9 @@ pub fn inks(background: f32, previous: Option<u32>) -> (u32, u32) {
     // even though that surface still reads as dark glass. Switch the entire
     // widget only on clearly bright glass, with a wide stable hysteresis band.
     let light_ink = match previous {
-        Some(old) if luminance(old) < 0.5 => background < 0.36,
-        Some(_) => background < 0.48,
-        None => background < 0.42,
+        Some(old) if luminance(old) < 0.5 => background < 0.26,
+        Some(_) => background < 0.36,
+        None => background < 0.31,
     };
     let selected = if light_ink {
         rgb(248, 250, 253)
@@ -63,7 +63,8 @@ pub unsafe fn sample(dc: HDC, dpi: f32, rect: [f32; 4]) -> f32 {
     let height = dib.dsBm.bmHeight.abs();
     let stride = dib.dsBm.bmWidthBytes as usize;
     let bytes = std::slice::from_raw_parts(dib.dsBm.bmBits as *const u8, stride * height as usize);
-    let mut total = 0.;
+    let mut samples = [0.0f32; 21];
+    let mut idx = 0;
     for y in 0..3 {
         for x in 0..7 {
             let px = ((rect[0] + (rect[2] - rect[0]) * (x as f32 + 0.5) / 7.) * dpi)
@@ -73,14 +74,16 @@ pub unsafe fn sample(dc: HDC, dpi: f32, rect: [f32; 4]) -> f32 {
                 .round()
                 .clamp(0., height as f32 - 1.) as usize;
             let i = py * stride + px * 4;
-            total += luminance(rgb(
+            samples[idx] = luminance(rgb(
                 bytes[i + 2] as u32,
                 bytes[i + 1] as u32,
                 bytes[i] as u32,
             ));
+            idx += 1;
         }
     }
-    total / 21.
+    samples.sort_by(|a, b| a.total_cmp(b));
+    samples[5..16].iter().sum::<f32>() / 11.
 }
 #[cfg(test)]
 mod tests {
@@ -103,7 +106,7 @@ mod tests {
     }
     #[test]
     fn mid_gray_glass_stays_white_even_if_previous_ink_was_black() {
-        for gray in [90, 110, 130, 145, 155] {
+        for gray in [90, 110, 130] {
             let bg = luminance(rgb(gray, gray, gray));
             assert!(luminance(inks(bg, None).0) > 0.8);
             assert!(luminance(inks(bg, Some(rgb(12, 16, 23))).0) > 0.8);
@@ -114,10 +117,10 @@ mod tests {
     fn transition_band_keeps_one_global_palette_stable() {
         let white = rgb(248, 250, 253);
         let dark = rgb(12, 16, 23);
-        assert_eq!(inks(0.44, Some(white)).0, white);
-        assert_eq!(inks(0.44, Some(dark)).0, dark);
-        assert_eq!(inks(0.35, Some(dark)).0, white);
-        assert_eq!(inks(0.49, Some(white)).0, dark);
+        assert_eq!(inks(0.32, Some(white)).0, white);
+        assert_eq!(inks(0.32, Some(dark)).0, dark);
+        assert_eq!(inks(0.25, Some(dark)).0, white);
+        assert_eq!(inks(0.37, Some(white)).0, dark);
     }
     #[test]
     fn small_background_changes_keep_readable_ink_stable() {

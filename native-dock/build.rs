@@ -56,4 +56,53 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::write(out.join("widget_modules.rs"), modules).unwrap();
     fs::write(out.join("widget_definitions.rs"), definitions).unwrap();
+    embed_windows_icon(&root, &out);
+}
+
+fn embed_windows_icon(widgets_root: &std::path::Path, out: &std::path::Path) {
+    if env::var_os("CARGO_CFG_WINDOWS").is_none() {
+        return;
+    }
+    let ico = widgets_root.parent().unwrap().join("resources").join("lumen.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    if !ico.is_file() {
+        return;
+    }
+    let Some(rc) = find_rc_exe() else {
+        println!("cargo:warning=rc.exe not found; lumen.exe will not embed lumen.ico");
+        return;
+    };
+    let rc_file = out.join("lumen.rc");
+    let res_file = out.join("lumen.res");
+    let escaped = ico.to_string_lossy().replace('\\', "\\\\");
+    fs::write(&rc_file, format!("1 ICON \"{escaped}\"\r\n")).unwrap();
+    let status = std::process::Command::new(rc)
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&res_file)
+        .arg(&rc_file)
+        .status()
+        .expect("run rc.exe");
+    assert!(status.success(), "rc.exe failed compiling lumen.rc");
+    println!("cargo:rustc-link-arg-bins={}", res_file.display());
+}
+
+fn find_rc_exe() -> Option<PathBuf> {
+    if let Ok(path) = env::var("PATH") {
+        for dir in env::split_paths(&path) {
+            let candidate = dir.join("rc.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let kits_bin = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    let mut versions: Vec<PathBuf> = fs::read_dir(&kits_bin)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("x64").join("rc.exe"))
+        .filter(|p| p.is_file())
+        .collect();
+    versions.sort();
+    versions.pop()
 }

@@ -13,7 +13,6 @@ impl State {
         let full = match self.config.design.as_str() {
             "orbit" => w >= 320. && h - top >= if self.config.queue { 406. } else { 350. },
             "disc" => w >= 560. && h - top >= if self.config.queue { 300. } else { 220. },
-            "sky" => w >= 420. && h - top >= 420.,
             _ => false,
         };
         if !full {
@@ -29,7 +28,6 @@ impl State {
                 self.light = true;
                 self.disc_theme(c, dc, w, h, top, saved);
             }
-            "sky" => self.sky_theme(c, dc, w, h, top),
             _ => (),
         }
         (self.ink, self.muted, self.light) = saved;
@@ -190,133 +188,6 @@ impl State {
         }
     }
 
-    unsafe fn sky_theme(&mut self, c: &Canvas, dc: HDC, w: f32, h: f32, top: f32) {
-        // Surface palette owns the entire backdrop. Only the now-playing pill
-        // is a nested content card; no inset gradient or second outer coating.
-        let outer_inks = (self.ink, self.muted, self.light);
-        let bottom = h - 16.;
-        let tools_y = top + 18.;
-        self.media_button(c, [32., tools_y, 70., tools_y + 38.], Action::Browse, true);
-        c.text(
-            "Browse",
-            [80., tools_y + 8., 170., tools_y + 30.],
-            13.,
-            false,
-            self.ink,
-            0,
-        );
-        self.media_button(
-            c,
-            [w - 124., tools_y, w - 86., tools_y + 38.],
-            Action::Library,
-            true,
-        );
-        self.media_button(
-            c,
-            [w - 76., tools_y, w - 38., tools_y + 38.],
-            Action::Queue,
-            true,
-        );
-        let hero = tools_y + 58.;
-        let side = ((w - 88.) * 0.39).min((h - top - 280.).max(92.)).min(220.);
-        let art = [32., hero, 32. + side, hero + side];
-        c.soft_shadow(art, 18., 40., 12., 5.);
-        self.rounded_cover(c, self.playback.art.as_deref().unwrap_or(""), art, 18.);
-        let x = art[2] + 22.;
-        let title = if self.playback.album.is_empty() {
-            self.theme_title()
-        } else {
-            &self.playback.album
-        };
-        let (first, second) = split_title(title, ((w - 34. - x) / 11.).max(8.) as usize);
-        c.text_medium(
-            &first,
-            [x, hero + 3., w - 32., hero + 34.],
-            23.,
-            self.ink,
-            0,
-        );
-        c.text_medium(
-            &second,
-            [x, hero + 33., w - 32., hero + 64.],
-            23.,
-            self.ink,
-            0,
-        );
-        c.text(
-            &self.playback.artist,
-            [x, hero + 75., w - 32., hero + 97.],
-            14.,
-            false,
-            self.muted,
-            0,
-        );
-        let detail = if self.playback.queue.is_empty() {
-            "Now playing".to_owned()
-        } else {
-            format!("{} queued", self.playback.queue.len())
-        };
-        c.text(
-            &detail,
-            [x, hero + 105., w - 90., hero + 123.],
-            11.,
-            false,
-            self.muted,
-            0,
-        );
-        let pill_y = bottom - 132.;
-        let queue_top = hero + side.max(190.) + 20.;
-        let rows = ((pill_y - queue_top - 26.) / 38.).floor().clamp(0., 5.) as usize;
-        if rows > 0 {
-            self.compact_queue(c, w, queue_top, if self.config.queue { rows } else { 1 });
-        }
-        self.timeline(c, [44., pill_y - 14., w - 44., pill_y - 4.], false);
-        self.ink = 0x292521;
-        self.muted = 0x77716b;
-        self.light = true;
-        let pill = [30., pill_y, w - 30., pill_y + 70.];
-        c.soft_shadow(pill, 30., 28., 12., 5.);
-        if let Some(bg) = &self.background {
-            bg.restore_glass_card(dc, pill, 30.);
-        }
-        c.round(pill, 30., 0xffffff, 180, false, false);
-        c.coating(pill, 30.);
-        self.rounded_cover(
-            c,
-            self.playback.art.as_deref().unwrap_or(""),
-            [44., pill_y + 12., 90., pill_y + 58.],
-            12.,
-        );
-        c.text_medium(
-            self.theme_title(),
-            [104., pill_y + 12., w - 154., pill_y + 36.],
-            15.,
-            self.ink,
-            0,
-        );
-        c.text(
-            &self.playback.artist,
-            [104., pill_y + 37., w - 154., pill_y + 55.],
-            12.,
-            false,
-            self.muted,
-            0,
-        );
-        self.media_button(
-            c,
-            [w - 142., pill_y + 13., w - 98., pill_y + 57.],
-            Action::Toggle,
-            true,
-        );
-        self.media_button(
-            c,
-            [w - 88., pill_y + 17., w - 52., pill_y + 53.],
-            Action::Next,
-            self.playback.available && self.playback.can_next,
-        );
-        (self.ink, self.muted, self.light) = outer_inks;
-    }
-
     fn theme_title(&self) -> &str {
         if self.playback.title.is_empty() {
             "Your music"
@@ -327,7 +198,13 @@ impl State {
 
     /// Printed photo disc, metallic hub and a transparent spindle hole. The
     /// cache tracks the decoded cover identity so late artwork replaces it.
-    unsafe fn disc_art(&self, c: &Canvas, r: [f32; 4], clip: [f32; 4], clip_radius: f32) {
+    pub(super) unsafe fn disc_art(
+        &self,
+        c: &Canvas,
+        r: [f32; 4],
+        clip: [f32; 4],
+        clip_radius: f32,
+    ) {
         let size = r[2] - r[0];
         let px = (size * self.dpi).round().max(1.) as i32;
         let url = self.playback.art.as_deref().unwrap_or("");
@@ -396,25 +273,6 @@ impl State {
             c.clipped_image(image, r, clip);
         }
     }
-}
-
-fn split_title(title: &str, limit: usize) -> (String, String) {
-    let mut first = String::new();
-    let mut second = String::new();
-    for word in title.split_whitespace() {
-        let target = if second.is_empty()
-            && (first.is_empty() || first.chars().count() + word.chars().count() < limit)
-        {
-            &mut first
-        } else {
-            &mut second
-        };
-        if !target.is_empty() {
-            target.push(' ');
-        }
-        target.push_str(word);
-    }
-    (first, second)
 }
 
 #[cfg(test)]

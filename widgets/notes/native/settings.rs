@@ -143,23 +143,40 @@ impl State {
             .map(|h| h.take_changes())
             .unwrap_or_default();
         let mut changed = false;
+        let mut blur_changed = false;
+        let mut backdrop_changed = false;
+        let mut structural = false;
         for change in changes {
-            changed |= apply(&mut self.board, change);
+            let id = change.id;
+            if apply(&mut self.board, change) {
+                changed = true;
+                blur_changed |= id == 4;
+                backdrop_changed |= id != 5;
+                structural |= !matches!(id, 2 | 3 | 4 | 5);
+            }
         }
         if !changed {
             return;
         }
-        self.update_local_blur();
-        self.apply_floating();
-        self.background_key.clear();
-        self.overlay = None;
-        self.place_editor();
+        if blur_changed {
+            self.update_local_blur();
+        }
+        if structural {
+            self.apply_floating();
+            self.place_editor();
+        }
+        if backdrop_changed {
+            self.background_key.clear();
+            self.overlay = None;
+        }
         self.schedule();
         let color = self.surface_color();
         let light = crate::accent::light(color);
-        let rows = rows(&self.board);
+        let rows = structural.then(|| rows(&self.board));
         if let Some(host) = &mut self.settings {
-            host.set_rows(rows);
+            if let Some(rows) = rows {
+                host.set_rows(rows);
+            }
             host.set_surface(color, light);
         }
         InvalidateRect(self.hwnd, null(), 0);

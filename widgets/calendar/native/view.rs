@@ -11,57 +11,124 @@ const WEEKDAYS: [&str; 7] = [
     "Friday",
     "Saturday",
 ];
+fn theme_accent(theme: &str, ambient: u32) -> u32 {
+    match theme {
+        "blocks" => color(255, 144, 41),
+        "pop" => color(255, 75, 50),
+        "prism" => color(245, 100, 180),
+        "grove" => color(180, 237, 56),
+        "mist" => color(101, 137, 172),
+        "agenda" | "soft" => color(235, 82, 79),
+        _ => ambient,
+    }
+}
+
+pub(super) fn day_cell_shape(theme: &str, l: &Layout, i: usize, tiny: bool) -> ([f32; 4], f32, bool) {
+    let circular = matches!(theme, "pop" | "prism" | "grove" | "mist" | "agenda");
+    if circular {
+        let r = l.circular_day(i);
+        (r, (r[2] - r[0]) / 2., true)
+    } else if theme == "soft" {
+        let r = l.circular_day(i);
+        (r, if tiny { 4. } else { 5. }, false)
+    } else {
+        let r = l.day(i);
+        let radius = match (theme, tiny) {
+            ("blocks", true) => 5.,
+            ("blocks", false) => 12.,
+            (_, true) => 4.,
+            (_, false) => 11.,
+        };
+        (r, radius, false)
+    }
+}
+
+fn selected_day_fg(theme: &str, accent: u32) -> u32 {
+    match theme {
+        "blocks" => color(20, 17, 11),
+        "prism" => color(38, 12, 35),
+        "grove" => color(21, 33, 9),
+        "lumen" | "almanac" if crate::contrast::luminance(accent) > 0.55 => color(18, 22, 30),
+        _ => 0xffffff,
+    }
+}
+
 impl State {
     /// Tiny windows spend their height on the calendar, not secondary theme cards.
     unsafe fn paint_tiny(&mut self, dc: HDC, w: f32, h: f32, ink: u32, ambient: u32) {
-        let l = Layout::new(&self.config.theme, w, h);
-        let c = Canvas::new(dc, self.dpi);
-        let accent = match self.config.theme.as_str() {
-            "blocks" => color(255, 144, 41),
-            "pop" => color(255, 75, 50),
-            "prism" => color(245, 100, 180),
-            "grove" => color(180, 237, 56),
-            "mist" => color(101, 137, 172),
-            "agenda" | "soft" => color(235, 82, 79),
-            _ => ambient,
+        let theme = self.config.theme.clone();
+        let t = theme.as_str();
+        let ink = if t == "mist" && !crate::surface::managed(&self.config.palette) {
+            0xffffff
+        } else {
+            ink
         };
+        let l = Layout::new(t, w, h);
+        let c = Canvas::new(dc, self.dpi);
+        let accent = theme_accent(t, ambient);
         let month = MONTHS[self.cursor.month as usize - 1];
         let title = if w < 240. {
             format!("{} {:02}", &month[..3], self.cursor.year % 100)
         } else {
             format!("{} {}", month, self.cursor.year)
         };
-        self.typo
-            .draw(dc, self.dpi, &title, l.label, Style::new(10.5, 650, ink), 0);
+        let mut title_style = Style::new(10.5, 650, ink);
+        if t == "almanac" {
+            title_style = title_style.serif();
+        }
+        self.typo.draw(dc, self.dpi, &title, l.label, title_style, 0);
         for (rect, action) in [
             (l.previous, Action::Previous),
             (l.next, Action::Next),
             (l.today, Action::Today),
         ] {
-            if self.hover == Some(action) || self.pressed == Some(action) {
+            let hover = self.hover == Some(action);
+            let pressed = self.pressed == Some(action);
+            if action == Action::Today {
                 c.round(
                     rect,
-                    6.,
+                    10.,
                     ink,
-                    if self.pressed == Some(action) {
-                        40
+                    if pressed {
+                        62
+                    } else if hover {
+                        (18. + 28. * self.hover_alpha) as u8
                     } else {
-                        (24. * self.hover_alpha) as u8
+                        18
                     },
                     false,
                     false,
                 );
-            }
-            if action == Action::Today {
+                c.round(
+                    rect,
+                    10.,
+                    ink,
+                    if pressed {
+                        80
+                    } else if hover {
+                        (30. + 34. * self.hover_alpha) as u8
+                    } else {
+                        30
+                    },
+                    true,
+                    false,
+                );
                 self.typo.draw(
                     dc,
                     self.dpi,
                     "Today",
                     rect,
-                    Style::new(9., 600, ink).alpha(0.85),
+                    Style::new(9., 600, ink).alpha(if hover || pressed { 1. } else { 0.8 }),
                     1,
                 );
             } else {
+                if pressed {
+                    c.round(rect, 7., ink, 58, false, false);
+                    c.round(rect, 7., ink, 70, true, false);
+                } else if hover {
+                    c.round(rect, 7., ink, (self.hover_alpha * 38.) as u8, false, false);
+                    c.round(rect, 7., ink, (self.hover_alpha * 42.) as u8, true, false);
+                }
                 let x = (rect[0] + rect[2]) * 0.5;
                 let y = (rect[1] + rect[3]) * 0.5;
                 let sign = if action == Action::Next { 1. } else { -1. };
@@ -72,10 +139,14 @@ impl State {
                         (x - sign * 2., y + 3.),
                     ],
                     ink,
-                    210,
+                    if hover || pressed { 255 } else { 200 },
                     1.3,
                 );
             }
+        }
+        let line = l.weekdays[1] - 2.;
+        if line > l.today[3] {
+            c.line(&[(l.weekdays[0], line), (l.weekdays[2], line)], ink, 30, 1.);
         }
         let cw = (l.weekdays[2] - l.weekdays[0]) / 7.;
         for i in 0..7 {
@@ -97,50 +168,91 @@ impl State {
         }
         let days = self.cursor.matrix(self.config.week_starts_on == 1);
         for (i, date) in days.iter().enumerate() {
-            let r = l.day(i);
+            let (r, radius, circular) = day_cell_shape(t, &l, i, true);
             let action = Action::Day(i);
             let selected = *date == self.selected;
             let today = *date == self.today;
-            let opacity = if date.month == self.cursor.month {
-                1.
-            } else {
-                0.32
-            };
+            let outside = date.month != self.cursor.month;
+            let opacity = if outside { 0.32 } else { 1. };
             if selected {
-                c.round(r, 4., accent, 255, false, false);
+                if t == "lumen" || t == "almanac" {
+                    c.soft_shadow(r, radius, opacity * 0.3, 4., 1.5);
+                    self.artwork.draw(
+                        dc,
+                        self.dpi,
+                        r,
+                        radius,
+                        Material::Selection(accent),
+                        opacity,
+                    );
+                    c.line(
+                        &[(r[0] + radius, r[1] + 0.7), (r[2] - radius, r[1] + 0.7)],
+                        0xffffff,
+                        (76. * opacity) as u8,
+                        1.,
+                    );
+                } else {
+                    c.round(r, radius, accent, (255. * opacity) as u8, false, false);
+                }
             } else if self.hover == Some(action) {
-                c.round(r, 4., ink, (28. * self.hover_alpha) as u8, false, false);
+                c.round(
+                    r,
+                    radius,
+                    ink,
+                    (28. * self.hover_alpha * opacity) as u8,
+                    false,
+                    false,
+                );
             }
-            if self.pressed == Some(action) {
-                c.round(r, 4., ink, 40, false, false);
+            if self.pressed == Some(action) && !selected {
+                c.round(r, radius, accent, (35. * opacity) as u8, false, false);
             }
             if today && !selected {
-                self.artwork.border(dc, self.dpi, r, 4., accent, 0.8, 1.);
+                self.artwork
+                    .border(dc, self.dpi, r, radius, accent, 0.75 * opacity, 1.);
+                if (t == "lumen" || t == "almanac") && r[3] - r[1] >= 16. {
+                    let x = (r[0] + r[2]) / 2.;
+                    c.round(
+                        [x - 1., r[3] - 3.5, x + 1., r[3] - 1.5],
+                        1.,
+                        accent,
+                        (255. * opacity) as u8,
+                        false,
+                        false,
+                    );
+                }
             }
             let fg = if selected {
-                if self.config.theme == "blocks" || self.config.theme == "grove" {
-                    color(20, 24, 20)
-                } else {
-                    0xffffff
-                }
+                selected_day_fg(t, accent)
             } else {
                 ink
             };
-            self.typo.draw(
-                dc,
-                self.dpi,
-                &date.day.to_string(),
-                r,
-                Style::new(
-                    ((r[3] - r[1]) * 0.8).clamp(8., 11.),
-                    if selected { 650 } else { 500 },
-                    fg,
-                )
-                .alpha(opacity),
-                1,
-            );
+            let mut style = Style::new(
+                ((r[3] - r[1]) * 0.72).clamp(8., 11.),
+                if selected { 650 } else { 500 },
+                fg,
+            )
+            .alpha(opacity);
+            if t == "almanac" {
+                style = style.serif();
+            }
+            self.typo
+                .draw(dc, self.dpi, &date.day.to_string(), r, style, 1);
             if selected && self.keyboard_day {
-                self.artwork.border(dc, self.dpi, r, 4., ink, 0.8, 1.);
+                let focus_rect = if circular {
+                    [r[0] - 1., r[1] - 1., r[2] + 1., r[3] + 1.]
+                } else {
+                    r
+                };
+                self.artwork.border(
+                    dc,
+                    self.dpi,
+                    focus_rect,
+                    if circular { radius + 1. } else { radius },
+                    ink,
+                    0.8,
+                    1.,
+                );
             }
         }
         let header_action = |a| match a {
@@ -177,18 +289,9 @@ impl State {
         }
         let theme = self.config.theme.clone();
         let t = theme.as_str();
-        let native_surface = t == "lumen"
-            && self.config.palette == "wallpaper-auto"
-            && self.config.lumen_surface != "glass";
         let l = Layout::new(t, w, h);
         let c = Canvas::new(dc, self.dpi);
-        let accent = match t {
-            "blocks" => color(255, 144, 41),
-            "pop" => color(255, 75, 50),
-            "prism" => color(245, 100, 180),
-            "grove" => color(180, 237, 56),
-            _ => ambient,
-        };
+        let accent = theme_accent(t, ambient);
         let selected = self.selected;
         if let Some(r) = l.date {
             if l.strip {
@@ -585,13 +688,24 @@ impl State {
                 | Action::Weekly(_)
                 | Action::Month(_) => {}
                 Action::Previous | Action::Next => {
-                    if hover {
+                    if pressed {
+                        c.round(button.rect, 9., ink, 58, false, false);
+                        c.round(button.rect, 9., ink, 70, true, false);
+                    } else if hover {
                         c.round(
                             button.rect,
                             9.,
                             ink,
-                            (self.hover_alpha * 18.) as u8,
+                            (self.hover_alpha * 38.) as u8,
                             false,
+                            false,
+                        );
+                        c.round(
+                            button.rect,
+                            9.,
+                            ink,
+                            (self.hover_alpha * 42.) as u8,
+                            true,
                             false,
                         );
                     }
@@ -609,7 +723,7 @@ impl State {
                             (x - sign * 2., y + 5.),
                         ],
                         ink,
-                        if hover { 255 } else { 186 },
+                        if hover || pressed { 255 } else { 186 },
                         1.5,
                     );
                 }
@@ -618,17 +732,36 @@ impl State {
                         button.rect,
                         12.,
                         ink,
-                        if hover { 33 } else { 18 },
+                        if pressed {
+                            62
+                        } else if hover {
+                            (18. + 28. * self.hover_alpha) as u8
+                        } else {
+                            18
+                        },
                         false,
                         false,
                     );
-                    c.round(button.rect, 12., ink, 30, true, false);
+                    c.round(
+                        button.rect,
+                        12.,
+                        ink,
+                        if pressed {
+                            80
+                        } else if hover {
+                            (30. + 34. * self.hover_alpha) as u8
+                        } else {
+                            30
+                        },
+                        true,
+                        false,
+                    );
                     self.typo.draw(
                         dc,
                         self.dpi,
                         "Today",
                         button.rect,
-                        Style::new(9.5, 600, ink).alpha(if hover { 1. } else { 0.73 }),
+                        Style::new(9.5, 600, ink).alpha(if hover || pressed { 1. } else { 0.73 }),
                         1,
                     );
                 }
@@ -638,20 +771,8 @@ impl State {
                     let today = date == self.today;
                     let outside = date.month != self.cursor.month;
                     let opacity = if outside { 0.45 } else { 1. };
-                    let circular = matches!(t, "pop" | "prism" | "grove");
-                    let r = if circular {
-                        l.circular_day(i)
-                    } else {
-                        button.rect
-                    };
-                    let radius = if circular {
-                        (r[2] - r[0]) / 2.
-                    } else if t == "blocks" {
-                        12.
-                    } else {
-                        11.
-                    };
-                    if hover && !selected && !(native_surface && today) {
+                    let (r, radius, circular) = day_cell_shape(t, &l, i, false);
+                    if hover && !selected {
                         c.round(
                             r,
                             radius,
@@ -664,23 +785,7 @@ impl State {
                     if pressed && !selected {
                         c.round(r, radius, accent, (30. * opacity) as u8, false, false);
                     }
-                    if native_surface {
-                        if today {
-                            let circle = l.circular_day(i);
-                            c.round(
-                                circle,
-                                (circle[2] - circle[0]) / 2.,
-                                color(255, 73, 63),
-                                (255. * opacity) as u8,
-                                false,
-                                false,
-                            );
-                        } else if selected {
-                            c.round(r, radius, ink, (33. * opacity) as u8, false, false);
-                            self.artwork
-                                .border(dc, self.dpi, r, radius, ink, 0.53 * opacity, 1.);
-                        }
-                    } else if selected {
+                    if selected {
                         if t == "lumen" || t == "almanac" {
                             c.soft_shadow(r, radius, opacity * 0.3, 7., 3.);
                             self.artwork.draw(
@@ -715,19 +820,8 @@ impl State {
                             );
                         }
                     }
-                    let fg = if native_surface {
-                        if today {
-                            0xffffff
-                        } else {
-                            ink
-                        }
-                    } else if selected {
-                        match t {
-                            "blocks" => color(20, 17, 11),
-                            "prism" => color(38, 12, 35),
-                            "grove" => color(21, 33, 9),
-                            _ => 0xffffff,
-                        }
+                    let fg = if selected {
+                        selected_day_fg(t, accent)
                     } else {
                         ink
                     };

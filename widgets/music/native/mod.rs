@@ -6,6 +6,7 @@ mod coverflow;
 mod icons;
 mod lenses;
 mod model;
+mod responsive;
 mod session;
 mod settings;
 mod themes;
@@ -46,6 +47,14 @@ struct State {
     media_icons: icons::Icons,
     button_lenses: lenses::Lenses,
     received: Instant,
+    last_poll: Instant,
+    last_seek: Option<Instant>,
+    spin_angle: f32,
+    spin_updated: Instant,
+    spin_active: bool,
+    coverflow_anim: Option<coverflow::Transition>,
+    anim_clock: Option<crate::motion::FrameClock>,
+    frame_queued: bool,
     images: HashMap<String, Image>,
     card_cache: HashMap<String, Image>,
     rounded_art: RefCell<HashMap<String, Image>>,
@@ -54,6 +63,7 @@ struct State {
     control_plates: Vec<([f32; 4], f32)>,
     hover: Option<Action>,
     pressed: Option<Action>,
+    frost: Option<Image>,
     background: Option<Buffer>,
     frame: Option<Buffer>,
     overlay: Option<Image>,
@@ -135,6 +145,12 @@ impl State {
                 self.buttons.clear();
                 self.hover = None;
                 self.pressed = None;
+                KillTimer(self.hwnd, 93);
+                KillTimer(self.hwnd, 94);
+                self.spin_active = false;
+                self.coverflow_anim = None;
+                self.anim_clock = None;
+                self.frame_queued = false;
                 if self.backend.is_some() {
                     // Retain only a slow metadata drain while hidden playback lives.
                     SetTimer(self.hwnd, 91, 1500, None);
@@ -149,9 +165,20 @@ impl State {
                 self.sync_settings();
             }
             Action::Browse => self.send(serde_json::json!({"action":"browse"})),
+            Action::SignIn => self.send(serde_json::json!({"action":"signin"})),
             Action::Library => self.send(serde_json::json!({"action":"library"})),
-            Action::Previous => self.send(serde_json::json!({"action":"previous"})),
-            Action::Next => self.send(serde_json::json!({"action":"next"})),
+            Action::Previous => {
+                self.send(serde_json::json!({"action":"previous"}));
+                if IsWindowVisible(self.hwnd) != 0 {
+                    SetTimer(self.hwnd, 91, 16, None);
+                }
+            }
+            Action::Next => {
+                self.send(serde_json::json!({"action":"next"}));
+                if IsWindowVisible(self.hwnd) != 0 {
+                    SetTimer(self.hwnd, 91, 16, None);
+                }
+            }
             Action::Toggle => {
                 if !self.playback.available && self.playback.title.is_empty() {
                     self.send(serde_json::json!({"action":"browse"}));
@@ -163,7 +190,11 @@ impl State {
             Action::Seek => {
                 if let Some(b) = self.buttons.iter().find(|b| b.action == Action::Seek) {
                     let fraction = ((x - b.rect[0]) / (b.rect[2] - b.rect[0])).clamp(0., 1.) as f64;
-                    self.send(serde_json::json!({"action":"seek","value":fraction * self.playback.duration}));
+                    let target = fraction * self.playback.duration;
+                    self.playback.position = target;
+                    self.received = Instant::now();
+                    self.last_seek = Some(Instant::now());
+                    self.send(serde_json::json!({"action":"seek","value":target}));
                 }
             }
         }
@@ -180,6 +211,7 @@ impl State {
         self.save();
     }
     unsafe fn poll(&mut self) {
+        self.last_poll = Instant::now();
         let mut dirty = false;
         // Drain outside the receiver borrow, then create images on the UI thread.
         let events: Vec<_> = self
@@ -193,6 +225,18 @@ impl State {
                     if let Ok(state) = serde_json::from_value::<Playback>(event["state"].clone()) {
                         self.error = state.error.clone().unwrap_or_default();
                         self.accept_playback(state);
+                        if IsWindowVisible(self.hwnd) != 0 {
+                            SetTimer(self.hwnd, 91, 250, None);
+                        }
+                        if self.coverflow_anim.is_some()
+                            && self.config.design == "coverflow"
+                            && IsWindowVisible(self.hwnd) != 0
+                        {
+                            if self.anim_clock.is_none() {
+                                self.anim_clock = Some(crate::motion::FrameClock::start());
+                            }
+                            SetTimer(self.hwnd, 94, 10, None);
+                        }
                     }
                     if let Some(error) = event["error"].as_str() {
                         self.error = error.into();
@@ -239,20 +283,11 @@ impl State {
     fn restore_art(&mut self) {
         let mut urls: Vec<String> = self.playback.art.iter().cloned().collect();
         urls.extend(self.last_cover.iter().cloned());
-        if let Some(i) = self
-            .playback
-            .queue
-            .iter()
-            .position(|t| t.selected || t.video_id == self.playback.video_id)
-        {
-            urls.extend(
-                self.playback
-                    .queue
-                    .iter()
-                    .skip(i.saturating_sub(2))
-                    .take(5)
-                    .map(|t| t.thumb.clone()),
-            );
+        let selected = coverflow::selected_index(&self.playback);
+        for slot in [-2, -1, 0, 1, 2] {
+            if let Some(i) = coverflow::neighbor_index(selected, self.playback.queue.len(), slot) {
+                urls.push(self.playback.queue[i].thumb.clone());
+            }
         }
         urls.extend(
             self.playback
@@ -287,6 +322,7 @@ impl State {
         self.remember_view();
     }
     unsafe fn paint(&mut self) {
+        let frame_started = Instant::now();
         let mut ps = zeroed();
         BeginPaint(self.hwnd, &mut ps);
         let mut r = zeroed();
@@ -300,16 +336,17 @@ impl State {
         if revision != self.revision && !self.moving {
             self.revision = revision;
             self.background = None;
-            self.overlay = None;
+            if !self.moving { self.overlay = None; }
             if let Some(glass) = &mut self.local_glass {
                 glass.refresh();
             }
         }
         crate::fusion::prepare(self.hwnd, 34.);
         let fusion_revision = crate::fusion::revision(self.hwnd);
-        if fusion_revision != self.fusion_revision {
+        let mut fusion_changed = false;
+        if fusion_revision != self.fusion_revision && !self.moving {
             self.fusion_revision = fusion_revision;
-            self.background = None;
+            fusion_changed = true;
         }
         let changed = self
             .frame
@@ -318,16 +355,24 @@ impl State {
         if changed {
             self.frame = Buffer::new(w, h, self.dpi, 34.);
             self.background = None;
-            self.overlay = None;
+            if !self.moving { self.overlay = None; }
         }
         let Some(mut frame) = self.frame.take() else {
             EndPaint(self.hwnd, &ps);
             return;
         };
         let (width, height) = (w as f32 / self.dpi, h as f32 / self.dpi);
-        if self.background.is_none() {
-            self.card_cache.clear();
-            if let Some(mut bg) = Buffer::new(w, h, self.dpi, 34.) {
+        if self.background.is_none() || fusion_changed {
+            let reuse_frost = fusion_changed && self.background.is_some() && self.frost.is_some();
+            if !self.moving && !reuse_frost {
+                self.card_cache.clear();
+            }
+            if let Some(mut bg) = self
+                .background
+                .take()
+                .filter(|b| b.matches_geometry(w, h, self.dpi, 34.))
+                .or_else(|| Buffer::new(w, h, self.dpi, 34.))
+            {
                 let brush = CreateSolidBrush(if crate::accent::light(self.surface_color()) {
                     0xf5f2f0
                 } else {
@@ -335,6 +380,7 @@ impl State {
                 });
                 FillRect(bg.dc, &r, brush);
                 DeleteObject(brush);
+                if !reuse_frost {
                 if self.config.frosted_glass {
                     if self.local_glass.is_none() {
                         let mut glass = Glass::new(self.config.blur, self.dpi);
@@ -351,11 +397,32 @@ impl State {
                 } else {
                     self.glass.borrow().draw_blended(bg.dc, self.hwnd, w, h, 0);
                 }
+                    if !self.moving {
+                        let mut pixels = bg.snapshot();
+                        for pixel in pixels.chunks_exact_mut(4) {
+                            pixel.swap(0, 2);
+                            pixel[3] = 255;
+                        }
+                        self.frost = Image::from_rgba(w as u32, h as u32, pixels);
+                    }
+                } else if let Some(frost) = &self.frost {
+                    Canvas::new(bg.dc, self.dpi).image(frost, [0., 0., width, height]);
+                }
                 self.chrome(&mut bg, [width, height]);
                 render::flush(bg.dc);
+                let bg_lum = crate::contrast::sample(
+                    bg.dc,
+                    self.dpi,
+                    [20., 20., width - 20., height - 20.],
+                );
+                let effective_lum = if self.config.design == "turntable" && bg_lum >= 0.20 {
+                    1.0
+                } else {
+                    bg_lum
+                };
                 (self.ink, self.muted) = crate::contrast::inks(
-                    crate::contrast::sample(bg.dc, self.dpi, [20., 20., width - 20., height - 20.]),
-                    Some(self.ink),
+                    effective_lum,
+                    (self.config.design != "turntable").then_some(self.ink),
                 );
                 self.light = crate::contrast::luminance(self.ink) < 0.5;
                 bg.bevel_for(self.hwnd);
@@ -366,7 +433,7 @@ impl State {
         if let Some(bg) = &self.background {
             frame.copy_from(bg.dc);
         }
-        frame.background_alpha((self.config.opacity * 2.55) as u8);
+        frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55) as u8);
         let batch = render::AlphaBatch::new(frame.dc, self.dpi);
         self.content(frame.dc, width, height);
         drop(batch);
@@ -385,6 +452,19 @@ impl State {
         }
         self.frame = Some(frame);
         EndPaint(self.hwnd, &ps);
+        if IsWindowVisible(self.hwnd) != 0
+            && !self.moving
+            && ((self.coverflow_anim.is_some_and(|a| !a.finished())
+                && self.config.design == "coverflow")
+                || self.spin_active)
+        {
+            crate::motion::pace_vsync(
+                self.hwnd,
+                frame_started,
+                &mut self.frame_queued,
+                crate::motion::VSYNC_FRAME,
+            );
+        }
     }
 }
 
@@ -454,6 +534,14 @@ impl Host {
             media_icons: icons::Icons::default(),
             button_lenses: lenses::Lenses::default(),
             received: Instant::now(),
+            last_poll: Instant::now(),
+            last_seek: None,
+            spin_angle: 0.,
+            spin_updated: Instant::now(),
+            spin_active: false,
+            coverflow_anim: None,
+            anim_clock: None,
+            frame_queued: false,
             images: HashMap::new(),
             card_cache: HashMap::new(),
             rounded_art: RefCell::new(HashMap::new()),
@@ -462,6 +550,7 @@ impl Host {
             control_plates: Vec::new(),
             hover: None,
             pressed: None,
+            frost: None,
             background: None,
             frame: None,
             overlay: None,
@@ -519,6 +608,7 @@ impl Host {
         };
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, 91, 250, None);
+        self.state.borrow_mut().sync_spin_timer();
         crate::window::apply_window_mode(hwnd, floating, inspect);
         let mut s = self.state.borrow_mut();
         s.poll();
@@ -539,8 +629,14 @@ impl Host {
     }
     pub unsafe fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
-        s.background = None;
-        s.overlay = None;
+        s.glass.borrow_mut().refresh();
+        if let Some(glass) = &mut s.local_glass {
+            glass.refresh();
+        }
+        if !s.moving {
+            s.background = None;
+            s.overlay = None;
+        }
         if IsWindowVisible(s.hwnd) != 0 {
             InvalidateRect(s.hwnd, null(), 0);
         }
@@ -662,12 +758,73 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.flush_settings();
             0
         }
+        WM_TIMER if wp == 93 => {
+            let elapsed = s.spin_updated.elapsed().as_secs_f32().min(0.1);
+            s.spin_updated = Instant::now();
+            if s.playback.playing
+                && !s.moving
+                && IsWindowVisible(hwnd) != 0
+                && matches!(s.config.design.as_str(), "orbit" | "disc" | "turntable")
+            {
+                s.spin_angle = responsive::advance_spin(s.spin_angle, elapsed);
+                if !s.frame_queued {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            0
+        }
+        WM_TIMER if wp == 94 => {
+            if s.coverflow_anim.is_some_and(|a| !a.finished())
+                && s.config.design == "coverflow"
+                && IsWindowVisible(hwnd) != 0
+            {
+                if !s.frame_queued {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            } else {
+                s.coverflow_anim = None;
+                KillTimer(hwnd, 94);
+                if !s.spin_active {
+                    s.anim_clock = None;
+                }
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            s.frame_queued = false;
+            if s.last_poll.elapsed() >= std::time::Duration::from_millis(200) {
+                s.poll();
+            }
+            let mut dirty = false;
+            if s.playback.playing
+                && !s.moving
+                && IsWindowVisible(hwnd) != 0
+                && matches!(s.config.design.as_str(), "orbit" | "disc" | "turntable")
+            {
+                let elapsed = s.spin_updated.elapsed().as_secs_f32().min(0.1);
+                s.spin_updated = Instant::now();
+                s.spin_angle = responsive::advance_spin(s.spin_angle, elapsed);
+                dirty = true;
+            }
+            if s.coverflow_anim.is_some_and(|a| !a.finished())
+                && s.config.design == "coverflow"
+                && IsWindowVisible(hwnd) != 0
+            {
+                dirty = true;
+            }
+            if dirty {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         m if m == settings::NOTIFY => {
             s.settings_changed();
             0
         }
         WM_TIMER => {
             s.poll();
+            s.sync_spin_timer();
             0
         }
         m if m == WM_APP + 81 => {
@@ -784,8 +941,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_MOUSEWHEEL => {
+            let delta = ((wp >> 16) as i16) as i32;
             if s.config.queue {
-                let delta = ((wp >> 16) as i16) as i32;
                 s.queue_offset = if delta > 0 {
                     s.queue_offset.saturating_sub(1)
                 } else {
@@ -793,6 +950,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 };
                 s.restore_art();
                 InvalidateRect(hwnd, null(), 0);
+            } else if s.config.design == "coverflow" && s.playback.available {
+                if delta > 0 && s.playback.can_previous {
+                    s.activate(Action::Previous, 0.);
+                } else if delta < 0 && s.playback.can_next {
+                    s.activate(Action::Next, 0.);
+                }
             }
             0
         }
@@ -818,10 +981,29 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_SIZE => {
-            s.frame = None;
-            s.background = None;
-            s.overlay = None;
-            InvalidateRect(hwnd, null(), 0);
+            let width = (lp as u32 & 0xffff) as i32;
+            let height = ((lp as u32 >> 16) & 0xffff) as i32;
+            if width > 0
+                && height > 0
+                && s.frame
+                    .as_ref()
+                    .is_none_or(|b| !b.matches_geometry(width, height, s.dpi, 34.))
+            {
+                s.frame = None;
+                s.background = None;
+                if !s.moving { s.overlay = None; }
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            if (s.config.frosted_glass || crate::glass::liquid_glass())
+                && crate::glass::move_paint_due(hwnd)
+            {
+                s.background = None;
+                s.frost = None;
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_WINDOWPOSCHANGED => {
@@ -855,8 +1037,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
-            if !s.moving {
+            let mut changed = s.glass.borrow_mut().refresh();
+            if let Some(glass) = &mut s.local_glass {
+                changed |= glass.refresh();
+            }
+            if !s.moving && (changed || msg == WM_DISPLAYCHANGE) {
                 s.background = None;
+                s.overlay = None;
             }
             InvalidateRect(hwnd, null(), 0);
             0
@@ -1043,10 +1230,9 @@ mod tests {
                 }
                 for design in model::DESIGNS {
                     let size = match design {
-                        "lumen" => [360., 180.],
+                        "compact" => [360., 180.],
                         "orbit" => [400., 480.],
                         "disc" => [620., 260.],
-                        "sky" => [480., 620.],
                         _ => [560., 480.],
                     };
                     SetWindowPos(
@@ -1224,9 +1410,9 @@ mod tests {
                         "appearance control {required} must remain a slider"
                     );
                 }
-                assert!(!rows
-                    .iter()
-                    .any(|r| matches!(r, crate::settings_ui::Row::Button { .. })));
+                assert_eq!(rows.iter().filter_map(|r|match r {
+                    crate::settings_ui::Row::Button{id,..}=>Some(*id),_=>None
+                }).collect::<Vec<_>>(),vec![204],"only the explicit sign-in action is a button; appearance controls remain sliders");
                 let revision = shared.borrow().revision();
                 for (id, value) in [(102, 17.), (103, 60.), (104, 27.), (105, 0.)] {
                     assert!(s.apply_setting(crate::settings_ui::Change {
@@ -1322,6 +1508,8 @@ mod tests {
             );
             SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
             assert!(host.state.borrow().moving);
+            host.state.borrow_mut().frame = Buffer::plain(100, 100, 1.);
+            assert!(host.state.borrow().frame.is_some());
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -1339,6 +1527,8 @@ mod tests {
                 !probe.blocked.get(),
                 "default processing must release State before nested callbacks"
             );
+            assert!(host.state.borrow().frame.is_none(),
+                "live resize must discard the old-sized frame before mouse release");
             let suggested = RECT {
                 left: 60,
                 top: 70,
@@ -1411,8 +1601,16 @@ mod tests {
             );
             let mut before: RECT = zeroed();
             GetWindowRect(hwnd, &mut before);
+            host.state.borrow_mut().paint();
+            let background_dc = host.state.borrow().background.as_ref().unwrap().dc;
             for _ in 0..8 {
+                SendMessageW(hwnd, WM_SIZE, SIZE_RESTORED as usize, 640 | (480 << 16));
                 host.state.borrow_mut().paint();
+                assert_eq!(
+                    host.state.borrow().background.as_ref().unwrap().dc,
+                    background_dc,
+                    "unchanged size and playback repaint must reuse wallpaper backing"
+                );
                 let mut after: RECT = zeroed();
                 let mut client: RECT = zeroed();
                 GetWindowRect(hwnd, &mut after);
@@ -1431,6 +1629,59 @@ mod tests {
             assert_eq!(IsWindowVisible(hwnd), 0);
             drop(host);
             eprintln!("music-paint-regression: hidden host released");
+        }
+    }
+    #[test]
+    fn disc_rotation_changes_art_without_rebuilding_its_cached_pixels() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _runtime = render::Runtime::start().unwrap();
+            let host = Host::create(
+                &test_root("disc-spin"),
+                Rc::new(RefCell::new(Glass::new(13., 1.))),
+                true,
+                true,
+            )
+            .unwrap();
+            let mut s = host.state.borrow_mut();
+            s.dpi = 1.;
+            s.config.design = "disc".into();
+            s.playback.art = Some("spin-fixture".into());
+            s.images.insert(
+                "spin-fixture".into(),
+                Image::from_rgba(
+                    32,
+                    32,
+                    (0..1024)
+                        .flat_map(|i| {
+                            [
+                                if i % 32 < 16 { 220 } else { 30 },
+                                if i / 32 < 16 { 180 } else { 50 },
+                                70,
+                                255,
+                            ]
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+            let a = Buffer::plain(480, 360, 1.).unwrap();
+            let b = Buffer::plain(480, 360, 1.).unwrap();
+            s.content(a.dc, 480., 360.);
+            let cached = s.rounded_art.borrow().len();
+            s.spin_angle = 45.;
+            s.content(b.dc, 480., 360.);
+            assert!(cached > 0);
+            assert_eq!(
+                s.rounded_art.borrow().len(),
+                cached,
+                "rotation must reuse the disc raster"
+            );
+            assert_ne!(
+                a.snapshot(),
+                b.snapshot(),
+                "rotation must visibly rotate the artwork"
+            );
         }
     }
     #[test]
@@ -1457,7 +1708,14 @@ mod tests {
                     [560, 480],
                     [1000, 920],
                 ] {
-                    for (queue, dpi) in [(false, 1.0_f32), (true, 1.0), (false, 1.5), (true, 1.5)] {
+                    for (queue, dpi, signed_in) in [
+                        (false, 1.0_f32, false),
+                        (true, 1.0, false),
+                        (false, 1.5, false),
+                        (true, 1.5, false),
+                        (false, 1.0, true),
+                        (false, 1.5, true),
+                    ] {
                         let mut s = State {
                             hwnd: null_mut(),
                             root: PathBuf::new(),
@@ -1470,6 +1728,7 @@ mod tests {
                             glass: Rc::new(RefCell::new(Glass::new(13., 1.))),
                             backend: None,
                             playback: Playback {
+                                signed_in,
                                 video_id: "preview0004".into(),
                                 available: true,
                                 can_seek: true,
@@ -1496,6 +1755,14 @@ mod tests {
                             media_icons: icons::Icons::default(),
                             button_lenses: lenses::Lenses::default(),
                             received: Instant::now(),
+                            last_poll: Instant::now(),
+                            last_seek: None,
+                            spin_angle: 0.,
+                            spin_updated: Instant::now(),
+                            spin_active: false,
+                            coverflow_anim: None,
+                            anim_clock: None,
+                            frame_queued: false,
                             images: HashMap::new(),
                             card_cache: HashMap::new(),
                             rounded_art: RefCell::new(HashMap::new()),
@@ -1504,7 +1771,8 @@ mod tests {
                             control_plates: Vec::new(),
                             hover: None,
                             pressed: None,
-                            background: None,
+                            frost: None,
+            background: None,
                             frame: None,
                             overlay: None,
                             shadow: None,
@@ -1558,7 +1826,34 @@ mod tests {
                         let batch = render::AlphaBatch::new(b.dc, dpi);
                         s.content(b.dc, size[0] as f32, size[1] as f32);
                         drop(batch);
+                        if design != "coverflow" {
+                            for action in [Action::Previous, Action::Toggle, Action::Next] {
+                                let button = s
+                                    .buttons
+                                    .iter()
+                                    .find(|b| b.action == action)
+                                    .expect("media control retained");
+                                assert!(
+                                    button.rect[2] - button.rect[0] >= 28.
+                                        && button.rect[3] - button.rect[1] >= 28.,
+                                    "{design}: controls must not shrink with art"
+                                );
+                            }
+                            if signed_in {
+                                assert_eq!(
+                                    s.buttons
+                                        .iter()
+                                        .filter(|b| b.action == Action::Browse)
+                                        .count(),
+                                    1
+                                );
+                            }
+                        }
                         for button in &s.buttons {
+                            assert!(
+                                !matches!(button.action, Action::Queue | Action::Track(_)),
+                                "{design}: playlist UI must be absent at every size"
+                            );
                             assert!(
                                 button.rect[0] >= 0.
                                     && button.rect[1] >= 0.
@@ -1599,9 +1894,21 @@ mod tests {
                                     .is_none(),
                                 "Browse may only be hidden in tiny mode"
                             );
-                            assert!(s.buttons.iter().all(|b| matches!(b.action,
-                                Action::Toggle | Action::Settings | Action::Close)),
-                                "tiny layout must hide secondary actions even when queue is enabled");
+                            assert!(
+                                s.buttons.iter().all(|b| matches!(
+                                    b.action,
+                                    Action::Toggle
+                                        | Action::Previous
+                                        | Action::Next
+                                        | Action::Seek
+                                        | Action::Library
+                                        | Action::Browse
+                                        | Action::Settings
+                                        | Action::Close
+                                        | Action::SignIn
+                                )),
+                                "small layouts retain media controls but never playlist actions"
+                            );
                         }
                         let pixels = b.snapshot();
                         let body =
@@ -1609,7 +1916,6 @@ mod tests {
                         let full_reference = !queue
                             && match design {
                                 "orbit" => size[0] >= 320 && size[1] as f32 - body >= 350.,
-                                "sky" => size[0] >= 420 && size[1] as f32 - body >= 420.,
                                 _ => false,
                             };
                         if full_reference {

@@ -1,6 +1,6 @@
 //! Staged checkbox selection: only Done changes persisted group membership.
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Hit {
     Cancel,
@@ -10,6 +10,9 @@ pub(super) enum Hit {
 pub(super) struct State {
     pub checked: HashSet<String>,
     pub pressed: Option<Hit>,
+    pub hover: Option<Hit>,
+    button_hover: [crate::motion::Tween; 2],
+    check_tweens: HashMap<String, crate::motion::Tween>,
     query: String,
     scroll: f32,
     selected: usize,
@@ -21,9 +24,16 @@ impl App {
         }
         self.cancel_pointer(hwnd);
         self.popup = None;
+        let mut check_tweens = HashMap::new();
+        let mut initial = crate::motion::Tween::fixed(0.);
+        initial.target(1., self.now(), 160., [0.25, 0.1, 0.25, 1.]);
+        check_tweens.insert(id.to_owned(), initial);
         self.group_selection = Some(State {
             checked: [id.to_owned()].into_iter().collect(),
             pressed: None,
+            hover: None,
+            button_hover: [crate::motion::Tween::fixed(0.); 2],
+            check_tweens,
             query: self.query.clone(),
             scroll: self.scroll.value(self.now()),
             selected: self.selected,
@@ -79,6 +89,31 @@ impl App {
         InvalidateRect(hwnd, null(), 0);
         true
     }
+    pub(super) unsafe fn group_selection_move(&mut self, hwnd: HWND, p: [f32; 2]) -> bool {
+        if self.group_selection.is_none() {
+            return false;
+        }
+        let now = self.now();
+        let hit = self.group_selection_hit(hwnd, p);
+        if let Some(state) = &mut self.group_selection {
+            if state.hover != hit {
+                state.hover = hit;
+                const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.];
+                let cancel_hot = state.hover == Some(Hit::Cancel);
+                let done_hot = state.hover == Some(Hit::Done) && state.checked.len() >= 2;
+                state.button_hover[0].target(if cancel_hot { 1. } else { 0. }, now, 180., EASE);
+                state.button_hover[1].target(if done_hot { 1. } else { 0. }, now, 180., EASE);
+                self.arm_motion(hwnd);
+            }
+        }
+        false
+    }
+    pub(super) fn group_selection_moving(&self, now: f64) -> bool {
+        self.group_selection.as_ref().is_some_and(|s| {
+            s.button_hover.iter().any(|t| t.moving(now))
+                || s.check_tweens.values().any(|t| t.moving(now))
+        })
+    }
     pub(super) unsafe fn group_selection_up(&mut self, hwnd: HWND, p: [f32; 2]) -> bool {
         if self.group_selection.is_none() {
             return false;
@@ -93,11 +128,21 @@ impl App {
                 Hit::Cancel => self.finish_group_selection(hwnd, false),
                 Hit::Done => self.finish_group_selection(hwnd, true),
                 Hit::Item(id) => {
+                    let now = self.now();
                     if let Some(state) = &mut self.group_selection {
-                        if !state.checked.remove(&id) {
-                            state.checked.insert(id);
-                        }
+                        let checked = if !state.checked.remove(&id) {
+                            state.checked.insert(id.clone());
+                            true
+                        } else {
+                            false
+                        };
+                        state
+                            .check_tweens
+                            .entry(id)
+                            .or_insert_with(|| crate::motion::Tween::fixed(if checked { 0. } else { 1. }))
+                            .target(if checked { 1. } else { 0. }, now, 160., [0.25, 0.1, 0.25, 1.]);
                     }
+                    self.arm_motion(hwnd);
                 }
             }
         }
@@ -183,7 +228,8 @@ impl App {
                 0,
             );
         }
-        for (hit, label, r) in [
+        let now = self.paint_time;
+        for (i, (hit, label, r)) in [
             (
                 Hit::Cancel,
                 "Cancel",
@@ -194,8 +240,19 @@ impl App {
                 "Done",
                 [w as f32 - 92., 22., w as f32 - 24., 52.],
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let enabled = hit != Hit::Done || state.checked.len() >= 2;
+            let hover = state.button_hover[i].sample(now);
+            let alpha = if hit == Hit::Done && enabled {
+                (220. + hover * 30.).round() as u8
+            } else if enabled {
+                (16. + hover * 18.).round() as u8
+            } else {
+                16
+            };
             c.round(
                 r,
                 15.,
@@ -204,7 +261,7 @@ impl App {
                 } else {
                     ink
                 },
-                if hit == Hit::Done && enabled { 220 } else { 16 },
+                alpha,
                 false,
                 false,
             );
@@ -230,17 +287,19 @@ impl App {
         };
         let c = Canvas::new(dc, self.dpi);
         let checked = state.checked.contains(id);
+        let t = state
+            .check_tweens
+            .get(id)
+            .map_or(if checked { 1. } else { 0. }, |tw| tw.sample(self.paint_time));
         let accent = self.selection_color();
-        if checked {
-            c.round(r, 20., accent, 135, true, false);
+        if t > 0.01 {
+            c.round(r, 20., accent, (135. * t).round() as u8, true, false);
         }
         let b = [r[2] - 24., r[1] + 5., r[2] - 6., r[1] + 23.];
         c.round(
             b,
             6.,
-            if checked {
-                accent
-            } else if self.dock.light {
+            if self.dock.light {
                 0xffffff
             } else {
                 rgb(31, 37, 47)
@@ -249,15 +308,18 @@ impl App {
             false,
             false,
         );
+        if t > 0.01 {
+            c.round(b, 6., accent, (235. * t).round() as u8, false, false);
+        }
         c.round(
             b,
             6.,
-            if checked { 0xffffff } else { self.search_ink },
-            if checked { 110 } else { 150 },
+            if t > 0.5 { 0xffffff } else { self.search_ink },
+            (150. - 40. * t).round() as u8,
             true,
             false,
         );
-        if checked {
+        if t > 0.01 {
             c.line(
                 &[
                     (b[0] + 4., b[1] + 9.),
@@ -265,7 +327,7 @@ impl App {
                     (b[0] + 14., b[1] + 5.),
                 ],
                 0xffffff,
-                255,
+                (255. * t).round() as u8,
                 1.8,
             );
         }

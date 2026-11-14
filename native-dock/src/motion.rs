@@ -1,6 +1,16 @@
 //! Time-based motion copied from the original dock's CSS/FLIP timings.
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 pub type Point = [f32; 2];
+static LOW_POWER: AtomicBool = AtomicBool::new(true);
+pub fn set_low_power(enabled: bool) {
+    LOW_POWER.store(enabled, Ordering::Relaxed);
+}
+pub fn low_power() -> bool {
+    LOW_POWER.load(Ordering::Relaxed)
+}
 #[link(name = "winmm")]
 extern "system" {
     fn timeBeginPeriod(period: u32) -> u32;
@@ -19,6 +29,31 @@ impl Drop for FrameClock {
             unsafe {
                 timeEndPeriod(1);
             }
+        }
+    }
+}
+pub const VSYNC_FRAME: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 19;
+pub unsafe fn pace_vsync(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    frame_started: std::time::Instant,
+    frame_queued: &mut bool,
+    message: u32,
+) {
+    if low_power() {
+        return;
+    }
+    let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
+    if present_ms < 12. {
+        let synced = if present_ms < 5.5 {
+            let flush_started = std::time::Instant::now();
+            let hr = windows_sys::Win32::Graphics::Dwm::DwmFlush();
+            hr == 0 || flush_started.elapsed().as_secs_f64() * 1000. >= 0.2
+        } else {
+            true
+        };
+        if synced && !*frame_queued {
+            *frame_queued = true;
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, message, 0, 0);
         }
     }
 }
@@ -46,6 +81,7 @@ pub fn bezier(t: f32, curve: [f32; 4]) -> f32 {
     }
 }
 const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.];
+const HOVER_FADE: [f32; 4] = [0.37, 0., 0.63, 1.];
 const LIFT: [f32; 4] = [0.2, 0.9, 0.2, 1.];
 const MOVE: [f32; 4] = [0.22, 0.9, 0.24, 1.];
 #[derive(Clone, Copy)]
@@ -169,6 +205,7 @@ pub struct Node {
     pub hover: Tween,
     pub scale: Tween,
     pub lift: Tween,
+    pub alpha: Tween,
     pub pointer: Point,
 }
 impl Node {
@@ -179,6 +216,7 @@ impl Node {
             hover: Tween::fixed(0.),
             scale: Tween::fixed(1.),
             lift: Tween::fixed(0.),
+            alpha: Tween::fixed(1.),
             pointer: point,
         }
     }
@@ -189,6 +227,7 @@ pub struct Visual {
     pub hover: f32,
     pub scale: f32,
     pub lift: f32,
+    pub alpha: f32,
     pub pointer: Point,
     pub launch: f32,
 }
@@ -219,12 +258,26 @@ pub struct Motion {
     pub clock: Option<FrameClock>,
     pub toolbar: HashMap<usize, Tween>,
     pub toolbar_rotation: HashMap<usize, Tween>,
+    pub toolbar_press: HashMap<usize, Tween>,
     pub search_focus: Tween,
+    pub search_clear: Tween,
+    pub status_alpha: Tween,
     pub scrollbar: Tween,
 }
 impl Motion {
+    pub fn search_clear_hover(&mut self, hovered: bool, now: f64) {
+        self.search_clear
+            .target(if hovered { 1. } else { 0. }, now, 180., EASE);
+    }
+    pub fn status_visible(&mut self, visible: bool, now: f64) {
+        self.status_alpha
+            .target(if visible { 1. } else { 0. }, now, 180., EASE);
+    }
     pub fn toolbar_hover(&mut self, index: Option<usize>, now: f64) {
-        for i in 0..5 {
+        self.toolbar_hover_count(index, 5, now);
+    }
+    pub fn toolbar_hover_count(&mut self, index: Option<usize>, count: usize, now: f64) {
+        for i in 0..count {
             self.toolbar_rotation
                 .entry(i)
                 .or_insert_with(|| Tween::fixed(0.))
@@ -232,21 +285,48 @@ impl Motion {
             self.toolbar
                 .entry(i)
                 .or_insert_with(|| Tween::fixed(0.))
-                .target(if index == Some(i) { 1. } else { 0. }, now, 180., EASE);
+                .target(
+                    if index == Some(i) { 1. } else { 0. },
+                    now,
+                    if index == Some(i) { 240. } else { 300. },
+                    HOVER_FADE,
+                );
+        }
+    }
+    pub fn toolbar_press(&mut self, index: Option<usize>, count: usize, now: f64) {
+        for i in 0..count {
+            self.toolbar_press
+                .entry(i)
+                .or_insert_with(|| Tween::fixed(1.))
+                .target(if index == Some(i) { 0.88 } else { 1. }, now, 140., LIFT);
         }
     }
     pub fn sync(&mut self, layout: &[(String, Point)], now: f64, animate: bool) {
+        let had_any = !self.nodes.is_empty();
         for (id, p) in layout {
+            let is_new = !self.nodes.contains_key(id);
             let node = self
                 .nodes
                 .entry(id.clone())
-                .or_insert_with(|| Node::new(*p));
+                .or_insert_with(|| {
+                    let mut n = Node::new(*p);
+                    if animate && had_any {
+                        n.alpha = Tween::fixed(0.);
+                    }
+                    n
+                });
             if animate {
                 node.x.target(p[0], now, 260., MOVE);
                 node.y.target(p[1], now, 260., MOVE);
+                if is_new && had_any {
+                    node.alpha.target(1., now, 180., EASE);
+                } else {
+                    node.alpha.target(1., now, 180., EASE);
+                }
             } else {
                 node.x = Tween::fixed(p[0]);
                 node.y = Tween::fixed(p[1]);
+                node.alpha = Tween::fixed(1.);
             }
         }
     }
@@ -254,8 +334,12 @@ impl Motion {
         for (id, node) in &mut self.nodes {
             let hovered = self.hovered.as_deref() == Some(id);
             let pressed = self.pressed.as_deref() == Some(id);
-            node.hover
-                .target(if hovered { 1. } else { 0. }, now, 200., EASE);
+            node.hover.target(
+                if hovered { 1. } else { 0. },
+                now,
+                if hovered { 240. } else { 320. },
+                HOVER_FADE,
+            );
             node.scale.target(
                 if pressed {
                     0.97
@@ -293,8 +377,8 @@ impl Motion {
             tween.target(
                 if id == Some(key.as_str()) { 1. } else { 0. },
                 now,
-                200.,
-                EASE,
+                if id == Some(key.as_str()) { 240. } else { 300. },
+                HOVER_FADE,
             );
         }
     }
@@ -327,6 +411,7 @@ impl Motion {
                 hover: n.hover.sample(now),
                 scale: n.scale.sample(now),
                 lift: n.lift.sample(now),
+                alpha: n.alpha.sample(now),
                 pointer: n.pointer,
                 launch,
             }
@@ -336,6 +421,7 @@ impl Motion {
                 hover: 0.,
                 scale: 1.,
                 lift: 0.,
+                alpha: 1.,
                 pointer: fallback,
                 launch,
             }
@@ -355,14 +441,17 @@ impl Motion {
         self.landing.is_some()
             || self.launching.is_some()
             || self.nodes.values().any(|n| {
-                [n.x, n.y, n.hover, n.scale, n.lift]
+                [n.x, n.y, n.hover, n.scale, n.lift, n.alpha]
                     .iter()
                     .any(|t| t.moving(now))
             })
             || self.group.values().any(|t| t.moving(now))
             || self.toolbar.values().any(|t| t.moving(now))
             || self.toolbar_rotation.values().any(|t| t.moving(now))
+            || self.toolbar_press.values().any(|t| t.moving(now))
             || self.search_focus.moving(now)
+            || self.search_clear.moving(now)
+            || self.status_alpha.moving(now)
             || self.scrollbar.moving(now)
     }
 }

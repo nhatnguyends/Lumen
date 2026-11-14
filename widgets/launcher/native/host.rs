@@ -56,6 +56,8 @@ const TITLE: &str = "Lumen · Native App Dock";
 const KEY_FROM_SEARCH: u32 = WM_APP + 1;
 const WIDGET_POINTER: u32 = WM_APP + 3;
 const WIDGET_REDRAW: u32 = WM_APP + 4;
+const MOTION_FRAME: u32 = WM_APP + 7;
+const WALLPAPER_READY: u32 = WM_APP + 20;
 const SEARCH_ID: usize = 100;
 const PIN_TIMER: usize = 1;
 const SMOKE_TIMER: usize = 2;
@@ -118,6 +120,7 @@ struct App {
     search_frost: Option<(String, render::Image)>,
     search_text: Option<(String, render::Image)>,
     list_base: Option<crate::compositor::Buffer>,
+    list_base_key: String,
     pointer: [f32; 2],
     paint_time: f64,
     toolbar_pressed: Option<usize>,
@@ -145,12 +148,14 @@ struct App {
     pending_resize: Option<RECT>,
     root: PathBuf,
     dock: Dock,
+    desktop_watch: Option<crate::desktop_sync::Watch>,
     edit: HWND,
     search_font: HFONT,
     search_brush: HBRUSH,
     query: String,
     selected: usize,
     scroll: crate::motion::SmoothScroll,
+    frame_queued: bool,
     hover: Option<usize>,
     icons: HashMap<String, Icon>,
     scaled_icons: HashMap<String, ((usize, u32), render::Image)>,
@@ -227,6 +232,7 @@ impl App {
             .collect();
         if let Some(host) = &mut self.general {
             host.set_visibility(visible);
+            host.set_pinned(self.dock.pinned_widgets.clone());
             if let Some(error) = errors.last() {
                 host.report_error(error);
             }
@@ -259,9 +265,24 @@ impl App {
     unsafe fn manage(&mut self, action: crate::general::Action) -> Result<(), String> {
         use crate::general::Action::*;
         match &action {
+            RefreshGlass => {
+                self.notify_wallpaper_changed(self.hwnd);
+            }
             RestartUpdate => {
                 crate::update::restart(&self.root)?;
-                PostMessageW(self.hwnd,WM_CLOSE,0,0);
+                PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+            }
+            Pin(id, pinned) => {
+                if *pinned {
+                    if !self.dock.pinned_widgets.iter().any(|p| p == id) {
+                        self.dock.pinned_widgets.push(id.clone());
+                    }
+                } else {
+                    self.dock.pinned_widgets.retain(|p| p != id);
+                }
+                self.layout_edit(self.hwnd);
+                self.settings_changed(true, false);
+                self.save();
             }
             Show(id) | Settings(id) => {
                 let settings = matches!(&action, Settings(_));
@@ -303,55 +324,6 @@ impl App {
                 }
                 self.packages.remember(id, false, self.smoke);
             }
-            ShowAll | HideAll => {
-                let mut errors = vec![];
-                for id in self.packages.ids() {
-                    if let Err(error) = self.manage(if matches!(&action, ShowAll) {
-                        Show(id)
-                    } else {
-                        Hide(id)
-                    }) {
-                        errors.push(error);
-                    }
-                }
-                if !errors.is_empty() {
-                    return Err(errors.join("; "));
-                }
-            }
-            Opacity(_) | Floating(_) => {
-                let opacity = if let Opacity(v) = action {
-                    Some(v.clamp(0., 100.))
-                } else {
-                    None
-                };
-                let floating = if let Floating(v) = action {
-                    Some(v)
-                } else {
-                    None
-                };
-                if let Some(v) = opacity {
-                    self.dock.opacity = v;
-                }
-                if let Some(v) = floating {
-                    self.dock.floating = v;
-                    apply_window_mode(self.hwnd, v, self.inspect);
-                }
-                self.background_key.clear();
-                self.save();
-                InvalidateRect(self.hwnd, null(), 0);
-                for id in self
-                    .packages
-                    .ids()
-                    .into_iter()
-                    .filter(|id| id != "launcher")
-                {
-                    self.packages
-                        .ensure(&id, self.glass.clone(), self.inspect, self.smoke)?;
-                    if let Some(h) = self.packages.host_mut(&id) {
-                        h.apply_common(opacity, floating);
-                    }
-                }
-            }
         }
         self.refresh_manager();
         if let Some(host) = &mut self.general {
@@ -371,16 +343,8 @@ impl App {
             }
         }
         if let Settings(id) = action {
-            let target = if id == "launcher" {
-                self.settings.hwnd
-            } else {
-                self.packages
-                    .host(&id)
-                    .map(|h| h.hwnd())
-                    .unwrap_or(null_mut())
-            };
-            if !target.is_null() {
-                SetForegroundWindow(target);
+            if id == "launcher" && !self.settings.hwnd.is_null() {
+                SetForegroundWindow(self.settings.hwnd);
             }
         }
         Ok(())
@@ -390,6 +354,23 @@ impl App {
             eprintln!("widget-package: {error}");
             self.status = error;
         }
+    }
+    unsafe fn toggle_package(&mut self, id: &str) {
+        let visible = if id == "launcher" {
+            IsWindowVisible(self.hwnd) != 0
+        } else {
+            self.packages.host(id).is_some_and(|h| h.visible())
+        };
+        let action = if visible {
+            crate::general::Action::Hide(id.into())
+        } else {
+            crate::general::Action::Show(id.into())
+        };
+        if let Err(error) = self.manage(action) {
+            eprintln!("widget-package: {error}");
+            self.status = error;
+        }
+        InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn show_notes(&mut self) {
         self.show_package("notes");
@@ -423,11 +404,8 @@ impl App {
             return 72;
         }
         if self.search_visible() || self.group_selection.is_some() {
-            crate::geometry::dock_header(
-                unsafe { self.dimensions(self.hwnd).0 },
-                !self.query.is_empty(),
-            )
-            .grid_top
+            self.header_layout(unsafe { self.dimensions(self.hwnd).0 })
+                .grid_top
         } else {
             24
         }
@@ -593,13 +571,29 @@ impl App {
             && index < self.visible(hwnd).len() + usize::from(self.query.trim().is_empty()))
         .then_some(index)
     }
+    fn toolbar_items(&self) -> Vec<Option<String>> {
+        let mut items = vec![None];
+        for id in &self.dock.pinned_widgets {
+            if self.packages.manifests().iter().any(|m| m.id == *id)
+                && !items.iter().any(|existing| existing.as_deref() == Some(id.as_str()))
+            {
+                items.push(Some(id.clone()));
+            }
+        }
+        items.push(None);
+        items
+    }
+    fn header_layout(&self, w: i32) -> crate::geometry::DockHeader {
+        crate::geometry::dock_header_with_toolbar(w, !self.query.is_empty(), self.toolbar_items().len())
+    }
     fn toolbar_hit(&self, w: i32, p: [f32; 2]) -> Option<usize> {
-        let header = crate::geometry::dock_header(w, !self.query.is_empty());
+        let count = self.toolbar_items().len();
+        let header = self.header_layout(w);
         if !self.search_visible() || (p[1] - header.toolbar_y).abs() > 17. {
             return None;
         }
         let radius = if header.toolbar_step < 39. { 12. } else { 17. };
-        (0..5)
+        (0..count)
             .find(|i| (p[0] - (header.toolbar_x + *i as f32 * header.toolbar_step)).abs() < radius)
     }
     unsafe fn layout_edit(&mut self, hwnd: HWND) {
@@ -616,7 +610,7 @@ impl App {
             self.edit,
             self.px(58),
             self.px(26),
-            self.px(crate::geometry::dock_header(width, !self.query.is_empty()).edit_width),
+            self.px(self.header_layout(width).edit_width),
             self.px(23),
             0,
         );
@@ -640,6 +634,7 @@ impl App {
             return;
         }
         self.profile_counts[0] += 1;
+        let mut legacy_icon = None;
         if let Some(name) = &item.icon {
             // Imported Electron cache names must remain inside config/icons.
             let path = std::path::Path::new(name);
@@ -650,8 +645,11 @@ impl App {
                 )
             {
                 if let Some(icon) = load_png(&self.root.join("config/icons").join(path)) {
-                    self.icons.insert(item.id.clone(), icon);
-                    return;
+                    if name.starts_with("native-custom-") {
+                        self.icons.insert(item.id.clone(), icon);
+                        return;
+                    }
+                    legacy_icon = Some(icon);
                 }
             }
         }
@@ -665,6 +663,64 @@ impl App {
         } else {
             source.into()
         };
+        let _com = ComGuard::new();
+        let lower = key.to_ascii_lowercase();
+        let is_shortcut = lower.ends_with(".lnk") || lower.ends_with(".url");
+        let is_exe = matches!(
+            std::path::Path::new(&lower)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("exe" | "bat" | "cmd" | "com" | "msi" | "scr")
+        );
+        let mut image = if is_shortcut {
+            system_image_list_icon(&key).or_else(|| shell_item_image(&key, 0x04 | 0x01))
+        } else if key.starts_with("shell:") {
+            shell_item_image(&key, 0x04 | 0x01).or_else(|| system_image_list_icon(&key))
+        } else if is_exe {
+            private_extract_icon(&key)
+                .or_else(|| shell_item_image(&key, 0x04 | 0x01))
+                .or_else(|| system_image_list_icon(&key))
+        } else {
+            shell_item_image(&key, 0x01).or_else(|| system_image_list_icon(&key))
+        };
+        let low_res = image
+            .as_ref()
+            .is_none_or(|img| {
+                let [mx, my] = img.max_opaque_extent();
+                mx <= 64 && my <= 64
+            });
+        if low_res && !item.target.is_empty() && item.target != key {
+            let target_lower = item.target.to_ascii_lowercase();
+            let target_is_exe = matches!(
+                std::path::Path::new(&target_lower)
+                    .extension()
+                    .and_then(|e| e.to_str()),
+                Some("exe" | "ico" | "dll")
+            );
+            let better = if target_is_exe {
+                private_extract_icon(&item.target)
+                    .or_else(|| shell_item_image(&item.target, 0x04 | 0x01))
+            } else {
+                shell_item_image(&item.target, 0x04 | 0x01)
+            };
+            if let Some(candidate) = better {
+                let [cx, cy] = candidate.max_opaque_extent();
+                let [ox, oy] = image
+                    .as_ref()
+                    .map_or([0, 0], |img| img.max_opaque_extent());
+                if cx.max(cy) > ox.max(oy) {
+                    image = Some(candidate);
+                }
+            }
+        }
+        if let Some(image) = image {
+            self.icons.insert(item.id.clone(), Icon::Image(image));
+            return;
+        }
+        if let Some(icon) = legacy_icon {
+            self.icons.insert(item.id.clone(), icon);
+            return;
+        }
         let mut info: SHFILEINFOW = zeroed();
         if key.starts_with("shell:") {
             let mut pidl = null_mut();
@@ -700,6 +756,20 @@ impl App {
             Icon::Shell(info.hIcon)
         };
         self.icons.insert(item.id.clone(), icon);
+    }
+    unsafe fn notify_wallpaper_changed(&mut self, hwnd: HWND) {
+        if let Some(host) = &mut self.general {
+            host.refresh();
+        }
+        self.packages.refresh();
+        crate::fusion::refresh();
+        let color = self.glass.borrow().wallpaper_accent();
+        self.set_accent(color);
+        self.background_key.clear();
+        InvalidateRect(hwnd, null(), 0);
+        if !self.settings.hwnd.is_null() {
+            InvalidateRect(self.settings.hwnd, null(), 0);
+        }
     }
     unsafe fn open_item(&mut self, hwnd: HWND, index: usize) {
         let Some(item) = self.dock.items.get(index) else {
@@ -816,27 +886,34 @@ impl App {
         InvalidateRect(hwnd, null(), 0);
     }
     unsafe fn activate_toolbar(&mut self, hwnd: HWND, button: usize) {
+        let items = self.toolbar_items();
         if button == 0 {
+            if let Some(host) = &mut self.general {
+                if IsWindowVisible(host.hwnd()) != 0 {
+                    host.hide();
+                    InvalidateRect(hwnd, null(), 0);
+                    return;
+                }
+            }
             self.show_general();
             return;
         }
-        if button == 2 {
-            self.show_notes();
-            return;
-        }
-        if button == 3 {
-            self.show_calendar();
-            return;
-        }
-        if button == 4 {
+        if button + 1 == items.len() {
+            if !self.settings.hwnd.is_null() && IsWindowVisible(self.settings.hwnd) != 0 {
+                ShowWindow(self.settings.hwnd, SW_HIDE);
+                InvalidateRect(hwnd, null(), 0);
+                return;
+            }
             let mut point = POINT {
                 x: self.px(self.dimensions(hwnd).0 - 40),
                 y: self.px(62),
             };
             ClientToScreen(hwnd, &mut point);
             self.context_menu(hwnd, point.x, point.y, None);
-        } else if button == 1 {
-            self.show_music();
+            return;
+        }
+        if let Some(Some(id)) = items.get(button) {
+            self.toggle_package(id);
         }
     }
     unsafe fn context_menu(&mut self, hwnd: HWND, x: i32, y: i32, item: Option<usize>) {
@@ -1060,7 +1137,8 @@ impl App {
     unsafe fn paint(&mut self, hwnd: HWND) {
         let frame_started = std::time::Instant::now();
         let counts_before = self.profile_counts;
-        self.label_budget = 2;
+        let now = self.now();
+        self.label_budget = if self.scroll.moving(now) { 2 } else { 64 };
         self.cache_pending = false;
         render::take_cost();
         let mut ps: PAINTSTRUCT = zeroed();
@@ -1075,7 +1153,6 @@ impl App {
             .expect("native paint buffer");
         let dc = frame.dc;
         let mut p = palette(self.dock.light);
-        let now = self.now();
         self.paint_time = now;
         self.motion.search_focus.target(
             if GetFocus() == self.edit { 1. } else { 0. },
@@ -1087,7 +1164,7 @@ impl App {
         let mut window: RECT = zeroed();
         GetWindowRect(hwnd, &mut window);
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             window.left,
             window.top,
             client.right,
@@ -1097,17 +1174,72 @@ impl App {
             self.dock.frosted,
             self.dock.tint,
             self.dock.frost_strength,
-            self.dock.opacity,
             self.dock.light,
             self.glass.borrow().revision(),
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
             crate::fusion::revision(hwnd)
         );
-        let frozen_background = self.moving_window
-            && self.background.as_ref().is_some_and(|b| {
-                b.width == client.right && b.height == client.bottom && b.dpi == self.dpi
-            });
-        if (key == self.background_key || frozen_background) && self.background.is_some() {
+        let bg_cached = key == self.background_key && self.background.is_some();
+        let own_alpha = (self.dock.opacity * 2.55).round() as u8;
+        let group_op = crate::fusion::group_opacities(hwnd, own_alpha);
+        let toolbar_items = self.toolbar_items();
+        let fast_header_key = if bg_cached
+            && self.resize_drag.is_none()
+            && self.group_selection.is_none()
+            && !self.background_key.is_empty()
+        {
+            let mut hk = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                self.background_key,
+                self.search_visible(),
+                self.query,
+                GetFocus() == self.edit && self.caret_on,
+                (self.motion.search_clear.sample(now) * 1000.).round() as i32,
+                self.dock.opacity,
+                (self.motion.search_focus.sample(now) * 1000.).round() as i32,
+                self.placeholder_opacity(),
+                self.search_ink,
+                self.search_muted,
+                w,
+                self.dock.pinned_widgets.join(",")
+            );
+            if let Some((_, ops)) = &group_op {
+                for o in ops {
+                    hk.push_str(&format!(":{o}"));
+                }
+            }
+            for i in 0..toolbar_items.len() {
+                let a = self.motion.toolbar.get(&i).map_or(0., |t| t.sample(now));
+                let r = self
+                    .motion
+                    .toolbar_rotation
+                    .get(&i)
+                    .map_or(0., |t| t.sample(now));
+                let p = self
+                    .motion
+                    .toolbar_press
+                    .get(&i)
+                    .map_or(1., |t| t.sample(now));
+                hk.push_str(&format!(
+                    ":{}:{}:{}",
+                    (a * 1000.).round() as i32,
+                    (r * 100.).round() as i32,
+                    (p * 1000.).round() as i32
+                ));
+            }
+            hk
+        } else {
+            String::new()
+        };
+        let fast_reused_header = !fast_header_key.is_empty()
+            && fast_header_key == self.list_base_key
+            && self
+                .list_base
+                .as_ref()
+                .is_some_and(|b| b.width == frame.width && b.height == frame.height && b.dpi == self.dpi);
+        if fast_reused_header {
+            // Skip copying self.background because self.list_base will overwrite the frame.
+        } else if bg_cached {
             frame.copy_from(self.background.as_ref().unwrap().dc);
         } else {
             if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
@@ -1133,13 +1265,12 @@ impl App {
                 100.
             };
             let overlay_key = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}",
                 client.right,
                 client.bottom,
                 self.dpi,
                 self.theme_color(),
                 tint,
-                self.dock.opacity,
                 self.dock.light
             );
             if (self.resize_drag.is_none() || self.overlay.is_none())
@@ -1156,7 +1287,13 @@ impl App {
                 )
                 .map(|image| (overlay_key, image));
             }
-            let pane = [4., 4., w as f32 - 4., h as f32 - 4.];
+            let fused = crate::fusion::fused(hwnd);
+            let pane = if fused {
+                [0., 0., w as f32, h as f32]
+            } else {
+                [4., 4., w as f32 - 4., h as f32 - 4.]
+            };
+            let radius = if fused { 0. } else { 34. };
             {
                 let c = Canvas::new(dc, self.dpi);
                 if crate::surface::managed(&self.dock.theme) {
@@ -1164,14 +1301,14 @@ impl App {
                 } else {
                     c.round(
                         pane,
-                        34.,
+                        radius,
                         self.theme_color(),
                         (tint * 2.55).round() as u8,
                         false,
                         false,
                     );
                 }
-                c.coating(pane, 34.);
+                c.coating(pane, radius);
             }
             if let Some((_, image)) = &self.overlay {
                 Canvas::new(dc, self.dpi).image(
@@ -1194,16 +1331,22 @@ impl App {
                     .is_some_and(|(old, _)| old.starts_with(&prefix));
             if !live_reuse {
                 self.search_frost = frame
-                    .frosted_piece(
+                    .frosted_piece_opacity(
                         [16., 14., w as f32 - 16., 60.],
                         23.,
                         8.,
                         [-2., -1.],
                         self.theme_color(),
+                        0.25,
                     )
                     .map(|image| (format!("{prefix}{key}"), image));
             }
-            Canvas::new(dc, self.dpi).widget_corner_reflection(pane, 34., self.dock.light);
+            Canvas::new(dc, self.dpi).widget_corner_reflection_for(
+                hwnd,
+                pane,
+                34.,
+                self.dock.light,
+            );
             frame.bevel_for(hwnd);
             let cache = self
                 .background
@@ -1222,27 +1365,84 @@ impl App {
             };
         }
         let bg_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-        let luminance =
-            crate::contrast::sample(dc, self.dpi, [16., 14., (w - 16) as f32, (h - 14) as f32]);
-        let (ink, muted) = crate::contrast::inks(luminance, Some(self.search_ink));
-        self.search_ink = ink;
-        self.search_muted = muted;
-        p.text = ink;
-        p.muted = muted;
-        let alpha_batch = if self.dock.opacity < 100. {
+        if !fast_reused_header {
+            let luminance =
+                crate::contrast::sample(dc, self.dpi, [16., 14., (w - 16) as f32, (h - 14) as f32]);
+            let (ink, muted) = crate::contrast::inks(luminance, Some(self.search_ink));
+            self.search_ink = ink;
+            self.search_muted = muted;
+        }
+        p.text = self.search_ink;
+        p.muted = self.search_muted;
+        let needs_alpha = self.dock.opacity < 100. || group_op.is_some();
+        let alpha_batch = if needs_alpha {
             render::AlphaBatch::new(dc, self.dpi)
         } else {
             None
         };
-        let background_opacity = if alpha_batch.is_some() {
-            self.dock.opacity / 100.
-        } else {
-            1.
-        };
-        if alpha_batch.is_some() {
-            frame.background_alpha((background_opacity * 255.).round() as u8);
+        if alpha_batch.is_some() && !fast_reused_header {
+            frame.background_alpha_for(self.hwnd, own_alpha);
         }
         SetBkMode(dc, TRANSPARENT as i32);
+        let header_key = if !fast_header_key.is_empty() {
+            fast_header_key
+        } else if self.resize_drag.is_none()
+            && self.group_selection.is_none()
+            && !self.background_key.is_empty()
+        {
+            let mut hk = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                self.background_key,
+                self.search_visible(),
+                self.query,
+                GetFocus() == self.edit && self.caret_on,
+                (self.motion.search_clear.sample(now) * 1000.).round() as i32,
+                self.dock.opacity,
+                (self.motion.search_focus.sample(now) * 1000.).round() as i32,
+                self.placeholder_opacity(),
+                self.search_ink,
+                self.search_muted,
+                w,
+                self.dock.pinned_widgets.join(",")
+            );
+            if let Some((_, ops)) = &group_op {
+                for o in ops {
+                    hk.push_str(&format!(":{o}"));
+                }
+            }
+            for i in 0..toolbar_items.len() {
+                let a = self.motion.toolbar.get(&i).map_or(0., |t| t.sample(now));
+                let r = self
+                    .motion
+                    .toolbar_rotation
+                    .get(&i)
+                    .map_or(0., |t| t.sample(now));
+                let p = self
+                    .motion
+                    .toolbar_press
+                    .get(&i)
+                    .map_or(1., |t| t.sample(now));
+                hk.push_str(&format!(
+                    ":{}:{}:{}",
+                    (a * 1000.).round() as i32,
+                    (r * 100.).round() as i32,
+                    (p * 1000.).round() as i32
+                ));
+            }
+            hk
+        } else {
+            String::new()
+        };
+        let reused_header = fast_reused_header
+            || (!header_key.is_empty()
+                && header_key == self.list_base_key
+                && self
+                    .list_base
+                    .as_ref()
+                    .is_some_and(|b| b.width == frame.width && b.height == frame.height && b.dpi == self.dpi));
+        if reused_header {
+            frame.copy_from(self.list_base.as_ref().unwrap().dc);
+        } else {
         if self.search_visible() || self.group_selection.is_some() {
             let rect = [16., 14., w as f32 - 16., 60.];
             let prefix = format!("dpi{}:", self.dpi);
@@ -1289,17 +1489,17 @@ impl App {
             p.muted = muted;
             self.symbols
                 .draw_rotated_alpha(dc, self.dpi, 0, 32., 28., 16., p.muted, 0., 0.62);
-            let header = crate::geometry::dock_header(w, !self.query.is_empty());
+            let header = self.header_layout(w);
             let toolbar_dy = header.toolbar_y - 37.;
             if !header.compact {
-                let divider = w - 220;
+                let divider = (header.toolbar_x - 24.).round() as i32;
                 self.stroke(dc, &[(divider, 28), (divider, 46)], p.line, 1);
             }
-            for i in 0..5 {
+            for (i, item) in toolbar_items.iter().enumerate() {
                 let amount = self
                     .motion
                     .toolbar
-                    .get(&(i as usize))
+                    .get(&i)
                     .map_or(0., |t| t.sample(now));
                 let x = header.toolbar_x + i as f32 * header.toolbar_step;
                 if amount > 0.001 {
@@ -1311,49 +1511,59 @@ impl App {
                             * if crate::contrast::luminance(p.text) < 0.5 {
                                 128.
                             } else {
-                                19.
+                                36.
                             }) as u8,
                         false,
                         false,
                     );
                 }
-                let (toolbar_ink, toolbar_muted) = self.adaptive_ink(
+                let (toolbar_ink, _toolbar_muted) = self.adaptive_ink(
                     dc,
                     [x - 14., 22. + toolbar_dy, x + 14., 50. + toolbar_dy],
                     &format!("toolbar-{i}"),
                 );
-                let t = (amount * 24.).round() / 24.;
-                let channel = |shift: u32| {
-                    let v = ((toolbar_muted >> shift) & 255) as f32;
-                    (v + (((toolbar_ink >> shift) & 255) as f32 - v) * t).round() as u32
-                };
-                let color = channel(0) | channel(8) << 8 | channel(16) << 16;
+                let color = toolbar_ink;
                 let angle = self
                     .motion
                     .toolbar_rotation
-                    .get(&(i as usize))
+                    .get(&i)
                     .map_or(0., |t| t.sample(now));
+                let press_scale = self
+                    .motion
+                    .toolbar_press
+                    .get(&i)
+                    .map_or(1., |t| t.sample(now));
+                let symbol = if i == 0 {
+                    1
+                } else if i + 1 == toolbar_items.len() {
+                    5
+                } else if let Some(id) = item {
+                    crate::symbols::widget_symbol(id)
+                } else {
+                    1
+                };
+                let size = 16. * press_scale;
                 self.symbols.draw_rotated_alpha(
                     dc,
                     self.dpi,
-                    (i + 1) as usize,
-                    x - 8.,
-                    28. + toolbar_dy,
-                    16.,
+                    symbol,
+                    x - size * 0.5,
+                    36. + toolbar_dy - size * 0.5,
+                    size,
                     color,
                     angle,
-                    0.62 + amount * 0.28,
+                    0.85 + amount * 0.15,
                 );
             }
             if !self.query.is_empty() {
                 let x = header.clear_x;
-                let hover = self.clear_hit(hwnd, self.pointer);
+                let hover = self.motion.search_clear.sample(now);
                 let canvas = Canvas::new(dc, self.dpi);
                 canvas.round(
                     [x - 11., 26., x + 11., 48.],
                     11.,
                     p.text,
-                    if hover { 30 } else { 17 },
+                    (17. + hover * 13.).round() as u8,
                     false,
                     false,
                 );
@@ -1425,23 +1635,28 @@ impl App {
         }
         self.paint_group_selection_header(dc, w);
         render::flush(dc);
+        }
         let header_ms = frame_started.elapsed().as_secs_f64() * 1000.;
         let content_count = self.visible(hwnd).len()
             + usize::from(self.query.trim().is_empty() && self.group_selection.is_none());
         let needs_fade = self.grid_top()
             + content_count.div_ceil(self.columns(hwnd)) as i32 * self.row_height()
             > h - 14;
-        let base = if needs_fade {
+        let base = if needs_fade || !header_key.is_empty() {
             let base = self
                 .list_base
                 .take()
                 .filter(|b| b.width == frame.width && b.height == frame.height && b.dpi == self.dpi)
                 .or_else(|| crate::compositor::Buffer::plain(frame.width, frame.height, self.dpi))
                 .unwrap();
-            base.copy_from(dc);
+            if !reused_header {
+                base.copy_from(dc);
+                self.list_base_key = header_key;
+            }
             Some(base)
         } else {
             self.list_base = None;
+            self.list_base_key.clear();
             None
         };
         let clip = SaveDC(dc);
@@ -1469,27 +1684,28 @@ impl App {
             self.scroll.value(now),
         ) {
             let (bar_ink, _) = self.adaptive_ink(dc, bar, "scrollbar");
-            Canvas::new(dc, self.dpi).round(
+            frame.fill_round(
                 bar,
                 1.5,
                 bar_ink,
                 (90. * self.motion.scrollbar.sample(now)) as u8,
-                false,
-                false,
             );
         }
-        if !self.status.is_empty() {
+        self.motion.status_visible(!self.status.is_empty(), now);
+        let status_a = self.motion.status_alpha.sample(now);
+        if !self.status.is_empty() && status_a > 0.01 {
+            let dy = ((1. - status_a) * 6.).round() as i32;
             self.surface(
                 dc,
-                [w / 2 - 160, h - 38, w / 2 + 160, h - 10],
+                [w / 2 - 160, h - 38 + dy, w / 2 + 160, h - 10 + dy],
                 14,
-                40,
+                (40. * status_a).round() as u8,
                 false,
             );
             self.text(
                 dc,
                 &self.status,
-                [w / 2 - 150, h - 38, w / 2 + 150, h - 10],
+                [w / 2 - 150, h - 38 + dy, w / 2 + 150, h - 10 + dy],
                 10,
                 false,
                 p.text,
@@ -1501,7 +1717,7 @@ impl App {
             self.ensure_motion_timer(hwnd);
         }
         let cpu_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-        let preserve_alpha = alpha_batch.is_some();
+        let preserve_alpha = needs_alpha;
         drop(alpha_batch);
         frame.present_with_alpha(hwnd, preserve_alpha);
         if self.window_shadow.is_none() {
@@ -1511,11 +1727,11 @@ impl App {
             shadow.sync(hwnd, self.dpi, (self.dock.opacity * 2.55).round() as u8);
         }
         let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-        if self.motion.timer_running && present_ms < 12. {
-            windows_sys::Win32::Graphics::Dwm::DwmFlush();
-        }
         self.frame = Some(frame);
         EndPaint(hwnd, &ps);
+        if self.motion.timer_running {
+            crate::motion::pace_vsync(hwnd, frame_started, &mut self.frame_queued, MOTION_FRAME);
+        }
         if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
             eprintln!(
                 "native-frame ms={:.2} cpu={:.2} present={:.2} bg={:.2} header={:.2} tiles={:.2} regen={:?} draw_ns={:?} at={:.1}",
@@ -1594,6 +1810,157 @@ unsafe fn load_png(path: &std::path::Path) -> Option<Icon> {
     render::Image::load(path).map(Icon::Image)
 }
 
+struct ComGuard(bool);
+impl ComGuard {
+    unsafe fn new() -> Self {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        Self(CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) >= 0)
+    }
+}
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                windows_sys::Win32::System::Com::CoUninitialize();
+            }
+        }
+    }
+}
+
+struct ComPtr(*mut std::ffi::c_void);
+impl Drop for ComPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
+                    std::mem::transmute(com_slot(self.0, 2));
+                release(self.0);
+            }
+        }
+    }
+}
+
+unsafe fn com_slot(object: *mut std::ffi::c_void, index: usize) -> *const std::ffi::c_void {
+    let vtable = *(object as *const *const *const std::ffi::c_void);
+    *vtable.add(index)
+}
+
+unsafe fn private_extract_icon(key: &str) -> Option<render::Image> {
+    let mut hicon: HICON = null_mut();
+    let mut icon_id: u32 = 0;
+    let count = PrivateExtractIconsW(
+        wide(key).as_ptr(),
+        0,
+        256,
+        256,
+        &mut hicon,
+        &mut icon_id,
+        1,
+        0,
+    );
+    if count == 0 || count == u32::MAX || hicon.is_null() {
+        return None;
+    }
+    let image = render::Image::from_icon(hicon);
+    DestroyIcon(hicon);
+    image
+}
+
+unsafe fn shell_item_image(key: &str, flags: u32) -> Option<render::Image> {
+    let iid = windows_sys::core::GUID::from_u128(0xbcc18b79_ba16_442f_80c4_8a59c30c463b);
+    let mut factory = ComPtr(null_mut());
+    if SHCreateItemFromParsingName(wide(key).as_ptr(), null_mut(), &iid, &mut factory.0) < 0
+        || factory.0.is_null()
+    {
+        return None;
+    }
+    let get_image: unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        SIZE,
+        u32,
+        *mut HBITMAP,
+    ) -> i32 = std::mem::transmute(com_slot(factory.0, 3));
+    let mut hbitmap: HBITMAP = null_mut();
+    if get_image(factory.0, SIZE { cx: 256, cy: 256 }, flags, &mut hbitmap) < 0
+        || hbitmap.is_null()
+    {
+        return None;
+    }
+    let image = render::Image::from_hbitmap(hbitmap);
+    DeleteObject(hbitmap as _);
+    image
+}
+
+unsafe fn system_image_list_icon(key: &str) -> Option<render::Image> {
+    let mut info: SHFILEINFOW = zeroed();
+    let ok = if key.starts_with("shell:") {
+        let mut pidl = null_mut();
+        let res =
+            if SHParseDisplayName(wide(key).as_ptr(), null_mut(), &mut pidl, 0, null_mut()) >= 0
+                && !pidl.is_null()
+            {
+                let r = SHGetFileInfoW(
+                    pidl as _,
+                    0,
+                    &mut info,
+                    size_of::<SHFILEINFOW>() as u32,
+                    SHGFI_SYSICONINDEX | SHGFI_PIDL,
+                );
+                windows_sys::Win32::System::Com::CoTaskMemFree(pidl as _);
+                r
+            } else {
+                0
+            };
+        res != 0
+    } else {
+        SHGetFileInfoW(
+            wide(key).as_ptr(),
+            0,
+            &mut info,
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        ) != 0
+    };
+    if !ok {
+        return None;
+    }
+    let iid = windows_sys::core::GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
+    for (list_id, min_extent) in [(SHIL_JUMBO, 56u32), (SHIL_EXTRALARGE, 36u32), (SHIL_LARGE, 0u32)]
+    {
+        let mut list = ComPtr(null_mut());
+        if SHGetImageList(list_id as i32, &iid, &mut list.0) < 0 || list.0.is_null() {
+            continue;
+        }
+        let get_icon: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            i32,
+            u32,
+            *mut HICON,
+        ) -> i32 = std::mem::transmute(com_slot(list.0, 10));
+        let mut hicon: HICON = null_mut();
+        if get_icon(
+            list.0,
+            info.iIcon,
+            windows_sys::Win32::UI::Controls::ILD_TRANSPARENT,
+            &mut hicon,
+        ) < 0
+            || hicon.is_null()
+        {
+            continue;
+        }
+        let image = render::Image::from_icon(hicon);
+        DestroyIcon(hicon);
+        if let Some(image) = image {
+            let [mx, my] = image.max_opaque_extent();
+            if min_extent > 0 && mx <= min_extent && my <= min_extent {
+                continue;
+            }
+            return Some(image);
+        }
+    }
+    None
+}
+
 unsafe fn font(height: i32, bold: bool) -> HFONT {
     CreateFontW(
         -height,
@@ -1613,6 +1980,7 @@ unsafe fn font(height: i32, bold: bool) -> HFONT {
     )
 }
 pub(crate) unsafe fn apply_window_mode(hwnd: HWND, _floating: bool, inspect: bool) {
+    crate::desktop_layer::register(hwnd, !inspect);
     // Legacy saved flags remain readable, but widgets always belong to the desktop.
     let floating = false;
     let owner = if !floating && !inspect {
@@ -1641,38 +2009,7 @@ pub(crate) unsafe fn apply_window_mode(hwnd: HWND, _floating: bool, inspect: boo
 /// Same z-order strategy as src/main/win32.ts: immediately ABOVE the highest
 /// desktop surface, below ordinary applications. Never reparents into Explorer.
 pub(crate) unsafe fn pin_to_desktop(hwnd: HWND) {
-    let mut current = GetTopWindow(null_mut());
-    let mut after: HWND = null_mut();
-    for _ in 0..4096 {
-        if current.is_null() {
-            return;
-        }
-        let mut name = [0u16; 256];
-        let length = GetClassNameW(current, name.as_mut_ptr(), 256).max(0) as usize;
-        let class = String::from_utf16_lossy(&name[..length]);
-        if IsWindowVisible(current) != 0 && (class == "Progman" || class == "WorkerW") {
-            let mut next = GetWindow(hwnd, GW_HWNDNEXT);
-            while !next.is_null() && crate::fusion::is_surface(next) {
-                next = GetWindow(next, GW_HWNDNEXT);
-            }
-            if next != current {
-                SetWindowPos(
-                    hwnd,
-                    after,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                );
-            }
-            return;
-        }
-        if current != hwnd {
-            after = current;
-        }
-        current = GetWindow(current, GW_HWNDNEXT);
-    }
+    crate::desktop_layer::pin(hwnd);
 }
 fn xy(lparam: LPARAM) -> (i32, i32) {
     (
@@ -1804,7 +2141,11 @@ unsafe extern "system" fn wndproc(
         WM_CREATE => {
             app.hwnd = hwnd;
             app.dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
-            app.glass.borrow_mut().refresh();
+            if std::env::args().any(|a| a == "--smoke-test") {
+                app.glass.borrow_mut().refresh();
+            } else {
+                app.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
+            }
             let accent = app.glass.borrow().wallpaper_accent();
             app.accent_color = accent;
             if app.dock.theme == crate::accent::THEME {
@@ -1970,10 +2311,7 @@ unsafe extern "system" fn wndproc(
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             let refreshed = app.glass.borrow_mut().refresh();
             if refreshed {
-                let color = app.glass.borrow().wallpaper_accent();
-                app.set_accent(color);
-                app.background_key.clear();
-                InvalidateRect(hwnd, null(), 0);
+                app.notify_wallpaper_changed(hwnd);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -2002,9 +2340,9 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_MOVE => {
-            // Windows can move the existing layered surface directly. Do not
-            // schedule wallpaper work for every intermediate mouse position.
-            if !app.moving_window {
+            if (!app.moving_window || app.dock.frosted || crate::glass::liquid_glass())
+                && crate::glass::move_paint_due(hwnd)
+            {
                 InvalidateRect(hwnd, null(), 0);
             }
             0
@@ -2033,12 +2371,19 @@ unsafe extern "system" fn wndproc(
             if app.bar_drag.take().is_some() {
                 ReleaseCapture();
             } else if let Some(button) = app.toolbar_pressed.take() {
+                let count = app.toolbar_items().len();
+                let now = app.now();
+                app.motion.toolbar_press(None, count, now);
+                app.arm_motion(hwnd);
                 ReleaseCapture();
                 if app.toolbar_hit(app.dimensions(hwnd).0, p) == Some(button) {
                     app.activate_toolbar(hwnd, button);
                 }
             } else if app.add_pressed {
                 app.add_pressed = false;
+                let now = app.now();
+                app.motion.press(None, now);
+                app.arm_motion(hwnd);
                 ReleaseCapture();
                 if app.hit(hwnd, p[0] as i32, p[1] as i32) == Some(app.visible(hwnd).len()) {
                     app.add_anything(hwnd);
@@ -2180,6 +2525,7 @@ unsafe extern "system" fn wndproc(
             app.motion.hover(None, p, now);
             app.hover = None;
             app.arm_motion(hwnd);
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_KEYDOWN | KEY_FROM_SEARCH => {
@@ -2226,6 +2572,10 @@ unsafe extern "system" fn wndproc(
             if let Some(button) = app.toolbar_hit(width, p) {
                 SetFocus(hwnd);
                 app.toolbar_pressed = Some(button);
+                let count = app.toolbar_items().len();
+                let now = app.now();
+                app.motion.toolbar_press(Some(button), count, now);
+                app.arm_motion(hwnd);
                 SetCapture(hwnd);
             } else if app.search_visible() && (14..60).contains(&y) {
                 SetFocus(app.edit);
@@ -2233,6 +2583,9 @@ unsafe extern "system" fn wndproc(
                 if pos == app.visible(hwnd).len() {
                     SetFocus(hwnd);
                     app.add_pressed = true;
+                    let now = app.now();
+                    app.motion.press(Some("__add".into()), now);
+                    app.arm_motion(hwnd);
                     SetCapture(hwnd);
                     return 0;
                 }
@@ -2275,6 +2628,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_MOUSELEAVE => {
             app.check_widget_pointer(hwnd);
+            app.popup_leave(hwnd);
             if app.tile_drag.is_none() {
                 app.hover_tile(hwnd, [-1000., -1000.]);
             }
@@ -2302,6 +2656,10 @@ unsafe extern "system" fn wndproc(
             if app.popup_wheel(hwnd, delta) {
                 return 0;
             }
+            let pointer = app.pointer;
+            app.hover = None;
+            app.motion.hover(None, pointer, now);
+            app.motion.group_target(None, now);
             app.scroll.by(-(delta as f32) / 120. * 72., now);
             app.arm_motion(hwnd);
             0
@@ -2356,6 +2714,27 @@ unsafe extern "system" fn wndproc(
             app.motion_tick(hwnd);
             0
         }
+        MOTION_FRAME => {
+            app.frame_queued = false;
+            if app.motion.timer_running {
+                app.motion_tick(hwnd);
+            }
+            0
+        }
+        WALLPAPER_READY => {
+            if app.glass.borrow_mut().finish_async() {
+                let accent = app.glass.borrow().wallpaper_accent();
+                app.accent_color = accent;
+                if app.dock.theme == crate::accent::THEME {
+                    app.dock.light = crate::accent::light(app.accent_color);
+                    app.rebuild_style(hwnd);
+                }
+                app.background_key.clear();
+                app.packages.refresh();
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_TIMER if wparam == LAUNCH_TIMER => {
             KillTimer(hwnd, LAUNCH_TIMER);
             if let Some(id) = app.pending_launch.take() {
@@ -2375,7 +2754,10 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_TIMER if wparam == PIN_TIMER => {
-            if let Some(host)=&mut app.general {host.poll_update();}
+            app.sync_desktop_items(hwnd);
+            if let Some(host) = &mut app.general {
+                host.poll_update();
+            }
             app.refresh_manager();
             app.packages.tick();
             if let Some(items) = app.catalog_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -2416,16 +2798,7 @@ unsafe extern "system" fn wndproc(
             }
             let refreshed = app.glass.borrow_mut().refresh();
             if refreshed {
-                if let Some(host) = &mut app.general {
-                    host.refresh();
-                }
-                app.packages.refresh();
-                let color = app.glass.borrow().wallpaper_accent();
-                app.set_accent(color);
-                InvalidateRect(hwnd, null(), 0);
-                if !app.settings.hwnd.is_null() {
-                    InvalidateRect(app.settings.hwnd, null(), 0);
-                }
+                app.notify_wallpaper_changed(hwnd);
             }
             if !app.dock.floating && !app.inspect {
                 pin_to_desktop(hwnd);
@@ -2497,15 +2870,16 @@ pub fn run() -> Result<(), String> {
     let _graphics = render::Runtime::start()?;
     let root = model::root();
     if crate::update::portable(&root) {
-        let folder=root.join("config");
+        let folder = root.join("config");
         std::fs::create_dir_all(&folder).map_err(|e|format!("Extract Lumen to a writable user folder (not Program Files). Cannot create its config folder: {e}"))?;
-        let probe=folder.join(format!(".write-check-{}",std::process::id()));
+        let probe = folder.join(format!(".write-check-{}", std::process::id()));
         let file=std::fs::OpenOptions::new().write(true).create_new(true).open(&probe)
             .map_err(|e|format!("Lumen needs write access to its config folder. Move the extracted folder to Downloads or another writable location: {e}"))?;
-        drop(file);std::fs::remove_file(probe).map_err(|e|e.to_string())?;
+        drop(file);
+        std::fs::remove_file(probe).map_err(|e| e.to_string())?;
     }
     let mut dock = Dock::load(&root)?;
-    let accent_color = crate::accent::FALLBACK;
+    let accent_color = crate::accent::vivid(crate::accent::FALLBACK);
     if dock.theme == crate::accent::THEME {
         dock.light = crate::accent::light(accent_color);
     }
@@ -2521,7 +2895,11 @@ pub fn run() -> Result<(), String> {
         if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
             eprintln!("native-dpi process_ok={process_dpi_ok} error={dpi_error} previous_awareness={before}");
         }
-        let manifest = wide(root.join(if crate::update::portable(&root) {"resources/lumen.manifest"}else{"native-dock/lumen.manifest"}));
+        let manifest = wide(root.join(if crate::update::portable(&root) {
+            "resources/lumen.manifest"
+        } else {
+            "native-dock/lumen.manifest"
+        }));
         let activation = ACTCTXW {
             cbSize: size_of::<ACTCTXW>() as u32,
             lpSource: manifest.as_ptr(),
@@ -2532,10 +2910,24 @@ pub fn run() -> Result<(), String> {
         if context != INVALID_HANDLE_VALUE {
             ActivateActCtx(context, &mut activation_cookie);
         }
-        let mutex_name=if smoke {format!("Local\\LumenNativeDockSmoke-{}",std::process::id())} else {"Local\\LumenNativeDockPrototype".into()};
+        let mutex_name = if smoke {
+            format!("Local\\LumenNativeDockSmoke-{}", std::process::id())
+        } else {
+            "Local\\LumenNativeDockPrototype".into()
+        };
         let mutex = CreateMutexW(null(), 0, wide(mutex_name).as_ptr());
         if mutex.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
+        }
+        // A normal app command for graceful local reloads, preserving all widget
+        // state through the same WM_CLOSE path as Quit in the tray.
+        if std::env::args().any(|arg| arg == "--quit") {
+            let existing = FindWindowW(wide("LumenNativeDockWindow").as_ptr(), null());
+            if !existing.is_null() {
+                PostMessageW(existing, WM_CLOSE, 0, 0);
+            }
+            CloseHandle(mutex);
+            return Ok(());
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if !smoke {
@@ -2594,6 +2986,7 @@ pub fn run() -> Result<(), String> {
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             background: None,
             list_base: None,
+            list_base_key: String::new(),
             pointer: [-1000.; 2],
             paint_time: 0.,
             toolbar_pressed: None,
@@ -2629,6 +3022,7 @@ pub fn run() -> Result<(), String> {
             packages: crate::widget_packages::Registry::discover(&root),
             general: None,
             root,
+            desktop_watch: None,
             dock,
             edit: null_mut(),
             search_font: null_mut(),
@@ -2636,6 +3030,7 @@ pub fn run() -> Result<(), String> {
             query: String::new(),
             selected: 0,
             scroll: Default::default(),
+            frame_queued: false,
             hover: None,
             icons: HashMap::new(),
             scaled_icons: HashMap::new(),

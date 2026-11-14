@@ -124,15 +124,37 @@ impl Snapshot {
 }
 impl State {
     pub(super) fn accept_playback(&mut self, mut next: Playback) {
+        // No browser/loading navbar is unknown, not a logout. Preserve the
+        // confirmed account alongside cached art until a live check says otherwise.
+        if !next.auth_known && !next.signed_in {
+            next.signed_in = self.playback.signed_in;
+        }
+        let account_changed = self.playback.signed_in != next.signed_in;
+        self.playback.signed_in = next.signed_in;
+        if account_changed {
+            self.sync_settings();
+        }
+        let seeking = self
+            .last_seek
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(900));
         // Loading/disconnection must not erase the previous session's artwork
         // or metadata. Transport capabilities always describe the live player.
         if !next.available && !self.playback.title.is_empty() {
+            if seeking {
+                return;
+            }
             self.playback.available = false;
             self.playback.playing = false;
             self.playback.can_seek = false;
             self.playback.can_next = false;
             self.playback.can_previous = false;
             return;
+        }
+        if seeking && next.video_id == self.playback.video_id {
+            next.playing = next.playing || self.playback.playing;
+            next.can_next = next.can_next || self.playback.can_next;
+            next.can_previous = next.can_previous || self.playback.can_previous;
+            next.can_seek = next.can_seek || self.playback.can_seek;
         }
         if next.art.as_ref().is_none_or(|a| a.is_empty()) {
             next.art = self.playback.art.clone();
@@ -149,23 +171,48 @@ impl State {
                 }
             }
         }
-        if next.queue.is_empty()
-            && self
-                .playback
-                .queue
-                .iter()
-                .any(|t| t.video_id == next.video_id)
+        if self.config.design == "coverflow"
+            && !self.playback.video_id.is_empty()
+            && !next.video_id.is_empty()
+            && self.playback.video_id != next.video_id
         {
-            next.queue = self
-                .playback
+            let old_id = &self.playback.video_id;
+            let new_id = &next.video_id;
+            let delta = next
                 .queue
                 .iter()
-                .cloned()
-                .map(|mut t| {
-                    t.selected = t.video_id == next.video_id;
-                    t
+                .position(|t| t.video_id == *old_id)
+                .and_then(|old_i| {
+                    next.queue
+                        .iter()
+                        .position(|t| t.video_id == *new_id)
+                        .map(|new_i| new_i as i32 - old_i as i32)
                 })
-                .collect();
+                .or_else(|| {
+                    self.playback
+                        .queue
+                        .iter()
+                        .position(|t| t.video_id == *new_id)
+                        .and_then(|new_i| {
+                            self.playback
+                                .queue
+                                .iter()
+                                .position(|t| t.video_id == *old_id)
+                                .map(|old_i| new_i as i32 - old_i as i32)
+                        })
+                })
+                .unwrap_or(0)
+                .clamp(-3, 3);
+            if delta != 0 {
+                let current_shift = self
+                    .coverflow_anim
+                    .filter(|a| !a.finished())
+                    .map_or(0., |a| a.remaining());
+                self.coverflow_anim = Some(coverflow::Transition {
+                    offset: (current_shift + delta as f32).clamp(-3., 3.),
+                    started: Instant::now(),
+                });
+            }
         }
         self.playback = next;
         self.received = Instant::now();

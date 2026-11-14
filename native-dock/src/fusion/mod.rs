@@ -32,6 +32,7 @@ struct Member {
     visible: bool,
     moving: bool,
     opacity: u8,
+    snap_drag: Option<(RECT, POINT)>,
 }
 struct Bridge {
     hwnd: HWND,
@@ -185,6 +186,7 @@ unsafe fn read_member(hwnd: HWND, radius: f32) -> Member {
         visible: IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0,
         moving: false,
         opacity: 255,
+        snap_drag: None,
     }
 }
 impl Manager {
@@ -331,6 +333,28 @@ pub fn group(hwnd: HWND) -> Option<Vec<Pane>> {
             .and_then(|s| s.as_ref().and_then(|s| s.group(hwnd as usize)))
     })
 }
+pub fn group_opacities(hwnd: HWND, own_alpha: u8) -> Option<(Vec<Pane>, Vec<u8>)> {
+    MANAGER.with(|m| {
+        let s = m.try_borrow().ok()?;
+        let s = s.as_ref()?;
+        let panes = s.group(hwnd as usize)?;
+        let opacities: Vec<u8> = panes
+            .iter()
+            .map(|p| {
+                if p.id == hwnd as usize {
+                    own_alpha
+                } else {
+                    s.members.get(&p.id).map_or(255, |m| m.opacity)
+                }
+            })
+            .collect();
+        if opacities.iter().all(|&o| o == own_alpha) {
+            None
+        } else {
+            Some((panes, opacities))
+        }
+    })
+}
 pub fn fused(hwnd: HWND) -> bool {
     group(hwnd).is_some()
 }
@@ -343,6 +367,12 @@ pub fn is_surface(hwnd: HWND) -> bool {
     })
 }
 unsafe fn restack(hwnd: HWND, panes: &[Pane], rect: Option<[i32; 4]>) {
+    crate::desktop_layer::register(
+        hwnd,
+        panes
+            .iter()
+            .any(|pane| crate::desktop_layer::contains(pane.id as HWND)),
+    );
     let mut above = GetTopWindow(null_mut());
     for _ in 0..4096 {
         if above.is_null() || panes.iter().any(|p| p.id == above as usize) {
@@ -404,9 +434,6 @@ pub fn opacity(hwnd: HWND, value: u8) {
             }
         }
     });
-}
-pub fn shape(panes: &[Pane], x: f32, y: f32) -> f32 {
-    geometry::distance(panes, x, y)
 }
 /// Shared by native WM_SIZING and app-local captured resize handlers. The
 /// supplied limits belong to the widget, not its detached settings window.
@@ -559,6 +586,7 @@ unsafe extern "system" fn widget_proc(
                     if let Ok(mut x) = m.try_borrow_mut() {
                         if let Some(s) = x.as_mut() {
                             if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
+                                p.snap_drag = None;
                                 if !p.moving {
                                     p.moving = true;
                                     s.changed();
@@ -617,29 +645,50 @@ unsafe extern "system" fn widget_proc(
         WM_MOVING => {
             let r = &mut *(lp as *mut RECT);
             MANAGER.with(|m| {
-                if let Ok(x) = m.try_borrow() {
-                    if let Some(s) = x.as_ref() {
+                if let Ok(mut x) = m.try_borrow_mut() {
+                    if let Some(s) = x.as_mut() {
                         if !s.enabled {
                             return;
                         }
-                        if let Some(p) = s.members.get(&(hwnd as usize)) {
+                        let panes = s.panes();
+                        if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
+                            let mut cursor: POINT = zeroed();
+                            GetCursorPos(&mut cursor);
+                            let raw = match &mut p.snap_drag {
+                                Some((raw, last)) => {
+                                    if cursor.x != last.x || cursor.y != last.y {
+                                        let dx = cursor.x - last.x;
+                                        let dy = cursor.y - last.y;
+                                        raw.left += dx;
+                                        raw.right += dx;
+                                        raw.top += dy;
+                                        raw.bottom += dy;
+                                        *last = cursor;
+                                    }
+                                    *raw
+                                }
+                                None => {
+                                    p.snap_drag = Some((*r, cursor));
+                                    *r
+                                }
+                            };
                             let inset = 4. * p.pane.dpi;
                             let moving = Pane {
                                 rect: [
-                                    r.left as f32 + inset,
-                                    r.top as f32 + inset,
-                                    r.right as f32 - inset,
-                                    r.bottom as f32 - inset,
+                                    raw.left as f32 + inset,
+                                    raw.top as f32 + inset,
+                                    raw.right as f32 - inset,
+                                    raw.bottom as f32 - inset,
                                 ],
                                 ..p.pane
                             };
-                            let d = snap_move(&moving, &s.panes());
+                            let d = snap_move(&moving, &panes);
                             let dx = d[0].round() as i32;
                             let dy = d[1].round() as i32;
-                            r.left += dx;
-                            r.right += dx;
-                            r.top += dy;
-                            r.bottom += dy;
+                            r.left = raw.left + dx;
+                            r.right = raw.right + dx;
+                            r.top = raw.top + dy;
+                            r.bottom = raw.bottom + dy;
                         }
                     }
                 }
@@ -650,6 +699,7 @@ unsafe extern "system" fn widget_proc(
                 if let Ok(mut x) = m.try_borrow_mut() {
                     if let Some(s) = x.as_mut() {
                         if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
+                            p.snap_drag = None;
                             if p.moving {
                                 p.moving = false;
                                 s.update(hwnd, None);
@@ -703,7 +753,7 @@ unsafe extern "system" fn surface_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
-unsafe fn refresh() {
+pub(crate) unsafe fn refresh() {
     // Take the manager out of TLS before Win32 calls: callbacks cannot reborrow it.
     let Some(mut s) = MANAGER.with(|m| m.borrow_mut().take()) else {
         return;
@@ -781,74 +831,209 @@ unsafe fn refresh() {
             material: 0,
             uploads: 0,
         });
-        let Some(buffer) = Buffer::plain(w, h, dpi) else {
+        let Some(mut buffer) = Buffer::plain(w, h, dpi) else {
             continue;
         };
-        let brush = CreateSolidBrush(s.glass.borrow().wallpaper_accent());
-        let rr = RECT {
-            left: 0,
-            top: 0,
-            right: w,
-            bottom: h,
-        };
-        FillRect(buffer.dc, &rr, brush);
-        DeleteObject(brush);
-        s.glass.borrow().draw(buffer.dc, hwnd, w, h);
-        let mut pixels = buffer.snapshot();
-        for y in 0..h {
-            for x in 0..w {
-                let gx = (l + x) as f32 + 0.5;
-                let gy = (t + y) as f32 + 0.5;
-                let i = ((y * w + x) * 4) as usize;
-                // All member content/chrome stays above. Junctions fill only the
-                // uncovered concave corners; no pane is painted on top of another.
-                let in_window = ps.iter().any(|p| {
-                    s.members.get(&p.id).is_some_and(|m| {
-                        gx >= m.window[0] as f32
-                            && gx < m.window[2] as f32
-                            && gy >= m.window[1] as f32
-                            && gy < m.window[3] as f32
-                    })
-                });
-                let d = shape(&ps, gx, gy);
-                let coverage = geometry::coverage(&ps, gx, gy);
-                // The shadow must also occupy transparent rounded corners INSIDE
-                // member HWND bounds; a rectangular hole cuts it into hard squares.
-                if in_window && coverage > 0. {
-                    pixels[i..i + 4].fill(0);
-                    continue;
-                }
-                // A transparent neighbor must not erase the entire cluster shadow.
-                // Blend the local members' opacity continuously near the junction.
-                let mut sum = 0.;
-                let mut alpha = 0.;
-                for (p, a) in ps.iter().zip(&opacities) {
-                    let weight = (-(p.distance(gx, gy) - d).max(0.) / (20. * dpi)).exp();
-                    sum += weight;
-                    alpha += weight * a;
-                }
-                let alpha = if sum > 0. { alpha / sum } else { 0. };
-                if coverage > 0. {
-                    let a = coverage * alpha;
-                    let edge = geometry::rim_light(&ps, gx, gy, d, dpi);
-                    let material = s.material_at(&ps, gx, gy);
-                    for c in 0..3 {
-                        let value = material.map_or(pixels[i + c] as f32, |m| m[c]);
-                        pixels[i + c] = ((value + (255. - value) * edge) * a) as u8;
+        let has_material = ps.iter().any(|p| s.materials.contains_key(&p.id));
+        if !has_material {
+            let brush = CreateSolidBrush(s.glass.borrow().wallpaper_accent());
+            let rr = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            FillRect(buffer.dc, &rr, brush);
+            DeleteObject(brush);
+            s.glass.borrow().draw(buffer.dc, hwnd, w, h);
+        }
+        let windows: Vec<[i32; 4]> = ps
+            .iter()
+            .map(|p| s.members.get(&p.id).map_or([0; 4], |m| m.window))
+            .collect();
+        let uniform_opacity = opacities
+            .first()
+            .copied()
+            .filter(|&a0| opacities.iter().all(|&a| (a - a0).abs() < 1e-5));
+        let pad_f = pad as f32;
+        let pixels = buffer.pixels_mut();
+        let liquid = crate::glass::liquid_glass();
+        let spec_w = 0.32 * (44.0 * dpi).min((w.min(h) as f32) * 0.45).max(1.0);
+        geometry::with_outline(&ps, |outline| {
+            let r_max = pad_f + 6. * dpi;
+            let mut x_zones: Vec<[f32; 2]> = outline
+                .v_lines
+                .iter()
+                .map(|v| [v[0] - r_max, v[0] + r_max])
+                .chain(
+                    outline
+                        .corners
+                        .iter()
+                        .map(|c| [c.min[0] - r_max, c.max[0] + r_max]),
+                )
+                .chain(
+                    windows
+                        .iter()
+                        .flat_map(|w| [[w[0] as f32 - 2., w[0] as f32 + 2.], [w[2] as f32 - 2., w[2] as f32 + 2.]]),
+                )
+                .collect();
+            x_zones.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
+            let mut merged_zones: Vec<[f32; 2]> = Vec::with_capacity(x_zones.len());
+            for z in x_zones {
+                if let Some(last) = merged_zones.last_mut() {
+                    if z[0] <= last[1] {
+                        last[1] = last[1].max(z[1]);
+                        continue;
                     }
-                    pixels[i + 3] = (255. * a) as u8;
-                } else {
-                    let sd = shape(&ps, gx - 5. * dpi, gy - 8. * dpi);
-                    let fade = ((pad as f32 - d) / (8. * dpi)).clamp(0., 1.);
-                    let a = (0.5 * (1. - (sd / (17. * dpi)).tanh()) * 96. * alpha * fade)
-                        .round()
-                        .clamp(0., 255.) as u8;
-                    pixels[i..i + 3].fill(0);
-                    pixels[i + 3] = a;
+                }
+                merged_zones.push(z);
+            }
+            for y in 0..h {
+                let ly = t + y;
+                let gy = ly as f32 + 0.5;
+                let row = (y * w * 4) as usize;
+                let mut x = 0i32;
+                while x < w {
+                    let lx = l + x;
+                    let gx = lx as f32 + 0.5;
+                    // Jump across horizontal core spans of any pane in O(1).
+                    let mut jumped = false;
+                    for p in &ps {
+                        let [pl, pt, pr, pb] = p.rect;
+                        let margin = 4. * p.dpi;
+                        if gy < pt + margin || gy >= pb - margin {
+                            continue;
+                        }
+                        let inset = p.radius + margin;
+                        let (span_l, span_r) = if gy >= pt + inset && gy < pb - inset {
+                            (pl + margin, pr - margin)
+                        } else {
+                            (pl + inset, pr - inset)
+                        };
+                        if gx >= span_l && gx < span_r {
+                            let end_x = ((span_r - 0.5).floor() as i32 - l + 1).clamp(x + 1, w);
+                            if !has_material {
+                                pixels[row + (x as usize * 4)..row + (end_x as usize * 4)].fill(0);
+                            }
+                            x = end_x;
+                            jumped = true;
+                            break;
+                        }
+                    }
+                    if jumped {
+                        continue;
+                    }
+                    // Outside all vertical/corner X-zones, distance and shadow are 1D-invariant in X.
+                    let in_zone = merged_zones.iter().any(|z| gx >= z[0] && gx <= z[1]);
+                    let span_end_x = if !in_zone && uniform_opacity.is_some() {
+                        let next_zone_x = merged_zones
+                            .iter()
+                            .filter(|z| z[0] > gx)
+                            .map(|z| (z[0] - 0.5).floor() as i32 - l)
+                            .min()
+                            .unwrap_or(w);
+                        next_zone_x.clamp(x + 1, w)
+                    } else {
+                        x + 1
+                    };
+                    let i = row + (x * 4) as usize;
+                    if geometry::covered_core(&ps, gx, gy) {
+                        if !has_material {
+                            pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
+                        }
+                        x = span_end_x;
+                        continue;
+                    }
+                    let d = outline.distance([gx, gy]);
+                    if d >= pad_f {
+                        if !has_material {
+                            pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
+                        }
+                        x = span_end_x;
+                        continue;
+                    }
+                    let in_window = windows
+                        .iter()
+                        .any(|w| lx >= w[0] && lx < w[2] && ly >= w[1] && ly < w[3]);
+                    if in_window && d < -0.625 {
+                        if !has_material {
+                            pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
+                        }
+                        x = span_end_x;
+                        continue;
+                    }
+                    let coverage = outline.coverage_with_distance(gx, gy, d);
+                    // The shadow must also occupy transparent rounded corners INSIDE
+                    // member HWND bounds; a rectangular hole cuts it into hard squares.
+                    if in_window && coverage > 0. {
+                        if !has_material {
+                            pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
+                        }
+                        x = span_end_x;
+                        continue;
+                    }
+                    // A transparent neighbor must not erase the entire cluster shadow.
+                    // Blend the local members' opacity continuously near the junction.
+                    let alpha = if let Some(a) = uniform_opacity {
+                        a
+                    } else {
+                        let mut sum = 0.;
+                        let mut alpha = 0.;
+                        for (p, a) in ps.iter().zip(&opacities) {
+                            let weight = (-(p.distance(gx, gy) - d).max(0.) / (20. * dpi)).exp();
+                            sum += weight;
+                            alpha += weight * a;
+                        }
+                        if sum > 0. {
+                            alpha / sum
+                        } else {
+                            0.
+                        }
+                    };
+                    if coverage > 0. {
+                        let a = coverage * alpha;
+                        let edge = outline.rim_light(gx, gy, d, dpi);
+                        let spec = if liquid && -d < spec_w {
+                            let dx =
+                                outline.distance([gx + 1., gy]) - outline.distance([gx - 1., gy]);
+                            let dy =
+                                outline.distance([gx, gy + 1.]) - outline.distance([gx, gy - 1.]);
+                            let len = (dx * dx + dy * dy).sqrt().max(1e-5);
+                            crate::compositor::liquid_rim_spec(d, dx / len, dy / len, spec_w)
+                        } else {
+                            0.
+                        };
+                        let material = s.material_at(&ps, gx, gy);
+                        for c in 0..3 {
+                            let value = material.map_or(pixels[i + c] as f32, |m| m[c]);
+                            let lit = (value + (255. - value) * edge + spec).min(255.);
+                            pixels[i + c] = (lit * a) as u8;
+                        }
+                        pixels[i + 3] = (255. * a) as u8;
+                        x += 1;
+                    } else {
+                        let sd = outline.distance([gx - 5. * dpi, gy - 8. * dpi]);
+                        let fade = ((pad_f - d) / (8. * dpi)).clamp(0., 1.);
+                        let tx = (sd / (17. * dpi)).clamp(-4.8, 4.8);
+                        let tx2 = tx * tx;
+                        let tanh = (tx * (135135. + tx2 * (17325. + tx2 * (378. + tx2)))
+                            / (135135. + tx2 * (62370. + tx2 * (3150. + tx2 * 28.))))
+                        .clamp(-1., 1.);
+                        let a = (0.5 * (1. - tanh) * 96. * alpha * fade)
+                            .round()
+                            .clamp(0., 255.) as u8;
+                        for sx in x..span_end_x {
+                            let si = row + (sx * 4) as usize;
+                            if !has_material {
+                                pixels[si..si + 3].fill(0);
+                            }
+                            pixels[si + 3] = a;
+                        }
+                        x = span_end_x;
+                    }
                 }
             }
-        }
-        buffer.replace_pixels(&pixels);
+        });
         restack(hwnd, &ps, Some([l, t, w, h]));
         if buffer.upload(hwnd) {
             bridge.uploads += 1;
@@ -874,6 +1059,55 @@ unsafe fn refresh() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "Local fusion timing diagnostic"]
+    fn profile_large_join_and_detach() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            init(Rc::new(RefCell::new(Glass::new(0., 1.))));
+            let mut windows = Vec::new();
+            for x in [-20000, -19108] {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Lumen fusion timing").as_ptr(),
+                    WS_POPUP,
+                    x,
+                    -20000,
+                    900,
+                    650,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 34.);
+                windows.push(hwnd);
+            }
+            let begin = std::time::Instant::now();
+            refresh();
+            eprintln!(
+                "fusion-profile join_ms={:.2}",
+                begin.elapsed().as_secs_f64() * 1000.
+            );
+            assert!(fused(windows[0]));
+            let begin = std::time::Instant::now();
+            SendMessageW(windows[0], WM_ENTERSIZEMOVE, 0, 0);
+            refresh();
+            eprintln!(
+                "fusion-profile detach_ms={:.2}",
+                begin.elapsed().as_secs_f64() * 1000.
+            );
+            assert!(!fused(windows[0]));
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
     #[test]
     fn actual_join_blends_raw_widget_colors_and_settles_without_feedback() {
         let _ui = crate::native_ui_test_lock();
@@ -1163,6 +1397,49 @@ mod tests {
                         );
                     }
                 }
+            }
+            // Mixed member opacities blend continuously across the seam without a hard step.
+            opacity(windows[0], 255);
+            opacity(windows[1], 0);
+            refresh();
+            let mut mixed_outputs = Vec::new();
+            for (idx, hwnd) in [windows[0], windows[1]].into_iter().enumerate() {
+                let m = read_member(hwnd, 30.);
+                let [l, t, r, b] = m.window;
+                let mut frame = Buffer::new(r - l, b - t, m.pane.dpi, 30.).unwrap();
+                let rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: r - l,
+                    bottom: b - t,
+                };
+                let brush = CreateSolidBrush(0x405060);
+                FillRect(frame.dc, &rect, brush);
+                DeleteObject(brush);
+                frame.background_alpha_for(hwnd, if idx == 0 { 255 } else { 0 });
+                assert!(frame.present_with_alpha(hwnd, true));
+                mixed_outputs.push((m.window, frame.snapshot()));
+            }
+            let seam_x = a.pane.rect[0] as i32 + 80;
+            let seam_y = a.pane.rect[1] as i32;
+            let mut prev_alpha: Option<i32> = None;
+            for y in (seam_y - 10)..=(seam_y + 10) {
+                let mut composed = 0u32;
+                for (r, pixels) in &mixed_outputs {
+                    if seam_x < r[0] || seam_x >= r[2] || y < r[1] || y >= r[3] {
+                        continue;
+                    }
+                    let i = (((y - r[1]) * (r[2] - r[0]) + seam_x - r[0]) * 4) as usize;
+                    let v = pixels[i + 3] as u32;
+                    composed = v + (composed * (255 - v) + 127) / 255;
+                }
+                if let Some(prev) = prev_alpha {
+                    assert!(
+                        (prev - composed as i32).abs() <= 4,
+                        "opacity across seam must transition smoothly without a hard step (y={y}, prev={prev}, cur={composed})"
+                    );
+                }
+                prev_alpha = Some(composed as i32);
             }
             let handle = MANAGER.with(|m| m.borrow().as_ref().unwrap().bridges[0].hwnd);
             let uploads = MANAGER.with(|m| m.borrow().as_ref().unwrap().bridges[0].uploads);

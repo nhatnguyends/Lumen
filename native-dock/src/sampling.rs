@@ -11,37 +11,181 @@ impl Target {
     // Cached sprites retain their device size while moving. Fixed interpolation
     // weights avoid inverse affine math and floating point work for every pixel.
     unsafe fn translate(self, source: &[u8], size: [usize; 2], origin: [f32; 2], opacity: f32) {
-        let ox = origin[0].floor() as i32;
-        let oy = origin[1].floor() as i32;
-        let fx = ((origin[0] - ox as f32) * 256.).round() as u32;
-        let fy = ((origin[1] - oy as f32) * 256.).round() as u32;
+        let x256 = (origin[0] * 256.).round() as i32;
+        let y256 = (origin[1] * 256.).round() as i32;
+        let ox = x256.div_euclid(256);
+        let oy = y256.div_euclid(256);
+        let fx = x256.rem_euclid(256) as u32;
+        let fy = y256.rem_euclid(256) as u32;
+        let opacity = (opacity.clamp(0., 1.) * 256.).round() as u32;
+        if opacity == 0 {
+            return;
+        }
+        let sw = size[0] as i32;
+        let sh = size[1] as i32;
+        let left = ox.max(self.clip[0]).max(0);
+        let top = oy.max(self.clip[1]).max(0);
+        let right = (ox + sw + 1).min(self.clip[2]).min(self.width as i32);
+        let bottom = (oy + sh + 1).min(self.clip[3]).min(self.height as i32);
+        if left >= right || top >= bottom {
+            return;
+        }
+        let dest = std::slice::from_raw_parts_mut(self.bits, self.width * self.height * 4);
+        let channels = if self.opaque { 3 } else { 4 };
+
+        // Fast path when X is pixel-aligned (fx == 0), including exact alignment (fy == 0)
+        // and pure vertical subpixel scrolling.
+        if fx == 0 {
+            let x_left = left.max(ox);
+            let x_right = right.min(ox + sw);
+            if x_left >= x_right {
+                return;
+            }
+            let sx_start = (x_left - ox) as usize * 4;
+            let byte_len = (x_right - x_left) as usize * 4;
+            let dst_start = x_left as usize * 4;
+            let blend_single_row = |dst_row: &mut [u8], src_row: &[u8], weight: u32| {
+                let w = weight * opacity;
+                if w == 0 {
+                    return;
+                }
+                for (dst, src) in dst_row[dst_start..dst_start + byte_len]
+                    .chunks_exact_mut(4)
+                    .zip(src_row[sx_start..sx_start + byte_len].chunks_exact(4))
+                {
+                    let a = src[3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let alpha = (a * w + 32768) >> 16;
+                    if alpha == 0 {
+                        continue;
+                    }
+                    if alpha >= 255 && w == 65536 {
+                        dst[..channels].copy_from_slice(&src[..channels]);
+                    } else {
+                        let inv = 255 - alpha;
+                        for c in 0..channels {
+                            let value = (src[c] as u32 * w + 32768) >> 16;
+                            dst[c] = (value + (dst[c] as u32 * inv + 127) / 255).min(255) as u8;
+                        }
+                    }
+                }
+            };
+            if fy == 0 {
+                let y_top = top.max(oy);
+                let y_bottom = bottom.min(oy + sh);
+                for y in y_top..y_bottom {
+                    let sy = (y - oy) as usize;
+                    let row0 = &source[sy * size[0] * 4..(sy + 1) * size[0] * 4];
+                    let dst_row =
+                        &mut dest[y as usize * self.width * 4..(y as usize + 1) * self.width * 4];
+                    blend_single_row(dst_row, row0, 256);
+                }
+                return;
+            }
+            let wy0 = 256 - fy;
+            let wy1 = fy;
+            if oy >= top && oy < bottom {
+                let row0 = &source[0..size[0] * 4];
+                let dst_row =
+                    &mut dest[oy as usize * self.width * 4..(oy as usize + 1) * self.width * 4];
+                blend_single_row(dst_row, row0, wy0);
+            }
+            let inner_top = top.max(oy + 1);
+            let inner_bottom = bottom.min(oy + sh);
+            for y in inner_top..inner_bottom {
+                let sy = (y - oy) as usize;
+                let row0 = &source[sy * size[0] * 4..(sy + 1) * size[0] * 4];
+                let row1 = &source[(sy - 1) * size[0] * 4..sy * size[0] * 4];
+                let dst_row =
+                    &mut dest[y as usize * self.width * 4..(y as usize + 1) * self.width * 4];
+                if opacity == 256 {
+                    for ((dst, s0), s1) in dst_row[dst_start..dst_start + byte_len]
+                        .chunks_exact_mut(4)
+                        .zip(row0[sx_start..sx_start + byte_len].chunks_exact(4))
+                        .zip(row1[sx_start..sx_start + byte_len].chunks_exact(4))
+                    {
+                        if (s0[3] | s1[3]) == 0 {
+                            continue;
+                        }
+                        let alpha = (s0[3] as u32 * wy0 + s1[3] as u32 * wy1 + 128) >> 8;
+                        if alpha == 0 {
+                            continue;
+                        }
+                        if alpha == 255 {
+                            dst[0] = ((s0[0] as u32 * wy0 + s1[0] as u32 * wy1 + 128) >> 8) as u8;
+                            dst[1] = ((s0[1] as u32 * wy0 + s1[1] as u32 * wy1 + 128) >> 8) as u8;
+                            dst[2] = ((s0[2] as u32 * wy0 + s1[2] as u32 * wy1 + 128) >> 8) as u8;
+                            if !self.opaque {
+                                dst[3] = 255;
+                            }
+                        } else {
+                            let inv = 255 - alpha;
+                            for c in 0..channels {
+                                let value = (s0[c] as u32 * wy0 + s1[c] as u32 * wy1 + 128) >> 8;
+                                dst[c] =
+                                    (value + (dst[c] as u32 * inv + 127) / 255).min(255) as u8;
+                            }
+                        }
+                    }
+                } else {
+                    for ((dst, s0), s1) in dst_row[dst_start..dst_start + byte_len]
+                        .chunks_exact_mut(4)
+                        .zip(row0[sx_start..sx_start + byte_len].chunks_exact(4))
+                        .zip(row1[sx_start..sx_start + byte_len].chunks_exact(4))
+                    {
+                        if (s0[3] | s1[3]) == 0 {
+                            continue;
+                        }
+                        let a_raw = s0[3] as u32 * wy0 + s1[3] as u32 * wy1;
+                        let alpha = (((a_raw + 128) >> 8) * opacity + 128) >> 8;
+                        if alpha == 0 {
+                            continue;
+                        }
+                        let inv = 255 - alpha;
+                        for c in 0..channels {
+                            let v_raw = s0[c] as u32 * wy0 + s1[c] as u32 * wy1;
+                            let value = (((v_raw + 128) >> 8) * opacity + 128) >> 8;
+                            dst[c] = (value + (dst[c] as u32 * inv + 127) / 255).min(255) as u8;
+                        }
+                    }
+                }
+            }
+            let y_end = oy + sh;
+            if y_end >= top && y_end < bottom && sh > 0 {
+                let row1 = &source[(sh as usize - 1) * size[0] * 4..sh as usize * size[0] * 4];
+                let dst_row = &mut dest
+                    [y_end as usize * self.width * 4..(y_end as usize + 1) * self.width * 4];
+                blend_single_row(dst_row, row1, wy1);
+            }
+            return;
+        }
+
         let weights = [
             (256 - fx) * (256 - fy),
             fx * (256 - fy),
             (256 - fx) * fy,
             fx * fy,
         ];
-        let opacity = (opacity.clamp(0., 1.) * 256.).round() as u32;
-        let left = ox.max(self.clip[0]).max(0);
-        let top = oy.max(self.clip[1]).max(0);
-        let right = (ox + size[0] as i32 + 1)
-            .min(self.clip[2])
-            .min(self.width as i32);
-        let bottom = (oy + size[1] as i32 + 1)
-            .min(self.clip[3])
-            .min(self.height as i32);
-        let dest = std::slice::from_raw_parts_mut(self.bits, self.width * self.height * 4);
         for y in top..bottom {
+            let sy = y - oy;
             for x in left..right {
                 let sx = x - ox;
-                let sy = y - oy;
+                if sx >= 1 && sx < sw && sy >= 1 && sy < sh {
+                    let o0 = (sy as usize * size[0] + sx as usize) * 4;
+                    let o2 = ((sy as usize - 1) * size[0] + sx as usize) * 4;
+                    if (source[o0 + 3] | source[o0 - 1] | source[o2 + 3] | source[o2 - 1]) == 0 {
+                        continue;
+                    }
+                }
                 let mut sample = [0u32; 4];
                 for (i, (qx, qy)) in [(sx, sy), (sx - 1, sy), (sx, sy - 1), (sx - 1, sy - 1)]
                     .into_iter()
                     .enumerate()
                 {
                     let w = weights[i];
-                    if w == 0 || qx < 0 || qy < 0 || qx >= size[0] as i32 || qy >= size[1] as i32 {
+                    if w == 0 || qx < 0 || qy < 0 || qx >= sw || qy >= sh {
                         continue;
                     }
                     let offset = (qy as usize * size[0] + qx as usize) * 4;
@@ -57,7 +201,7 @@ impl Target {
                     continue;
                 }
                 let offset = (y as usize * self.width + x as usize) * 4;
-                for c in 0..if self.opaque { 3 } else { 4 } {
+                for c in 0..channels {
                     let value = (((sample[c] + 32768) >> 16) * opacity + 128) >> 8;
                     dest[offset + c] = (value
                         + (dest[offset + c] as u32 * (255 - alpha) + 127) / 255)
@@ -78,6 +222,13 @@ impl Target {
         let bottom = ((r[3] + pad).ceil() as i32)
             .min(self.clip[3])
             .min(self.height as i32);
+        if left >= right || top >= bottom {
+            return;
+        }
+        let opacity = (opacity.clamp(0., 1.) * 256.).round() as u32;
+        if opacity == 0 {
+            return;
+        }
         let axis = |a: i32, b: i32, start: f32, end: f32, source: usize| -> Vec<(i32, u32)> {
             (a..b)
                 .map(|v| {
@@ -89,15 +240,110 @@ impl Target {
         };
         let xs = axis(left, right, r[0], r[2], size[0]);
         let ys = axis(top, bottom, r[1], r[3], size[1]);
-        let opacity = (opacity.clamp(0., 1.) * 256.).round() as u32;
+        let sw = size[0] as i32;
+        let sh = size[1] as i32;
+        let channels = if self.opaque { 3 } else { 4 };
         let dest = std::slice::from_raw_parts_mut(self.bits, self.width * self.height * 4);
         for (yy, (sy, fy)) in ys.into_iter().enumerate() {
+            let wy0 = 256 - fy;
+            let wy1 = fy;
+            let dst_row_offset = (top as usize + yy) * self.width * 4;
+            if sy >= 0 && sy + 1 < sh {
+                let row0 = &source[sy as usize * size[0] * 4..(sy as usize + 1) * size[0] * 4];
+                let row1 = &source[(sy as usize + 1) * size[0] * 4..(sy as usize + 2) * size[0] * 4];
+                for (xx, &(sx, fx)) in xs.iter().enumerate() {
+                    if sx >= 0 && sx + 1 < sw {
+                        let s = sx as usize * 4;
+                        let a00 = row0[s + 3];
+                        let a10 = row0[s + 7];
+                        let a01 = row1[s + 3];
+                        let a11 = row1[s + 7];
+                        if (a00 | a10 | a01 | a11) == 0 {
+                            continue;
+                        }
+                        let wx0 = 256 - fx;
+                        let wx1 = fx;
+                        let w00 = wx0 * wy0;
+                        let w10 = wx1 * wy0;
+                        let w01 = wx0 * wy1;
+                        let w11 = wx1 * wy1;
+                        let offset = dst_row_offset + (left as usize + xx) * 4;
+                        if (a00 & a10 & a01 & a11) == 255 && opacity == 256 {
+                            for c in 0..3 {
+                                let v = row0[s + c] as u32 * w00
+                                    + row0[s + 4 + c] as u32 * w10
+                                    + row1[s + c] as u32 * w01
+                                    + row1[s + 4 + c] as u32 * w11;
+                                dest[offset + c] = ((v + 32768) >> 16) as u8;
+                            }
+                            if !self.opaque {
+                                dest[offset + 3] = 255;
+                            }
+                            continue;
+                        }
+                        let sample_a = a00 as u32 * w00
+                            + a10 as u32 * w10
+                            + a01 as u32 * w01
+                            + a11 as u32 * w11;
+                        let alpha = (((sample_a + 32768) >> 16) * opacity + 128) >> 8;
+                        if alpha == 0 {
+                            continue;
+                        }
+                        let inv = 255 - alpha;
+                        for c in 0..channels {
+                            let sample_c = row0[s + c] as u32 * w00
+                                + row0[s + 4 + c] as u32 * w10
+                                + row1[s + c] as u32 * w01
+                                + row1[s + 4 + c] as u32 * w11;
+                            let value = (((sample_c + 32768) >> 16) * opacity + 128) >> 8;
+                            dest[offset + c] =
+                                (value + (dest[offset + c] as u32 * inv + 127) / 255).min(255) as u8;
+                        }
+                        continue;
+                    }
+                    let weights = [
+                        (256 - fx) * wy0,
+                        fx * wy0,
+                        (256 - fx) * wy1,
+                        fx * wy1,
+                    ];
+                    let mut sample = [0u32; 4];
+                    for (i, (qx, qy)) in [(sx, sy), (sx + 1, sy), (sx, sy + 1), (sx + 1, sy + 1)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let w = weights[i];
+                        if w == 0 || qx < 0 || qy < 0 || qx >= sw || qy >= sh {
+                            continue;
+                        }
+                        let off = (qy as usize * size[0] + qx as usize) * 4;
+                        if source[off + 3] == 0 {
+                            continue;
+                        }
+                        for c in 0..4 {
+                            sample[c] += source[off + c] as u32 * w;
+                        }
+                    }
+                    let alpha = (((sample[3] + 32768) >> 16) * opacity + 128) >> 8;
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let offset = dst_row_offset + (left as usize + xx) * 4;
+                    for c in 0..channels {
+                        let value = (((sample[c] + 32768) >> 16) * opacity + 128) >> 8;
+                        dest[offset + c] = (value
+                            + (dest[offset + c] as u32 * (255 - alpha) + 127) / 255)
+                            .min(255) as u8;
+                    }
+                }
+                continue;
+            }
             for (xx, &(sx, fx)) in xs.iter().enumerate() {
                 let weights = [
-                    (256 - fx) * (256 - fy),
-                    fx * (256 - fy),
-                    (256 - fx) * fy,
-                    fx * fy,
+                    (256 - fx) * wy0,
+                    fx * wy0,
+                    (256 - fx) * wy1,
+                    fx * wy1,
                 ];
                 let mut sample = [0u32; 4];
                 for (i, (qx, qy)) in [(sx, sy), (sx + 1, sy), (sx, sy + 1), (sx + 1, sy + 1)]
@@ -105,7 +351,7 @@ impl Target {
                     .enumerate()
                 {
                     let w = weights[i];
-                    if w == 0 || qx < 0 || qy < 0 || qx >= size[0] as i32 || qy >= size[1] as i32 {
+                    if w == 0 || qx < 0 || qy < 0 || qx >= sw || qy >= sh {
                         continue;
                     }
                     let offset = (qy as usize * size[0] + qx as usize) * 4;
@@ -120,8 +366,8 @@ impl Target {
                 if alpha == 0 {
                     continue;
                 }
-                let offset = ((top as usize + yy) * self.width + left as usize + xx) * 4;
-                for c in 0..if self.opaque { 3 } else { 4 } {
+                let offset = dst_row_offset + (left as usize + xx) * 4;
+                for c in 0..channels {
                     let value = (((sample[c] + 32768) >> 16) * opacity + 128) >> 8;
                     dest[offset + c] = (value
                         + (dest[offset + c] as u32 * (255 - alpha) + 127) / 255)

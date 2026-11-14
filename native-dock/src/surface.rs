@@ -1,7 +1,7 @@
 //! Shared glass materials. Persisted keys carry either a gradient identity or
 //! a precise custom sRGB color; the wallpaper/content themes stay independent.
 use crate::render::{Canvas, Image};
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 const fn cref(rgb: u32) -> u32 {
     ((rgb >> 16) & 255) | (rgb & 0xff00) | ((rgb & 255) << 16)
 }
@@ -160,9 +160,12 @@ pub fn sample(key: &str, u: f32, v: f32, aspect: f32) -> [u8; 3] {
     };
     c.map(|v| v.round().clamp(0., 255.) as u8)
 }
-// Pixel-only bounded cache: no GDI+ handles survive a renderer session.
-thread_local! {static PIXELS:RefCell<HashMap<(String,u32,u32,u32,u32),Vec<u8>>>=RefCell::new(HashMap::new());}
-fn texture(key: &str, w: u32, h: u32, aspect: f32, radius: f32) -> Option<Image> {
+// Bounded GDI+ texture cache; cleared before GdiplusShutdown in Runtime::drop.
+thread_local! {static TEXTURES:RefCell<HashMap<(String,u32,u32,u32,u32),Rc<Image>>>=RefCell::new(HashMap::new());}
+pub fn clear_cache() {
+    TEXTURES.with(|cache| cache.borrow_mut().clear());
+}
+fn texture(key: &str, w: u32, h: u32, aspect: f32, radius: f32) -> Option<Rc<Image>> {
     let cache_key = (
         key.into(),
         w,
@@ -170,51 +173,50 @@ fn texture(key: &str, w: u32, h: u32, aspect: f32, radius: f32) -> Option<Image>
         (aspect * 64.).round() as u32,
         (radius * 16.).round() as u32,
     );
-    PIXELS.with(|cache| {
+    TEXTURES.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let pixels = cache
-            .entry(cache_key)
-            .or_insert_with(|| {
-                let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-                for y in 0..h {
-                    for x in 0..w {
-                        let c = sample(
-                            key,
-                            (x as f32 + 0.5) / w as f32,
-                            (y as f32 + 0.5) / h as f32,
-                            aspect,
-                        );
-                        let alpha = if radius > 0. {
-                            ((0.5
-                                - crate::compositor::distance(
-                                    x as f32 + 0.5,
-                                    y as f32 + 0.5,
-                                    w as f32,
-                                    h as f32,
-                                    radius,
-                                    0.,
-                                ))
-                            .clamp(0., 1.)
-                                * 255.)
-                                .round() as u8
-                        } else {
-                            255
-                        };
-                        pixels.extend_from_slice(&[
-                            ((c[0] as u32 * alpha as u32 + 127) / 255) as u8,
-                            ((c[1] as u32 * alpha as u32 + 127) / 255) as u8,
-                            ((c[2] as u32 * alpha as u32 + 127) / 255) as u8,
-                            alpha,
-                        ]);
-                    }
-                }
-                pixels
-            })
-            .clone();
-        if cache.len() > 16 {
+        if let Some(existing) = cache.get(&cache_key) {
+            return Some(existing.clone());
+        }
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = sample(
+                    key,
+                    (x as f32 + 0.5) / w as f32,
+                    (y as f32 + 0.5) / h as f32,
+                    aspect,
+                );
+                let alpha = if radius > 0. {
+                    ((0.5
+                        - crate::compositor::distance(
+                            x as f32 + 0.5,
+                            y as f32 + 0.5,
+                            w as f32,
+                            h as f32,
+                            radius,
+                            0.,
+                        ))
+                    .clamp(0., 1.)
+                        * 255.)
+                        .round() as u8
+                } else {
+                    255
+                };
+                pixels.extend_from_slice(&[
+                    ((c[0] as u32 * alpha as u32 + 127) / 255) as u8,
+                    ((c[1] as u32 * alpha as u32 + 127) / 255) as u8,
+                    ((c[2] as u32 * alpha as u32 + 127) / 255) as u8,
+                    alpha,
+                ]);
+            }
+        }
+        let image = Rc::new(Image::from_rgba(w, h, pixels)?);
+        if cache.len() >= 16 {
             cache.clear();
         }
-        Image::from_rgba(w, h, pixels)
+        cache.insert(cache_key, image.clone());
+        Some(image)
     })
 }
 pub fn paint(c: &Canvas, pane: [f32; 4], key: &str, opacity: f32) {

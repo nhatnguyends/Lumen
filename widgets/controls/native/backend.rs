@@ -27,6 +27,7 @@ pub struct Display {
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    pub sources: std::collections::BTreeMap<String, Vec<Device>>,
     pub displays: Vec<Display>,
     pub outputs: Vec<Device>,
     pub inputs: Vec<Device>,
@@ -47,13 +48,14 @@ pub struct Worker {
 }
 impl Worker {
     pub fn new(root: &std::path::Path) -> Result<Self, String> {
-        let root=root.to_path_buf();
+        let root = root.to_path_buf();
         let (tx, requests) = mpsc::channel::<Option<Command>>();
         let (results, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("lumen-controls".into())
             .spawn(move || unsafe {
                 super::display_restore::configure(&root);
+                super::input_source::configure(&root);
                 let initialized = CoInitializeEx(null(), COINIT_MULTITHREADED as u32) >= 0;
                 while let Ok(command) = requests.recv() {
                     let error = command.as_ref().and_then(|c| execute(c).err());
@@ -435,10 +437,21 @@ pub fn can_detach(displays: &[Display], id: &str) -> bool {
 pub unsafe fn execute(command: &Command) -> Result<(), String> {
     if !command.value.is_finite()
         || command.value < 0.
-        || command.value > 100.
+        || command.value
+            > if command.control.kind == Kind::Source {
+                255.
+            } else {
+                100.
+            }
         || command.control.target.len() > 1024
     {
         return Err("Invalid control command".into());
+    }
+    if command.control.kind == Kind::Source {
+        if command.value.fract() != 0. {
+            return Err("Invalid input code".into());
+        }
+        return super::input_source::set(&command.control.target, command.value as u32);
     }
     if !command.control.kind.is_volume() && command.value != 0. && command.value != 1. {
         return Err("Invalid toggle command".into());
@@ -457,8 +470,10 @@ pub unsafe fn execute(command: &Command) -> Result<(), String> {
             if !enabled && !can_detach(&list, &d.id) {
                 return Err("Keep the primary display enabled".into());
             }
-            if enabled {return super::display_restore::reattach(&command.control);}
-            let actual_source=super::display_restore::remember_before_detach(&command.control)?;
+            if enabled {
+                return super::display_restore::reattach(&command.control);
+            }
+            let actual_source = super::display_restore::remember_before_detach(&command.control)?;
             let mut m = mode(&actual_source, false)?;
             if !enabled {
                 m.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
@@ -478,12 +493,9 @@ pub unsafe fn execute(command: &Command) -> Result<(), String> {
             Ok(())
         }
         Kind::Hdr => {
-            let source=super::display_restore::source(&command.control.target);
+            let source = super::display_restore::source(&command.control.target);
             let targets = hdr_targets()?;
-            let targets: Vec<_> = targets
-                .iter()
-                .filter(|t| t.source == source)
-                .collect();
+            let targets: Vec<_> = targets.iter().filter(|t| t.source == source).collect();
             if targets.is_empty() || targets.iter().any(|t| !t.supported) {
                 return Err("HDR is unavailable for this display".into());
             }
@@ -520,10 +532,11 @@ pub unsafe fn execute(command: &Command) -> Result<(), String> {
 pub unsafe fn snapshot() -> Snapshot {
     let mut s = Snapshot::default();
     s.displays = displays();
+    s.sources = super::input_source::snapshot(&s.displays);
     match hdr_targets() {
         Ok(targets) => {
             for d in &mut s.displays {
-                let source=super::display_restore::source(&d.id);
+                let source = super::display_restore::source(&d.id);
                 let ts: Vec<_> = targets.iter().filter(|t| t.source == source).collect();
                 d.hdr_supported = !ts.is_empty() && ts.iter().all(|t| t.supported);
                 d.hdr_enabled = !ts.is_empty() && ts.iter().all(|t| t.enabled);

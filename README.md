@@ -84,3 +84,16 @@ python run_lumen.py --check
 
 Settings live in `config/`. Legacy settings are retained for import; removing
 Electron does not delete widget data or browser sign-in profiles.
+
+## Credits and license
+
+Created by **Nhat Ng**. Copyright © 2026 Nhat Ng.
+Lumen's original source is licensed under [MIT](LICENSE.txt).
+
+Thank you to the developers and contributors behind Rust, windows-rs, resvg,
+tiny-skia, image, Serde, RustCrypto, zip-rs, Node.js, Koffi, Lucide, Feather,
+Vite, Rolldown, TypeScript, Python and all transitive dependencies.
+See [Credits](CREDITS.md) and the [third-party inventory](LICENSES/THIRD-PARTY-NOTICES.md).
+Full license texts are included under `LICENSES/` in source and portable packages.
+General Settings → Credits & licenses opens the acknowledgements.
+Third-party components keep their own licenses; Lumen's MIT license does not replace them.

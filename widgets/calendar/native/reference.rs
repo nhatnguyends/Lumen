@@ -83,11 +83,23 @@ impl State {
                     8.,
                     ink,
                     if pressed {
-                        38
+                        58
                     } else {
-                        (22. * self.hover_alpha) as u8
+                        (38. * self.hover_alpha) as u8
                     },
                     false,
+                    false,
+                );
+                c.round(
+                    button.rect,
+                    8.,
+                    ink,
+                    if pressed {
+                        70
+                    } else {
+                        (42. * self.hover_alpha) as u8
+                    },
+                    true,
                     false,
                 );
             }

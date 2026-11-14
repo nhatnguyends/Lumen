@@ -47,7 +47,8 @@ const player = new MusicPlayer(directory, (state, error) => {
   if (stopping) return
   emit({ type: 'state', state, error: error || null })
   if (state) {
-    const selected = state.queue.findIndex(item => item.selected || item.videoId === state.videoId)
+    const currentIndex = state.queue.findIndex(item => item.videoId === state.videoId)
+    const selected = currentIndex >= 0 ? currentIndex : state.queue.findIndex(item => item.selected)
     const visible = selected < 0 ? [] : state.queue.slice(Math.max(0, selected - 2), selected + 3)
     for (const url of [state.art, ...visible.map(item => item.thumb), ...state.queue.slice(0, 20).map(item => item.thumb)]) if (url) void art(url)
   }
@@ -58,6 +59,8 @@ async function command(message: { action: string; value?: number; videoId?: stri
   switch (message.action) {
     case 'browse': await player.open(); break
     case 'library': await player.open('https://music.youtube.com/library'); break
+    case 'signin': await player.signIn(); break
+    case 'signout': await player.signOut(); break
     case 'layout': break // Chrome owns its client size; never resize a cross-process child.
     case 'select': await player.play(message.videoId || ''); break
     case 'info': emit({ type: 'info', ...await player.instanceInfo() }); break

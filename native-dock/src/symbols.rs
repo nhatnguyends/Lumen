@@ -2,7 +2,7 @@
 use crate::render::{Canvas, Image};
 use std::{cell::RefCell, collections::HashMap};
 use windows_sys::Win32::Graphics::Gdi::HDC;
-const VECTORS: [&str; 7] = [
+const VECTORS: [&str; 9] = [
     include_str!("../assets/toolbar/0.svg"),
     include_str!("../assets/toolbar/1.svg"),
     include_str!("../assets/toolbar/2.svg"),
@@ -10,7 +10,19 @@ const VECTORS: [&str; 7] = [
     include_str!("../assets/toolbar/4.svg"),
     include_str!("../assets/toolbar/5.svg"),
     include_str!("../assets/toolbar/6.svg"),
+    include_str!("../assets/toolbar/7.svg"),
+    include_str!("../assets/toolbar/8.svg"),
 ];
+pub fn widget_symbol(id: &str) -> usize {
+    match id {
+        "music" => 2,
+        "notes" => 3,
+        "calendar" => 4,
+        "clock" => 7,
+        "controls" => 8,
+        _ => 1,
+    }
+}
 #[derive(Default)]
 pub struct Symbols(RefCell<HashMap<(usize, u32, u32), Image>>);
 impl Symbols {
@@ -91,7 +103,7 @@ mod tests {
     use super::*;
     #[test]
     fn every_original_vector_has_smooth_transparent_edges() {
-        for i in 0..7 {
+        for i in 0..9 {
             let pixels = raster(i, 0xffffff, 64).unwrap();
             assert!(pixels.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
             assert!(pixels.chunks_exact(4).any(|p| p[3] == 0));

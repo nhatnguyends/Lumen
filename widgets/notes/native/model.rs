@@ -11,6 +11,135 @@ use std::{
 pub const COLORS: [&str; 7] = ["amber", "rose", "sky", "mint", "violet", "peach", "slate"];
 pub const MIN_SIZE: i32 = 160;
 pub const DESIGNS: [&str; 4] = ["lumen", "notebook", "index", "honey"];
+pub fn images_dir(root: &Path) -> std::path::PathBuf {
+    root.join("config/notes-images")
+}
+pub fn extract_rtf_pictures(note: &mut Note, root: &Path) -> bool {
+    let Some(rtf) = note.rtf.as_deref() else {
+        return false;
+    };
+    if !rtf.contains("{\\pict") {
+        return false;
+    }
+    let bytes = rtf.as_bytes();
+    let mut out = String::with_capacity(rtf.len());
+    let mut pos = 0;
+    let mut changed = false;
+    while let Some(rel) = rtf[pos..].find("{\\pict") {
+        let start = pos + rel;
+        let next = bytes.get(start + 6).copied();
+        if next.is_some_and(|b| b.is_ascii_alphabetic()) {
+            out.push_str(&rtf[pos..start + 6]);
+            pos = start + 6;
+            continue;
+        }
+        out.push_str(&rtf[pos..start]);
+        let mut i = start + 1;
+        let mut depth = 1usize;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'\\' if i + 1 < bytes.len() => i += 2,
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        let group = &rtf[start..i];
+        let mut saved = false;
+        if group.contains("\\pngblip") || group.contains("\\jpegblip") {
+            let mut hex = Vec::new();
+            let gb = group.as_bytes();
+            let mut j = 1;
+            let mut gdepth = 1usize;
+            while j < gb.len() && gdepth > 0 {
+                if gdepth > 1 {
+                    match gb[j] {
+                        b'\\' if j + 1 < gb.len() => j += 2,
+                        b'{' => {
+                            gdepth += 1;
+                            j += 1;
+                        }
+                        b'}' => {
+                            gdepth -= 1;
+                            j += 1;
+                        }
+                        _ => j += 1,
+                    }
+                    continue;
+                }
+                match gb[j] {
+                    b'{' => {
+                        gdepth += 1;
+                        j += 1;
+                    }
+                    b'}' => {
+                        gdepth -= 1;
+                        j += 1;
+                    }
+                    b'\\' => {
+                        j += 1;
+                        if j < gb.len() && gb[j].is_ascii_alphabetic() {
+                            while j < gb.len() && gb[j].is_ascii_alphabetic() {
+                                j += 1;
+                            }
+                            if j < gb.len() && gb[j] == b'-' {
+                                j += 1;
+                            }
+                            while j < gb.len() && gb[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                            if j < gb.len() && gb[j] == b' ' {
+                                j += 1;
+                            }
+                        } else if j < gb.len() {
+                            j += 1;
+                        }
+                    }
+                    b if b.is_ascii_hexdigit() => {
+                        hex.push(b);
+                        j += 1;
+                    }
+                    _ => j += 1,
+                }
+            }
+            if hex.len() >= 16 {
+                let decoded: Vec<u8> = hex
+                    .chunks_exact(2)
+                    .filter_map(|pair| {
+                        let s = std::str::from_utf8(pair).ok()?;
+                        u8::from_str_radix(s, 16).ok()
+                    })
+                    .collect();
+                if let Ok(img) = image::load_from_memory(&decoded) {
+                    let dir = images_dir(root);
+                    if fs::create_dir_all(&dir).is_ok() {
+                        let name = format!("img-{}-{}.png", now(), note.images.len());
+                        if img.into_rgba8().save(dir.join(&name)).is_ok() {
+                            note.images.push(name);
+                            saved = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !saved {
+            out.push_str(group);
+        }
+        pos = i;
+    }
+    if changed {
+        out.push_str(&rtf[pos..]);
+        note.rtf = Some(out);
+    }
+    changed
+}
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -25,6 +154,8 @@ pub struct Note {
     pub body: String,
     #[serde(default)]
     pub rtf: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     pub color: String,
     #[serde(default)]
     pub pinned: bool,
@@ -141,6 +272,13 @@ impl Board {
             b
         };
         board.validate()?;
+        let mut extracted = false;
+        for note in &mut board.notes {
+            extracted |= extract_rtf_pictures(note, root);
+        }
+        if extracted {
+            let _ = board.save(root);
+        }
         Ok(board)
     }
     pub fn validate(&mut self) -> Result<(), String> {
@@ -220,6 +358,7 @@ impl Board {
             id: id.clone(),
             body: String::new(),
             rtf: None,
+            images: vec![],
             color: COLORS[self.notes.len() % COLORS.len()].into(),
             pinned: false,
             created_at: stamp,
@@ -268,7 +407,7 @@ fn escape_rtf(text: &str, out: &mut String) {
 /// Translate only the old editor's semantic tags; arbitrary HTML is never executed.
 pub fn html(input: &str, rich: bool) -> String {
     let mut out = if rich {
-        "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\uc1\\fs24 ".into()
+        "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI Variable Text;}}\\uc1\\fs21 ".into()
     } else {
         String::new()
     };
@@ -574,6 +713,29 @@ mod tests {
         imported.save(&root).unwrap();
         assert_eq!(fs::read(root.join("config/notes.json")).unwrap(), old);
         assert_eq!(Board::load(&root).unwrap().notes[0].body, "<b>Keep me</b>");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn extract_rtf_pictures_migrates_embedded_png_to_images_and_strips_pict() {
+        let root = std::env::temp_dir()
+            .join(format!("lumen-notes-pict-{}-{}", std::process::id(), now()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        let img = image::RgbaImage::from_pixel(4, 3, image::Rgba([255, 0, 0, 255]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let hex: String = png.iter().map(|b| format!("{b:02x}")).collect();
+        let mut b = Board::default();
+        b.create().unwrap();
+        b.notes[0].body = "Hello".into();
+        b.notes[0].rtf = Some(format!(
+            "{{\\rtf1\\ansi Hello{{\\pict{{\\*\\picprop}}\\pngblip\\picw100\\pich75 \r\n{hex}\r\n}}\\par}}"
+        ));
+        assert!(extract_rtf_pictures(&mut b.notes[0], &root));
+        assert_eq!(b.notes[0].images.len(), 1);
+        assert!(images_dir(&root).join(&b.notes[0].images[0]).exists());
+        assert!(!b.notes[0].rtf.as_deref().unwrap().contains("\\pict"));
+        assert!(!extract_rtf_pictures(&mut b.notes[0], &root));
         fs::remove_dir_all(root).unwrap();
     }
 }

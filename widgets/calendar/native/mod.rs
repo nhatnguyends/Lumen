@@ -81,6 +81,8 @@ struct State {
     pressed: Option<Action>,
     hover: Option<Action>,
     hover_alpha: f32,
+    hover_clock: Option<crate::motion::FrameClock>,
+    frame_queued: bool,
     drag: Option<Drag>,
     ink: Option<u32>,
 }
@@ -139,6 +141,8 @@ impl Host {
             pressed: None,
             hover: None,
             hover_alpha: 0.,
+            hover_clock: None,
+            frame_queued: false,
             drag: None,
             ink: None,
         }));
@@ -244,6 +248,19 @@ impl Host {
         let mut s = self.state.borrow_mut();
         s.open_settings();
     }
+    pub unsafe fn refresh(&mut self) {
+        let mut s = self.state.borrow_mut();
+        s.glass.borrow_mut().refresh();
+        s.key.clear();
+        if IsWindowVisible(s.hwnd) != 0 {
+            InvalidateRect(s.hwnd, null(), 0);
+        }
+        let surface =
+            crate::surface::color(&s.config.palette, s.glass.borrow().wallpaper_accent());
+        if let Some(host) = &mut s.settings_host {
+            host.set_surface(surface, crate::contrast::luminance(surface) > 0.42);
+        }
+    }
     /// Apply an explicit General Settings action; absent fields stay unchanged.
     pub unsafe fn apply_common(&mut self, opacity: Option<f32>, floating: Option<bool>) {
         let mut s = self.state.borrow_mut();
@@ -346,21 +363,6 @@ impl State {
             ),
             Row::section("Window"),
         ];
-        if c.theme == "lumen" {
-            rows.insert(
-                rows.len() - 2,
-                Row::choices(
-                    10,
-                    "Lumen surface",
-                    &c.lumen_surface,
-                    vec![
-                        Choice::new("glass", "Glass", None),
-                        Choice::new("paper", "Paper", Some(0xf2ece6)),
-                        Choice::new("midnight", "Midnight", Some(0x191919)),
-                    ],
-                ),
-            );
-        }
         rows
     }
     unsafe fn open_settings(&mut self) {
@@ -404,9 +406,13 @@ impl State {
     }
     unsafe fn apply_settings_changes(&mut self, changes: Vec<crate::settings_ui::Change>) {
         use crate::settings_ui::Value;
+        let mut structural = false;
         for change in changes {
             match (change.id, change.value) {
-                (1, Value::Bool(v)) => self.config.frosted = v,
+                (1, Value::Bool(v)) => {
+                    self.config.frosted = v;
+                    structural = true;
+                }
                 (2, Value::Number(v)) => self.config.tint = v.clamp(0., 100.),
                 (3, Value::Number(v)) => self.config.frost_strength = v.clamp(0., 100.),
                 (4, Value::Number(v)) => {
@@ -415,29 +421,33 @@ impl State {
                 }
                 (5, Value::Number(v)) => self.config.opacity = v.clamp(0., 100.),
                 (6, Value::Choice(v)) if crate::surface::valid(&v) => {
-                    self.config.palette = crate::surface::normalize(&v).unwrap_or(v)
+                    self.config.palette = crate::surface::normalize(&v).unwrap_or(v);
+                    structural = true;
                 }
-                (7, Value::Choice(v)) if THEMES.contains(&v.as_str()) => self.config.theme = v,
+                (7, Value::Choice(v)) if THEMES.contains(&v.as_str()) => {
+                    self.config.theme = v;
+                    structural = true;
+                }
                 (8, Value::Choice(v)) => {
-                    self.config.week_starts_on = if v == "sunday" { 0 } else { 1 }
+                    self.config.week_starts_on = if v == "sunday" { 0 } else { 1 };
+                    structural = true;
                 }
                 (9, Value::Bool(v)) => {
                     self.config.floating = v;
                     PostMessageW(self.hwnd, APPLY_MODE, 0, 0);
-                }
-                (10, Value::Choice(v)) if matches!(v.as_str(), "glass" | "paper" | "midnight") => {
-                    self.config.lumen_surface = v
+                    structural = true;
                 }
                 _ => {}
             }
         }
-        self.key.clear();
-        self.save();
-        let rows = self.settings_rows();
+        SetTimer(self.hwnd, 99, 180, None);
+        let rows = structural.then(|| self.settings_rows());
         let surface =
             crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent());
         if let Some(host) = &mut self.settings_host {
-            host.set_rows(rows);
+            if let Some(rows) = rows {
+                host.set_rows(rows);
+            }
             host.set_surface(surface, crate::contrast::luminance(surface) > 0.42);
         }
         InvalidateRect(self.hwnd, null(), 0);
@@ -599,6 +609,8 @@ impl State {
                 self.config.open = false;
                 KillTimer(self.hwnd, 1);
                 KillTimer(self.hwnd, 2);
+                self.hover_clock = None;
+                self.frame_queued = false;
                 self.pressed = None;
                 self.hover = None;
                 self.drag = None;
@@ -617,6 +629,7 @@ impl State {
         InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn paint(&mut self) {
+        let frame_started = std::time::Instant::now();
         let mut ps = zeroed();
         BeginPaint(self.hwnd, &mut ps);
         let mut r: RECT = zeroed();
@@ -641,17 +654,14 @@ impl State {
         let mut position: RECT = zeroed();
         GetWindowRect(self.hwnd, &mut position);
         let theme = self.config.theme.as_str();
-        let accent =
-            crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent());
+        let wallpaper_accent = self.glass.borrow().wallpaper_accent();
+        let accent = if self.config.palette == crate::accent::THEME {
+            wallpaper_accent
+        } else {
+            crate::accent::vivid(crate::surface::color(&self.config.palette, wallpaper_accent))
+        };
         let light = matches!(theme, "almanac" | "agenda" | "soft");
         let material = match theme {
-            "lumen" if self.config.palette == "wallpaper-auto" => {
-                match self.config.lumen_surface.as_str() {
-                    "paper" => Some(artwork::Material::LumenPaper),
-                    "midnight" => Some(artwork::Material::LumenMidnight),
-                    _ => None,
-                }
-            }
             "almanac" => Some(artwork::Material::Almanac),
             "blocks" => Some(artwork::Material::Blocks),
             "pop" => Some(artwork::Material::Pop),
@@ -669,7 +679,7 @@ impl State {
             })
             .unwrap_or(color(18, 22, 30));
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             position.left,
             position.top,
             r.right,
@@ -678,20 +688,13 @@ impl State {
             theme,
             self.config.frosted,
             self.config.tint,
-            self.config.opacity,
             self.glass.borrow().revision(),
             crate::fusion::revision(self.hwnd),
             self.config.blur,
             self.config.frost_strength,
-            self.config.palette,
-            self.config.lumen_surface
+            self.config.palette
         );
-        let frozen = self.drag.is_some()
-            && self
-                .backdrop
-                .as_ref()
-                .is_some_and(|f| f.width == r.right && f.height == r.bottom && f.dpi == self.dpi);
-        if self.key != key && !frozen || self.backdrop.is_none() {
+        if self.key != key || self.backdrop.is_none() {
             let brush = CreateSolidBrush(base);
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
@@ -735,7 +738,7 @@ impl State {
             ) {
                 c.image(&overlay, [0., 0., w, h]);
             }
-            c.widget_corner_reflection(chrome, radius, light);
+            c.widget_corner_reflection_for(self.hwnd, chrome, radius, light);
             drop(c);
             frame.bevel_for(self.hwnd);
             self.ink = Some(
@@ -745,7 +748,12 @@ impl State {
                 )
                 .0,
             );
-            if let Some(back) = Buffer::plain(r.right, r.bottom, self.dpi) {
+            if let Some(back) = self
+                .backdrop
+                .take()
+                .filter(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
+                .or_else(|| Buffer::plain(r.right, r.bottom, self.dpi))
+            {
                 back.copy_from(frame.dc);
                 self.backdrop = Some(back);
             }
@@ -753,28 +761,72 @@ impl State {
         } else if let Some(back) = &self.backdrop {
             frame.copy_from(back.dc);
         }
-        frame.background_alpha((self.config.opacity * 2.55).round() as u8);
+        frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55).round() as u8);
         let _batch = render::AlphaBatch::new(frame.dc, self.dpi);
         let ink = self.ink.unwrap_or(color(248, 250, 253));
         self.paint_calendar(frame.dc, w, h, ink, accent);
         drop(_batch);
         if let Some(bg) = &self.backdrop {
+            let tiny = layout::tiny(w, h);
+            let layout = layout::Layout::new(&self.config.theme, w, h);
+            let reference = !tiny && layout::is_reference(&self.config.theme);
+            let month_days = self.cursor.matrix(self.config.week_starts_on == 1);
+            let week_days = self.selected.week(self.config.week_starts_on == 1);
+            let centered_box = |rect: [f32; 4], max_size: f32, soft: bool| -> ([f32; 4], f32) {
+                let cx = (rect[0] + rect[2]) * 0.5;
+                let cy = (rect[1] + rect[3]) * 0.5;
+                let size = (rect[2] - rect[0] - 4.)
+                    .min(rect[3] - rect[1] - 3.)
+                    .min(max_size);
+                (
+                    [cx - size / 2., cy - size / 2., cx + size / 2., cy + size / 2.],
+                    if soft { 5. } else { size / 2. },
+                )
+            };
             for button in self.buttons() {
                 let selected = matches!(button.action, Action::Today)
-                    || matches!(button.action,Action::Day(i) if self.cursor.matrix(self.config.week_starts_on==1)[i]==self.selected)
+                    || matches!(button.action, Action::Day(i) if month_days[i] == self.selected)
+                    || matches!(button.action, Action::WeekDay(i) if week_days[i] == self.selected)
                     || self.hover == Some(button.action)
                     || self.pressed == Some(button.action);
                 if selected && !matches!(button.action, Action::Settings | Action::Hide) {
-                    let radius = if layout::tiny(w, h) {
-                        4.
-                    } else if matches!(self.config.theme.as_str(), "pop" | "prism" | "grove") {
-                        (button.rect[3] - button.rect[1]) / 2.
-                    } else {
-                        8.
+                    let (rect, radius) = match button.action {
+                        Action::Day(i) => {
+                            if reference {
+                                centered_box(button.rect, 28., self.config.theme == "soft")
+                            } else {
+                                let (r, rad, _) =
+                                    view::day_cell_shape(&self.config.theme, &layout, i, tiny);
+                                (r, rad)
+                            }
+                        }
+                        Action::WeekDay(_) => centered_box(button.rect, 40., false),
+                        Action::Today => (
+                            button.rect,
+                            if tiny {
+                                10.
+                            } else if reference {
+                                8.
+                            } else {
+                                12.
+                            },
+                        ),
+                        Action::Previous | Action::Next => (
+                            button.rect,
+                            if tiny {
+                                7.
+                            } else if reference {
+                                8.
+                            } else {
+                                9.
+                            },
+                        ),
+                        Action::Weekly(_) => (button.rect, 7.),
+                        _ => (button.rect, 8.),
                     };
                     frame.retain_control_backing(
                         bg,
-                        button.rect,
+                        rect,
                         radius,
                         if self.hover == Some(button.action)
                             && !matches!(button.action, Action::Today)
@@ -799,6 +851,14 @@ impl State {
             );
         }
         EndPaint(self.hwnd, &ps);
+        if IsWindowVisible(self.hwnd) != 0 && self.hover_clock.is_some() {
+            crate::motion::pace_vsync(
+                self.hwnd,
+                frame_started,
+                &mut self.frame_queued,
+                crate::motion::VSYNC_FRAME,
+            );
+        }
     }
 }
 
@@ -945,7 +1005,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if hover != s.hover {
                     s.hover = hover;
                     s.hover_alpha = 0.;
-                    SetTimer(hwnd, 2, 16, None);
+                    if s.hover_clock.is_none() {
+                        s.hover_clock = Some(crate::motion::FrameClock::start());
+                    }
+                    SetTimer(hwnd, 2, 10, None);
+                    InvalidateRect(hwnd, null(), 0);
                 }
                 let mut track = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -985,15 +1049,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             s.hover = None;
             s.hover_alpha = 0.;
             KillTimer(hwnd, 2);
+            s.hover_clock = None;
             InvalidateRect(hwnd, null(), 0);
             0
         }
+        WM_TIMER if wp == 99 => {
+            KillTimer(hwnd, 99);
+            s.save();
+            0
+        }
         WM_TIMER if wp == 2 => {
-            s.hover_alpha = (s.hover_alpha + 0.13).min(1.);
+            s.hover_alpha = (s.hover_alpha + 0.08).min(1.);
             if s.hover_alpha >= 1. {
                 KillTimer(hwnd, 2);
+                s.hover_clock = None;
             }
-            InvalidateRect(hwnd, null(), 0);
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            s.frame_queued = false;
+            if s.hover_clock.is_some() {
+                s.hover_alpha = (s.hover_alpha + 0.08).min(1.);
+                if s.hover_alpha >= 1. {
+                    KillTimer(hwnd, 2);
+                    s.hover_clock = None;
+                }
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_TIMER if wp == 1 => {
@@ -1072,6 +1157,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_KILLFOCUS => {
             s.keyboard_day = false;
             InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            if (s.config.frosted || crate::glass::liquid_glass())
+                && crate::glass::move_paint_due(hwnd)
+            {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_WINDOWPOSCHANGED => {

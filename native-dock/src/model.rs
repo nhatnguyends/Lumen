@@ -55,7 +55,13 @@ pub struct Dock {
     pub icon_size: i32,
     pub show_labels: bool,
     pub show_search: bool,
+    pub sync_desktop: bool,
     pub theme: String,
+    #[serde(default = "default_pinned_widgets")]
+    pub pinned_widgets: Vec<String>,
+}
+fn default_pinned_widgets() -> Vec<String> {
+    vec!["music".into(), "notes".into(), "calendar".into()]
 }
 impl Default for Dock {
     fn default() -> Self {
@@ -75,7 +81,9 @@ impl Default for Dock {
             icon_size: 48,
             show_labels: true,
             show_search: true,
+            sync_desktop: false,
             theme: crate::accent::THEME.into(),
+            pinned_widgets: default_pinned_widgets(),
         }
     }
 }

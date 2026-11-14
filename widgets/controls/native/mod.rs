@@ -2,6 +2,7 @@
 mod backend;
 mod display_restore;
 mod icons;
+mod input_source;
 mod lenses;
 mod model;
 pub(crate) mod package;
@@ -51,6 +52,17 @@ enum Action {
     Move(usize),
     Settings,
     Hide,
+    Back,
+}
+struct CompactTile {
+    control_index: usize,
+    device_index: Option<usize>,
+    kind: Kind,
+    title: String,
+    subtitle: String,
+    on: bool,
+    available: bool,
+    rect: [f32; 4],
 }
 struct Drag {
     edge: u32,
@@ -92,8 +104,15 @@ struct State {
     hover: Option<Action>,
     drag: Option<Drag>,
     slider: Option<(usize, f32)>,
+    slider_anchor: Option<(f32, f32)>,
     scroll: f32,
     scroll_target: f32,
+    hover_motion: std::collections::HashMap<String, crate::motion::Tween>,
+    hover_epoch: Instant,
+    hover_clock: Option<crate::motion::FrameClock>,
+    scroll_clock: Option<crate::motion::FrameClock>,
+    scroll_tick: Instant,
+    frame_queued: bool,
     manager_window: Option<Box<Host>>,
     manager_parent: HWND,
     manager_query: String,
@@ -101,6 +120,8 @@ struct State {
     scroll_drag: Option<(bool, f32)>,
     editing: bool,
     manager: bool,
+    picker: Option<usize>,
+    display_order: Vec<String>,
     moving: Option<(usize, POINT, usize, bool)>,
     button_lenses: lenses::Lenses,
 }
@@ -191,8 +212,15 @@ impl Host {
             hover: None,
             drag: None,
             slider: None,
+            slider_anchor: None,
             scroll: 0.,
             scroll_target: 0.,
+            hover_motion: Default::default(),
+            hover_epoch: Instant::now(),
+            hover_clock: None,
+            scroll_clock: None,
+            scroll_tick: Instant::now(),
+            frame_queued: false,
             manager_window: None,
             manager_parent: null_mut(),
             manager_query: String::new(),
@@ -200,6 +228,8 @@ impl Host {
             scroll_drag: None,
             editing: false,
             manager: false,
+            picker: None,
+            display_order: vec![],
             moving: None,
             button_lenses: lenses::Lenses::default(),
         }));
@@ -288,6 +318,7 @@ impl Host {
     }
     pub unsafe fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
+        s.glass.borrow_mut().refresh();
         s.key.clear();
         if IsWindowVisible(s.hwnd) != 0 {
             InvalidateRect(s.hwnd, null(), 0);
@@ -320,6 +351,16 @@ fn point(lp: LPARAM) -> POINT {
 }
 fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | g << 8 | b << 16
+}
+fn clean_device_name(name: &str) -> String {
+    let t = name.trim();
+    if let (Some(open), Some(rest)) = (t.find(" ("), t.strip_suffix(')')) {
+        let inner = rest[open + 2..].trim();
+        if !inner.is_empty() {
+            return inner.to_string();
+        }
+    }
+    t.to_string()
 }
 impl State {
     unsafe fn size(&self) -> [f32; 2] {
@@ -376,7 +417,7 @@ impl State {
             self.last_poll = Instant::now();
             self.error.clear();
             unsafe {
-                SetTimer(self.hwnd, 1, 100, None);
+                SetTimer(self.hwnd, 1, 16, None);
             }
         }
     }
@@ -388,8 +429,10 @@ impl State {
         self.pressed = None;
         self.drag = None;
         self.slider = None;
+        self.slider_anchor = None;
         self.moving = None;
         self.manager = false;
+        self.picker = None;
         ShowWindow(self.hwnd, SW_HIDE);
         for ui in [&mut self.settings, &mut self.editor, &mut self.chooser]
             .into_iter()
@@ -397,6 +440,10 @@ impl State {
         {
             ui.hide();
         }
+        self.scroll_clock = None;
+        self.hover_clock = None;
+        self.hover_motion.clear();
+        KillTimer(self.hwnd, 3);
         self.frame = None;
         self.backdrop = None;
         self.fade_base = None;
@@ -418,7 +465,7 @@ impl State {
             }
         }
         if let Some((a, _)) = self.hits.iter().rev().find(|(a, r)| {
-            (matches!(a, Action::Scroll(_)) || (self.manager && *a == Action::Hide))
+            (matches!(a, Action::Scroll(_)) || (self.manager && *a == Action::Back))
                 && inside(*r, p)
         }) {
             return Some(*a);
@@ -452,9 +499,10 @@ impl State {
                 &c.design,
                 [
                     ("lumen", "Lumen"),
-                    ("cloud", "Cloud"),
+                    ("cloud", "Vibrant"),
                     ("soft-violet", "Soft Violet"),
                     ("liquid-pastel", "Liquid Pastel"),
+                    ("compact", "Compact"),
                 ]
                 .into_iter()
                 .map(|(k, v)| Choice::new(k, v, None))
@@ -498,6 +546,18 @@ impl State {
             }
         }
         if let Some(ui) = &mut self.settings {
+            let light = matches!(
+                self.config.design.as_str(),
+                "cloud" | "soft-violet" | "liquid-pastel"
+            );
+            ui.set_surface(
+                if light {
+                    rgb(229, 233, 232)
+                } else {
+                    rgb(28, 32, 42)
+                },
+                light,
+            );
             ui.set_rows(rows);
             ui.show();
         }
@@ -603,7 +663,7 @@ impl State {
             })
         };
         for kind in KINDS {
-            if matches!(kind, Kind::Mute | Kind::MicMute) {
+            if matches!(kind, Kind::Mute | Kind::MicMute | Kind::Source) {
                 continue;
             }
             if kind == Kind::Hdr {
@@ -642,7 +702,7 @@ impl State {
                 id: c.id.clone(),
                 kind,
                 target: d.id.clone(),
-                label: d.name.clone(),
+                label: clean_device_name(&d.name),
             })
             .collect()
         } else {
@@ -704,8 +764,27 @@ impl State {
                     self.manager = false;
                     self.scroll = 0.;
                     self.scroll_target = 0.;
+                } else if self.picker.is_some() {
+                    self.picker = None;
+                    self.scroll = 0.;
+                    self.scroll_target = 0.;
                 } else {
                     self.hide();
+                }
+            }
+            Action::Back => {
+                if !self.manager_parent.is_null() {
+                    self.hide();
+                    return;
+                }
+                if self.manager {
+                    self.manager = false;
+                    self.scroll = 0.;
+                    self.scroll_target = 0.;
+                } else if self.picker.is_some() {
+                    self.picker = None;
+                    self.scroll = 0.;
+                    self.scroll_target = 0.;
                 }
             }
             Action::Edit => self.open_editor(),
@@ -748,7 +827,13 @@ impl State {
                 }
                 if let Some(c) = self.config.controls.get(i).cloned() {
                     if c.kind.is_group() {
-                        return;
+                        if self.config.design == "compact" {
+                            self.picker = Some(i);
+                            self.scroll = 0.;
+                            self.scroll_target = 0.;
+                        } else {
+                            return;
+                        }
                     } else {
                         let (on, _, available) = self.info(&c);
                         if available {
@@ -776,15 +861,33 @@ impl State {
             Action::Device(i, j) => {
                 if !self.editing {
                     if let Some(mut c) = self.config.controls.get(i).cloned() {
-                        if let Some((id, _, on, enabled)) = self.devices(c.kind).get(j) {
+                        if let Some((id, _, on, enabled)) = self.control_devices(&c).get(j) {
                             if *enabled {
+                                if c.kind == Kind::Source {
+                                    if let Ok(value) = id.parse::<f32>() {
+                                        self.command(c, value);
+                                    }
+                                    if self.picker.is_some() {
+                                        self.picker = None;
+                                        self.scroll = 0.;
+                                        self.scroll_target = 0.;
+                                    }
+                                    InvalidateRect(self.hwnd, null(), 0);
+                                    return;
+                                }
                                 c.target = id.clone();
                                 let value = if c.kind == Kind::Display && *on {
                                     0.
                                 } else {
                                     1.
                                 };
+                                let close_picker = c.kind != Kind::Display;
                                 self.command(c, value);
+                                if self.picker.is_some() && close_picker {
+                                    self.picker = None;
+                                    self.scroll = 0.;
+                                    self.scroll_target = 0.;
+                                }
                             }
                         }
                     }
@@ -794,8 +897,156 @@ impl State {
         }
         InvalidateRect(self.hwnd, null(), 0);
     }
+    fn compact_tiles(&self, w: f32, h: f32, scroll: f32) -> (Vec<CompactTile>, f32, bool) {
+        let mut kind_order = vec![];
+        for c in &self.config.controls {
+            if !kind_order.contains(&c.kind) {
+                kind_order.push(c.kind);
+            }
+        }
+        let mut items = vec![];
+        for kind in kind_order {
+            for (ci, c) in self.config.controls.iter().enumerate() {
+                if c.kind != kind {
+                    continue;
+                }
+                if c.kind.is_group() {
+                    let devices = self.control_devices(c);
+                    let title = match c.kind {
+                        Kind::Audio => "Audio",
+                        Kind::Microphone => "Mic",
+                        Kind::Display => "Display",
+                        _ => &c.label,
+                    };
+                    if devices.is_empty() {
+                        items.push(CompactTile {
+                            control_index: ci,
+                            device_index: None,
+                            kind: c.kind,
+                            title: title.into(),
+                            subtitle: "No devices".into(),
+                            on: false,
+                            available: false,
+                            rect: [0.; 4],
+                        });
+                    } else {
+                        for (di, (_, dev_name, d_on, d_enabled)) in devices.into_iter().enumerate() {
+                            let subtitle = if c.kind == Kind::Display {
+                                dev_name.trim_end_matches(" · Main Display").to_string()
+                            } else {
+                                dev_name
+                            };
+                            items.push(CompactTile {
+                                control_index: ci,
+                                device_index: Some(di),
+                                kind: c.kind,
+                                title: title.into(),
+                                subtitle,
+                                on: d_on,
+                                available: if c.kind == Kind::Display {
+                                    d_enabled
+                                } else {
+                                    true
+                                },
+                                rect: [0.; 4],
+                            });
+                        }
+                    }
+                } else {
+                    let (on, status, available) = self.info(c);
+                    items.push(CompactTile {
+                        control_index: ci,
+                        device_index: None,
+                        kind: c.kind,
+                        title: if c.kind == Kind::Hdr {
+                            "HDR".into()
+                        } else {
+                            c.label.clone()
+                        },
+                        subtitle: status,
+                        on,
+                        available,
+                        rect: [0.; 4],
+                    });
+                }
+            }
+        }
+        let (top, pad, gap) = (60., 18., 10.);
+        let minimized = h <= 240.;
+        if minimized {
+            let mut x = pad;
+            let height = (h - top - pad).clamp(32., 56.);
+            let mut prev_kind: Option<Kind> = None;
+            for item in &mut items {
+                if let Some(pk) = prev_kind {
+                    x += if pk != item.kind { 14. } else { 8. };
+                }
+                let width = if item.kind.is_volume() { 160. } else { height };
+                item.rect = [x - scroll, top, x + width - scroll, top + height];
+                x += width;
+                prev_kind = Some(item.kind);
+            }
+            return (items, (x + pad - w).max(0.), true);
+        }
+        let cols = ((w - 2. * pad + gap) / 88.).floor().max(1.) as usize;
+        let mut y = top;
+        let mut row: Vec<(usize, usize, f32)> = vec![];
+        let flush_row =
+            |row: &mut Vec<(usize, usize, f32)>, y: &mut f32, items: &mut [CompactTile]| {
+                if row.is_empty() {
+                    return;
+                }
+                let k = row.len();
+                let total_span: usize = row.iter().map(|(_, s, _)| *s).sum();
+                let avail = (w - 2. * pad - gap * (k - 1) as f32).max(1.);
+                let rh = row.iter().map(|(_, _, h)| *h).fold(0f32, f32::max);
+                let mut x = pad;
+                for (idx, span, _) in row.drain(..) {
+                    let width = avail * (span as f32 / total_span as f32);
+                    items[idx].rect = [x, *y - scroll, x + width, *y + rh - scroll];
+                    x += width + gap;
+                }
+                *y += rh + gap;
+            };
+        let mut col = 0;
+        let mut prev_kind: Option<Kind> = None;
+        for idx in 0..items.len() {
+            let kind = items[idx].kind;
+            let span = if kind.is_volume() { cols } else { 1 };
+            let kind_changed = prev_kind.is_some_and(|pk| pk != kind);
+            if !row.is_empty() && (kind_changed || col + span > cols) {
+                flush_row(&mut row, &mut y, &mut items);
+                col = 0;
+                if kind_changed {
+                    y += 8.;
+                }
+            }
+            let ih = if kind.is_volume() { 64. } else { 86. };
+            row.push((idx, span, ih));
+            col += span;
+            prev_kind = Some(kind);
+            if col == cols {
+                flush_row(&mut row, &mut y, &mut items);
+                col = 0;
+            }
+        }
+        flush_row(&mut row, &mut y, &mut items);
+        let end = if items.is_empty() { top } else { y - gap };
+        (items, (end + pad - h).max(0.), false)
+    }
+    fn slider_rect(&self, index: usize, w: f32, h: f32) -> Option<[f32; 4]> {
+        if self.config.design == "compact" && !self.manager {
+            let (items, _, _) = self.compact_tiles(w, h, self.scroll);
+            return items
+                .into_iter()
+                .find(|t| t.control_index == index && t.kind.is_volume())
+                .map(|t| t.rect);
+        }
+        let (t, _, _) = self.tiles(w, h, self.scroll);
+        t.into_iter().find(|t| t.index == index).map(|t| t.rect)
+    }
     fn tiles(&self, w: f32, h: f32, scroll: f32) -> (Vec<model::Tile>, f32, bool) {
-        model::layout_devices(
+        model::layout_devices_for_design(
             &self.config.controls,
             w,
             h,
@@ -805,7 +1056,18 @@ impl State {
                 self.snapshot.inputs.len(),
                 self.snapshot.displays.len(),
             ],
+            &self.config.design,
         )
+    }
+    fn picker_max_scroll(&self, h: f32) -> f32 {
+        let Some(idx) = self.picker else {
+            return 0.;
+        };
+        let Some(c) = self.config.controls.get(idx) else {
+            return 0.;
+        };
+        let count = self.control_devices(c).len().max(1);
+        (92. + count as f32 * 40. + 14. - h).max(0.)
     }
     fn scrollbar(&self) -> Option<([f32; 4], [f32; 4], f32, bool)> {
         let [w, h] = unsafe { self.size() };
@@ -822,6 +1084,11 @@ impl State {
                 .collect();
             let (_, _, max) = model::manager_layout(&items, w, h, 0.);
             (vec![], max, false)
+        } else if self.picker.is_some() {
+            (vec![], self.picker_max_scroll(h), false)
+        } else if self.config.design == "compact" {
+            let (_, max, horizontal) = self.compact_tiles(w, h, 0.);
+            (vec![], max, horizontal)
         } else {
             self.tiles(w, h, 0.)
         };
@@ -833,10 +1100,10 @@ impl State {
             [18., h - 9., w - 18., h - 5.]
         } else {
             [
-                w - 11.,
-                top,
+                w - 10.,
+                top + 8.,
                 w - 7.,
-                h - if self.manager { 60. } else { 18. },
+                h - if self.manager { 72. } else { 36. },
             ]
         };
         let length = if horizontal {
@@ -844,7 +1111,11 @@ impl State {
         } else {
             track[3] - track[1]
         };
-        let thumb_len = (length * length / (length + max)).clamp(24., length.max(24.));
+        let thumb_len = if horizontal {
+            (length * length / (length + max)).clamp(24., length.max(24.))
+        } else {
+            (length * length / (length + max) * 0.65).clamp(24., length.min(56.).max(24.))
+        };
         let offset = (length - thumb_len) * (self.scroll / max).clamp(0., 1.);
         let thumb = if horizontal {
             [
@@ -863,11 +1134,39 @@ impl State {
         };
         Some((track, thumb, max, horizontal))
     }
+    fn control_devices(&self, c: &Control) -> Vec<(String, String, bool, bool)> {
+        if c.kind == Kind::Source {
+            self.snapshot
+                .sources
+                .get(&c.target)
+                .into_iter()
+                .flatten()
+                .map(|d| (d.id.clone(), d.name.clone(), d.selected, true))
+                .collect()
+        } else {
+            self.devices(c.kind)
+        }
+    }
+    fn sync_display_order(&mut self) {
+        self.display_order
+            .retain(|id| self.snapshot.displays.iter().any(|d| &d.id == id));
+        for d in &self.snapshot.displays {
+            if !self.display_order.contains(&d.id) {
+                self.display_order.push(d.id.clone());
+            }
+        }
+    }
     fn devices(&self, kind: Kind) -> Vec<(String, String, bool, bool)> {
         if kind == Kind::Display {
-            self.snapshot
-                .displays
-                .iter()
+            let mut items: Vec<_> = self.snapshot.displays.iter().collect();
+            items.sort_by_key(|d| {
+                self.display_order
+                    .iter()
+                    .position(|id| id == &d.id)
+                    .unwrap_or(usize::MAX)
+            });
+            items
+                .into_iter()
                 .map(|d| {
                     (
                         d.id.clone(),
@@ -888,13 +1187,14 @@ impl State {
                 &self.snapshot.outputs
             };
             list.iter()
-                .map(|d| (d.id.clone(), d.name.clone(), d.selected, true))
+                .map(|d| (d.id.clone(), clean_device_name(&d.name), d.selected, true))
                 .collect()
         }
     }
     fn info(&self, c: &Control) -> (bool, String, bool) {
         let s = &self.snapshot;
         match c.kind {
+            Kind::Source => (false, "DDC/CI input selection".into(), true),
             Kind::Volume | Kind::MicVolume => {
                 let value = if c.kind.is_input() {
                     s.mic_volume
@@ -924,7 +1224,7 @@ impl State {
                 });
                 (
                     d.is_some_and(|d| d.selected),
-                    d.map(|d| d.name.clone())
+                    d.map(|d| clean_device_name(&d.name))
                         .unwrap_or_else(|| "Choose device".into()),
                     !list.is_empty(),
                 )
@@ -970,6 +1270,8 @@ impl State {
         }
     }
     unsafe fn paint(&mut self) {
+        self.sync_display_order();
+        let frame_started = Instant::now();
         let mut ps = zeroed();
         BeginPaint(self.hwnd, &mut ps);
         let mut r: RECT = zeroed();
@@ -988,7 +1290,7 @@ impl State {
         let mut pos: RECT = zeroed();
         GetWindowRect(self.hwnd, &mut pos);
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             pos.left,
             pos.top,
             w,
@@ -996,16 +1298,17 @@ impl State {
             self.dpi,
             self.glass.borrow().revision(),
             crate::fusion::revision(self.hwnd),
-            serde_json::to_string(&self.config).unwrap_or_default()
+            self.config.design,
+            self.config.frosted,
+            self.config.tint,
+            self.config.frost_strength,
+            self.config.blur,
+            self.config.palette,
+            (self.config.opacity * 2.55).round() as u8
         );
-        let frozen = self.drag.is_some()
-            && self
-                .backdrop
-                .as_ref()
-                .is_some_and(|f| f.width == r.right && f.height == r.bottom);
-        if self.backdrop.is_none() || self.key != key && !frozen {
+        if self.backdrop.is_none() || self.fade_base.is_none() || self.key != key {
             let design = self.config.design.as_str();
-            let light = design != "lumen";
+            let light = matches!(design, "cloud" | "soft-violet" | "liquid-pastel");
             let base = match design {
                 "cloud" => rgb(237, 244, 244),
                 "soft-violet" => rgb(231, 230, 241),
@@ -1055,7 +1358,7 @@ impl State {
             {
                 c.image(&noise, pane);
             }
-            c.widget_corner_reflection(pane, 30., light);
+            c.widget_corner_reflection_for(self.hwnd, pane, 30., light);
             drop(c);
             frame.bevel_for(self.hwnd);
             self.ink = Some(
@@ -1065,39 +1368,59 @@ impl State {
                 )
                 .0,
             );
-            if let Some(back) = Buffer::plain(r.right, r.bottom, self.dpi) {
+            if let Some(back) = self
+                .backdrop
+                .take()
+                .filter(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
+                .or_else(|| Buffer::plain(r.right, r.bottom, self.dpi))
+            {
                 back.copy_from(frame.dc);
                 self.backdrop = Some(back);
             }
+            frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55).round() as u8);
+            if let Some(base) = self
+                .fade_base
+                .take()
+                .filter(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
+                .or_else(|| Buffer::plain(r.right, r.bottom, self.dpi))
+            {
+                base.copy_from(frame.dc);
+                self.fade_base = Some(base);
+            }
             self.key = key;
-        } else if let Some(back) = &self.backdrop {
-            frame.copy_from(back.dc);
-        }
-        frame.background_alpha((self.config.opacity * 2.55).round() as u8);
-        if self
-            .fade_base
-            .as_ref()
-            .is_none_or(|b| b.width != r.right || b.height != r.bottom)
-        {
-            self.fade_base = Buffer::plain(r.right, r.bottom, self.dpi);
-        }
-        if let Some(base) = &self.fade_base {
-            base.copy_from(frame.dc);
+        } else if let Some(base) = &self.fade_base {
+            frame.copy_from(base.dc);
         }
         let ink = self.ink.unwrap_or(0xffffff);
         let light = crate::contrast::luminance(ink) < 0.5;
         let accent = if self.config.design == "soft-violet" {
-            rgb(118, 86, 226)
+            crate::accent::vivid(rgb(118, 86, 226))
         } else if self.config.design == "cloud" {
-            rgb(66, 186, 198)
+            crate::accent::vivid(rgb(66, 186, 198))
+        } else if self.config.palette == crate::accent::THEME {
+            self.glass.borrow().wallpaper_accent()
         } else {
-            crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent())
+            crate::accent::vivid(crate::surface::color(
+                &self.config.palette,
+                self.glass.borrow().wallpaper_accent(),
+            ))
         };
-        let (_, max, _) = self.tiles(w, h, 0.);
+        self.picker = None;
+        let compact_expanded = self.config.design == "compact" && !self.manager;
+        let (_, max, _) = if compact_expanded {
+            let (_, m, _) = self.compact_tiles(w, h, 0.);
+            (vec![], m, false)
+        } else {
+            self.tiles(w, h, 0.)
+        };
         let max = if self.manager { 100000. } else { max };
         self.scroll_target = self.scroll_target.clamp(0., max);
         self.scroll = self.scroll.clamp(0., max);
-        let (tiles, _, _) = self.tiles(w, h, self.scroll);
+        let (tiles, _, _) = if compact_expanded || self.manager {
+            (vec![], 0., false)
+        } else {
+            self.tiles(w, h, self.scroll)
+        };
         self.hits.clear();
         let saved = SaveDC(frame.dc);
         IntersectClipRect(
@@ -1108,7 +1431,335 @@ impl State {
             ((h - if self.manager { 60. } else { 12. }) * self.dpi) as i32,
         );
         let batch = render::AlphaBatch::new(frame.dc, self.dpi);
-        for tile in if self.manager { vec![] } else { tiles } {
+        let mut compact_groups: Vec<([f32; 4], f32)> = vec![];
+        if compact_expanded {
+            let (compact_items, _, _) = self.compact_tiles(w, h, self.scroll);
+            let minimized = h <= 240.;
+            let mut i = 0;
+            while i < compact_items.len() {
+                let kind = compact_items[i].kind;
+                let mut j = i + 1;
+                while j < compact_items.len() && compact_items[j].kind == kind {
+                    j += 1;
+                }
+                if !kind.is_volume() && j - i >= 2 {
+                    let mut box_r = compact_items[i].rect;
+                    for item in &compact_items[i + 1..j] {
+                        box_r[0] = box_r[0].min(item.rect[0]);
+                        box_r[1] = box_r[1].min(item.rect[1]);
+                        box_r[2] = box_r[2].max(item.rect[2]);
+                        box_r[3] = box_r[3].max(item.rect[3]);
+                    }
+                    let gr = [
+                        (box_r[0] - 4.).max(14.),
+                        (box_r[1] - if minimized { 3. } else { 4. }).max(54.),
+                        (box_r[2] + 4.).min(w - 14.),
+                        box_r[3] + if minimized { 3. } else { 4. },
+                    ];
+                    let gr_rad = if minimized {
+                        ((gr[3] - gr[1]) / 2.).min(20.)
+                    } else {
+                        20.
+                    };
+                    if gr[3] >= 54. && gr[1] <= h - 12. && gr[2] >= 14. && gr[0] <= w - 14. {
+                        let cv = Canvas::new(frame.dc, self.dpi);
+                        cv.group_surface_live(gr, gr_rad, self.drag.is_some());
+                        compact_groups.push((gr, gr_rad));
+                    }
+                }
+                i = j;
+            }
+            for item in compact_items {
+                let r = item.rect;
+                if r[3] < 54. || r[1] > h - 12. || r[2] < 14. || r[0] > w - 14. {
+                    continue;
+                }
+                let cv = Canvas::new(frame.dc, self.dpi);
+                let action = if item.kind.is_volume() {
+                    Action::Slider(item.control_index)
+                } else if let Some(di) = item.device_index {
+                    Action::Device(item.control_index, di)
+                } else {
+                    Action::Control(item.control_index)
+                };
+                let hovered = if self.editing {
+                    self.scroll_clock.is_none()
+                        && self.hover.is_some_and(|a| {
+                            matches!(a, Action::Move(i) | Action::Remove(i) | Action::Rename(i) if i == item.control_index)
+                        })
+                } else {
+                    item.available
+                        && self.scroll_clock.is_none()
+                        && (self.hover == Some(action)
+                            || (item.kind.is_volume()
+                                && (self.hover == Some(Action::Mute(item.control_index))
+                                    || self
+                                        .slider
+                                        .is_some_and(|(si, _)| si == item.control_index))))
+                };
+                let motion_key = format!(
+                    "compact:{}:{}",
+                    item.control_index,
+                    item.device_index.map_or(usize::MAX, |d| d),
+                );
+                let now = self.hover_epoch.elapsed().as_secs_f64() * 1000.;
+                let motion = self.hover_motion.entry(motion_key).or_default();
+                motion.target(
+                    if hovered { 1. } else { 0. },
+                    now,
+                    180.,
+                    [0.25, 0.1, 0.25, 1.],
+                );
+                let hover_amount = motion.sample(now);
+                if motion.moving(now) && self.hover_clock.is_none() {
+                    self.hover_clock = Some(crate::motion::FrameClock::start());
+                    SetTimer(self.hwnd, 3, 10, None);
+                }
+                if item.kind.is_volume() {
+                    let v = self
+                        .slider
+                        .filter(|(i, _)| *i == item.control_index)
+                        .map(|(_, v)| v)
+                        .or(if item.kind.is_input() {
+                            self.snapshot.mic_volume
+                        } else {
+                            self.snapshot.volume
+                        })
+                        .unwrap_or(0.)
+                        .clamp(0., 100.);
+                    let pill_h = if minimized {
+                        (r[3] - r[1]).clamp(28., 44.)
+                    } else {
+                        36.
+                    };
+                    let pill_y = if minimized {
+                        (r[1] + r[3] - pill_h) / 2.
+                    } else {
+                        r[1] + 24.
+                    };
+                    let track = [r[0], pill_y, r[2], pill_y + pill_h];
+                    if !self.editing {
+                        self.hits.push((action, track));
+                    }
+                    if !minimized {
+                        cv.text_alpha(
+                            &item.title,
+                            [r[0] + 4., r[1] + 2., r[2] - 44., r[1] + 20.],
+                            11.,
+                            true,
+                            ink,
+                            0,
+                            if item.available { 255 } else { 115 },
+                        );
+                        cv.text_alpha(
+                            &format!("{}%", v.round()),
+                            [r[2] - 44., r[1] + 2., r[2] - 4., r[1] + 20.],
+                            10.,
+                            false,
+                            ink,
+                            2,
+                            if item.available { 170 } else { 110 },
+                        );
+                    }
+                    cv.soft_shadow(track, pill_h / 2., 14. + 8. * hover_amount, 4., 2.);
+                    cv.round(
+                        track,
+                        pill_h / 2.,
+                        ink,
+                        if light { 28 } else { 36 },
+                        false,
+                        false,
+                    );
+                    let span = (track[2] - track[0] - pill_h).max(0.);
+                    let fill_w = (pill_h + span * (v / 100.)).min(track[2] - track[0]);
+                    cv.round(
+                        [track[0], track[1], track[0] + fill_w, track[3]],
+                        pill_h / 2.,
+                        accent,
+                        if item.available { 210 } else { 105 },
+                        false,
+                        false,
+                    );
+                    self.button_lenses.draw(
+                        &cv,
+                        self.dpi,
+                        track,
+                        accent,
+                        lenses::ENABLED
+                            | lenses::CIRCLE
+                            | if light { lenses::LIGHT } else { 0 }
+                            | if hovered { lenses::HOVER } else { 0 }
+                            | if self.pressed == Some(action) {
+                                lenses::PRESSED
+                            } else {
+                                0
+                            },
+                    );
+                    if hover_amount > 0.001 {
+                        cv.round(
+                            track,
+                            pill_h / 2.,
+                            0xffffff,
+                            (44. * hover_amount).round() as u8,
+                            false,
+                            false,
+                        );
+                    }
+                    if !self.editing {
+                        self.hits.push((
+                            Action::Mute(item.control_index),
+                            [track[0], track[1], track[0] + pill_h, track[3]],
+                        ));
+                    }
+                    let icon_ink = if crate::contrast::luminance(accent) > 0.55 {
+                        rgb(24, 28, 36)
+                    } else {
+                        0xffffff
+                    };
+                    let icon_kind = if if item.kind.is_input() {
+                        self.snapshot.mic_muted
+                    } else {
+                        self.snapshot.muted
+                    } {
+                        if item.kind.is_input() {
+                            Kind::MicMute
+                        } else {
+                            Kind::Mute
+                        }
+                    } else {
+                        item.kind
+                    };
+                    let icon_size = if minimized { 18. } else { 20. };
+                    self.icons.draw(
+                        self.dpi,
+                        &cv,
+                        icon_kind,
+                        track[0] + (pill_h - icon_size) / 2.,
+                        track[1] + (pill_h - icon_size) / 2.,
+                        icon_size,
+                        icon_ink,
+                        item.available,
+                    );
+                } else {
+                    let d = if minimized {
+                        (r[2] - r[0]).min(r[3] - r[1])
+                    } else {
+                        48f32.min(r[2] - r[0] - 4.)
+                    };
+                    let cx = (r[0] + r[2]) / 2.;
+                    let cy = if minimized {
+                        (r[1] + r[3]) / 2.
+                    } else {
+                        r[1] + 2. + d / 2.
+                    };
+                    let disc = [cx - d / 2., cy - d / 2., cx + d / 2., cy + d / 2.];
+                    if item.available && !self.editing {
+                        self.hits.push((action, disc));
+                    }
+                    cv.soft_shadow(disc, d / 2., 16. + 10. * hover_amount, 5., 2.);
+                    if item.on {
+                        cv.round(
+                            disc,
+                            d / 2.,
+                            accent,
+                            if item.available { 195 } else { 115 },
+                            false,
+                            false,
+                        );
+                    }
+                    let disc_style = if item.available { lenses::ENABLED } else { 0 }
+                        | lenses::CIRCLE
+                        | if light { lenses::LIGHT } else { 0 }
+                        | if item.on {
+                            lenses::ACTIVE | lenses::PRIMARY
+                        } else {
+                            0
+                        }
+                        | if hovered { lenses::HOVER } else { 0 }
+                        | if item.available && self.pressed == Some(action) {
+                            lenses::PRESSED
+                        } else {
+                            0
+                        };
+                    self.button_lenses.draw(&cv, self.dpi, disc, accent, disc_style);
+                    if hover_amount > 0.001 && item.available {
+                        cv.round(
+                            disc,
+                            d / 2.,
+                            0xffffff,
+                            (54. * hover_amount).round() as u8,
+                            false,
+                            false,
+                        );
+                    }
+                    let icon_ink = if item.on {
+                        if crate::contrast::luminance(accent) > 0.55 {
+                            rgb(24, 28, 36)
+                        } else {
+                            0xffffff
+                        }
+                    } else {
+                        ink
+                    };
+                    let icon_size = if minimized { 20. } else { 22. };
+                    self.icons.draw(
+                        self.dpi,
+                        &cv,
+                        item.kind,
+                        cx - icon_size / 2.,
+                        cy - icon_size / 2.,
+                        icon_size,
+                        icon_ink,
+                        item.available,
+                    );
+                    if !minimized {
+                        cv.text_alpha(
+                            &item.title,
+                            [r[0] + 2., disc[3] + 4., r[2] - 2., disc[3] + 20.],
+                            10.5,
+                            true,
+                            ink,
+                            1,
+                            if item.available { 255 } else { 140 },
+                        );
+                        cv.text_alpha(
+                            &item.subtitle,
+                            [r[0] + 2., disc[3] + 19., r[2] - 2., disc[3] + 34.],
+                            8.5,
+                            false,
+                            ink,
+                            1,
+                            if item.available { 153 } else { 110 },
+                        );
+                    }
+                }
+                if self.editing {
+                    self.hits.push((Action::Move(item.control_index), r));
+                    let editing_this = self.hover.is_some_and(|a| {
+                        matches!(a, Action::Move(i) | Action::Remove(i) | Action::Rename(i) if i == item.control_index)
+                    }) || self.moving.is_some_and(|(i, _, _, _)| i == item.control_index);
+                    if editing_this && item.device_index.is_none_or(|di| di == 0) {
+                        for (a, x, label) in [
+                            (Action::Remove(item.control_index), r[0] + 3., "×"),
+                            (Action::Rename(item.control_index), r[2] - 23., "✎"),
+                        ] {
+                            let button = [x, r[1] + 2., x + 20., r[1] + 22.];
+                            cv.round(
+                                button,
+                                10.,
+                                if light { 0xffffff } else { 0x292330 },
+                                230,
+                                false,
+                                false,
+                            );
+                            cv.text(label, button, 14., true, ink, 1);
+                            self.hits.push((a, button));
+                        }
+                    }
+                }
+            }
+        }
+        for tile in tiles {
             let r = tile.rect;
             if r[3] < 54. || r[1] > h - 12. || r[2] < 14. || r[0] > w - 14. {
                 continue;
@@ -1120,9 +1771,311 @@ impl State {
             } else {
                 Action::Control(tile.index)
             };
+            let hovered = self.scroll_clock.is_none()
+                && self.hover.is_some_and(|a| match a {
+                    Action::Control(i)
+                    | Action::Slider(i)
+                    | Action::Device(i, _)
+                    | Action::Mute(i)
+                    | Action::Move(i)
+                    | Action::Remove(i)
+                    | Action::Rename(i) => i == tile.index,
+                    _ => false,
+                });
+            if self.config.design == "compact" {
+                let cv = Canvas::new(frame.dc, self.dpi);
+                let minimized = h <= 240.;
+                let now = self.hover_epoch.elapsed().as_secs_f64() * 1000.;
+                let motion = self.hover_motion.entry(c.id.clone()).or_default();
+                motion.target(
+                    if hovered { 1. } else { 0. },
+                    now,
+                    180.,
+                    [0.25, 0.1, 0.25, 1.],
+                );
+                let hover_amount = motion.sample(now);
+                if motion.moving(now) && self.hover_clock.is_none() {
+                    self.hover_clock = Some(crate::motion::FrameClock::start());
+                    SetTimer(self.hwnd, 3, 10, None);
+                }
+                if self.moving.is_some_and(|(from, _, to, active)| {
+                    active && (from == tile.index || to == tile.index)
+                }) {
+                    cv.round(r, 16., accent, 230, true, false);
+                }
+                if c.kind.is_volume() {
+                    let v = self
+                        .slider
+                        .filter(|(i, _)| *i == tile.index)
+                        .map(|(_, v)| v)
+                        .or(if c.kind.is_input() {
+                            self.snapshot.mic_volume
+                        } else {
+                            self.snapshot.volume
+                        })
+                        .unwrap_or(0.)
+                        .clamp(0., 100.);
+                    let pill_h = if minimized {
+                        (r[3] - r[1]).clamp(28., 44.)
+                    } else {
+                        36.
+                    };
+                    let pill_y = if minimized {
+                        (r[1] + r[3] - pill_h) / 2.
+                    } else {
+                        r[1] + 24.
+                    };
+                    let track = [r[0], pill_y, r[2], pill_y + pill_h];
+                    if !self.editing {
+                        self.hits.push((action, track));
+                    }
+                    if !minimized {
+                        cv.text_alpha(
+                            &c.label,
+                            [r[0] + 4., r[1] + 2., r[2] - 44., r[1] + 20.],
+                            11.,
+                            true,
+                            ink,
+                            0,
+                            if available { 255 } else { 115 },
+                        );
+                        cv.text_alpha(
+                            &format!("{}%", v.round()),
+                            [r[2] - 44., r[1] + 2., r[2] - 4., r[1] + 20.],
+                            10.,
+                            false,
+                            ink,
+                            2,
+                            if available { 170 } else { 110 },
+                        );
+                    }
+                    cv.soft_shadow(track, pill_h / 2., 14. + 8. * hover_amount, 4., 2.);
+                    cv.round(
+                        track,
+                        pill_h / 2.,
+                        ink,
+                        if light { 28 } else { 36 },
+                        false,
+                        false,
+                    );
+                    let span = (track[2] - track[0] - pill_h).max(0.);
+                    let fill_w = (pill_h + span * (v / 100.)).min(track[2] - track[0]);
+                    cv.round(
+                        [track[0], track[1], track[0] + fill_w, track[3]],
+                        pill_h / 2.,
+                        accent,
+                        if available { 210 } else { 105 },
+                        false,
+                        false,
+                    );
+                    self.button_lenses.draw(
+                        &cv,
+                        self.dpi,
+                        track,
+                        accent,
+                        lenses::ENABLED
+                            | lenses::CIRCLE
+                            | if light { lenses::LIGHT } else { 0 }
+                            | if hovered { lenses::HOVER } else { 0 }
+                            | if self.pressed == Some(action) {
+                                lenses::PRESSED
+                            } else {
+                                0
+                            },
+                    );
+                    if hover_amount > 0.001 {
+                        cv.round(
+                            track,
+                            pill_h / 2.,
+                            0xffffff,
+                            (44. * hover_amount).round() as u8,
+                            false,
+                            false,
+                        );
+                    }
+                    if !self.editing {
+                        self.hits.push((
+                            Action::Mute(tile.index),
+                            [track[0], track[1], track[0] + pill_h, track[3]],
+                        ));
+                    }
+                    let icon_ink = if crate::contrast::luminance(accent) > 0.55 {
+                        rgb(24, 28, 36)
+                    } else {
+                        0xffffff
+                    };
+                    let icon_kind = if if c.kind.is_input() {
+                        self.snapshot.mic_muted
+                    } else {
+                        self.snapshot.muted
+                    } {
+                        if c.kind.is_input() {
+                            Kind::MicMute
+                        } else {
+                            Kind::Mute
+                        }
+                    } else {
+                        c.kind
+                    };
+                    let icon_size = if minimized { 18. } else { 20. };
+                    self.icons.draw(
+                        self.dpi,
+                        &cv,
+                        icon_kind,
+                        track[0] + (pill_h - icon_size) / 2.,
+                        track[1] + (pill_h - icon_size) / 2.,
+                        icon_size,
+                        icon_ink,
+                        available,
+                    );
+                } else {
+                    let devices = if c.kind.is_group() {
+                        self.control_devices(c)
+                    } else {
+                        vec![]
+                    };
+                    let active = if c.kind.is_group() {
+                        match c.kind {
+                            Kind::Display => devices.iter().any(|(_, _, d_on, _)| *d_on),
+                            Kind::Source => !devices.is_empty(),
+                            _ => on,
+                        }
+                    } else {
+                        on
+                    };
+                    let d = if minimized {
+                        (r[2] - r[0]).min(r[3] - r[1])
+                    } else {
+                        48f32.min(r[2] - r[0] - 4.)
+                    };
+                    let cx = (r[0] + r[2]) / 2.;
+                    let cy = if minimized {
+                        (r[1] + r[3]) / 2.
+                    } else {
+                        r[1] + 2. + d / 2.
+                    };
+                    let disc = [cx - d / 2., cy - d / 2., cx + d / 2., cy + d / 2.];
+                    self.hits.push((action, disc));
+                    cv.soft_shadow(disc, d / 2., 16. + 10. * hover_amount, 5., 2.);
+                    if active {
+                        cv.round(
+                            disc,
+                            d / 2.,
+                            accent,
+                            if available { 195 } else { 95 },
+                            false,
+                            false,
+                        );
+                    }
+                    let disc_style = lenses::ENABLED
+                        | lenses::CIRCLE
+                        | if light { lenses::LIGHT } else { 0 }
+                        | if active {
+                            lenses::ACTIVE | lenses::PRIMARY
+                        } else {
+                            0
+                        }
+                        | if hovered { lenses::HOVER } else { 0 }
+                        | if self.pressed == Some(action) {
+                            lenses::PRESSED
+                        } else {
+                            0
+                        };
+                    self.button_lenses.draw(&cv, self.dpi, disc, accent, disc_style);
+                    if hover_amount > 0.001 {
+                        cv.round(
+                            disc,
+                            d / 2.,
+                            0xffffff,
+                            (54. * hover_amount).round() as u8,
+                            false,
+                            false,
+                        );
+                    }
+                    let icon_ink = if active {
+                        if crate::contrast::luminance(accent) > 0.55 {
+                            rgb(24, 28, 36)
+                        } else {
+                            0xffffff
+                        }
+                    } else {
+                        ink
+                    };
+                    let icon_size = if minimized { 20. } else { 22. };
+                    self.icons.draw(
+                        self.dpi,
+                        &cv,
+                        c.kind,
+                        cx - icon_size / 2.,
+                        cy - icon_size / 2.,
+                        icon_size,
+                        icon_ink,
+                        available,
+                    );
+                    if c.kind.is_group() {
+                        let badge = [disc[2] - 13., disc[3] - 13., disc[2], disc[3]];
+                        cv.round(
+                            badge,
+                            6.5,
+                            if light { 0xffffff } else { rgb(30, 34, 44) },
+                            215,
+                            false,
+                            false,
+                        );
+                        cv.text("▾", badge, 9., true, ink, 1);
+                    }
+                    if !minimized {
+                        let title = if c.kind == Kind::Hdr {
+                            "HDR"
+                        } else {
+                            &c.label
+                        };
+                        cv.text_alpha(
+                            title,
+                            [r[0] + 2., disc[3] + 4., r[2] - 2., disc[3] + 20.],
+                            10.5,
+                            true,
+                            ink,
+                            1,
+                            if available { 255 } else { 115 },
+                        );
+                        cv.text_alpha(
+                            &status,
+                            [r[0] + 2., disc[3] + 19., r[2] - 2., disc[3] + 34.],
+                            8.5,
+                            false,
+                            ink,
+                            1,
+                            if available { 153 } else { 105 },
+                        );
+                    }
+                }
+                if self.editing {
+                    self.hits.push((Action::Move(tile.index), r));
+                    let editing_this = self.hover.is_some_and(|a|matches!(a,Action::Move(i)|Action::Remove(i)|Action::Rename(i) if i==tile.index)) || self.moving.is_some_and(|(i,_,_,_)|i==tile.index);
+                    if editing_this {
+                        for (a, x, label) in [
+                            (Action::Remove(tile.index), r[0] + 3., "×"),
+                            (Action::Rename(tile.index), r[2] - 23., "✎"),
+                        ] {
+                            let button = [x, r[1] + 2., x + 20., r[1] + 22.];
+                            cv.round(
+                                button,
+                                10.,
+                                if light { 0xffffff } else { 0x292330 },
+                                230,
+                                false,
+                                false,
+                            );
+                            cv.text(label, button, 14., true, ink, 1);
+                            self.hits.push((a, button));
+                        }
+                    }
+                }
+                continue;
+            }
             self.hits.push((action, r));
             let cv = Canvas::new(frame.dc, self.dpi);
-            let hovered = self.hover == Some(action);
             let material = lenses::material(&self.config.design);
             let radius = lenses::radius(material, r[3] - r[1]);
             let light = light || material == lenses::CLOUD || material == lenses::SOFT;
@@ -1133,7 +2086,15 @@ impl State {
             } else {
                 ink
             };
-            let card_accent = if self.config.design == "liquid-pastel" {
+            let card_accent = if self.config.design == "cloud" {
+                [
+                    rgb(255, 139, 65),
+                    rgb(188, 115, 255),
+                    rgb(255, 100, 179),
+                    rgb(80, 198, 235),
+                    rgb(143, 220, 111),
+                ][tile.index % 5]
+            } else if self.config.design == "liquid-pastel" {
                 match tile.index % 3 {
                     0 => rgb(169, 150, 212),
                     1 => rgb(134, 184, 169),
@@ -1142,6 +2103,19 @@ impl State {
             } else {
                 accent
             };
+            let now = self.hover_epoch.elapsed().as_secs_f64() * 1000.;
+            let motion = self.hover_motion.entry(c.id.clone()).or_default();
+            motion.target(
+                if hovered { 1. } else { 0. },
+                now,
+                180.,
+                [0.25, 0.1, 0.25, 1.],
+            );
+            let hover_amount = motion.sample(now);
+            if motion.moving(now) && self.hover_clock.is_none() {
+                self.hover_clock = Some(crate::motion::FrameClock::start());
+                SetTimer(self.hwnd, 3, 10, None);
+            }
             cv.soft_shadow(
                 [r[0] + 1., r[1] + 1., r[2] - 1., r[3] - 1.],
                 radius,
@@ -1149,10 +2123,8 @@ impl State {
                     27.
                 } else if material == lenses::CLOUD {
                     12.
-                } else if hovered {
-                    24.
                 } else {
-                    16.
+                    16. + 8. * hover_amount
                 },
                 if material == lenses::SOFT { 7. } else { 5. },
                 if material == lenses::SOFT { 4. } else { 2. },
@@ -1165,7 +2137,6 @@ impl State {
                 } else {
                     0
                 }
-                | if hovered { lenses::HOVER } else { 0 }
                 | if self.pressed == Some(action) {
                     lenses::PRESSED
                 } else {
@@ -1173,6 +2144,24 @@ impl State {
                 };
             self.button_lenses
                 .draw(&cv, self.dpi, r, card_accent, style);
+            if hover_amount > 0.001 {
+                cv.round(
+                    r,
+                    radius,
+                    0xffffff,
+                    (32. * hover_amount).round() as u8,
+                    false,
+                    false,
+                );
+                cv.round(
+                    [r[0] + 0.75, r[1] + 0.75, r[2] - 0.75, r[3] - 0.75],
+                    radius,
+                    0xffffff,
+                    (165. * hover_amount).round() as u8,
+                    true,
+                    false,
+                );
+            }
             if self.moving.is_some_and(|(from, _, to, active)| {
                 active && (from == tile.index || to == tile.index)
             }) {
@@ -1194,10 +2183,14 @@ impl State {
                     ink,
                     0,
                 );
-                let devices = self.devices(c.kind);
+                let devices = self.control_devices(c);
                 if devices.is_empty() {
                     cv.text(
-                        "No devices connected",
+                        if c.kind == Kind::Source {
+                            if self.snapshot.displays.iter().any(|d|d.id==c.target&&!d.enabled){"Use the laptop or monitor menu to switch back"}else{"Input switching not exposed by this monitor"}
+                        } else {
+                            "No devices connected"
+                        },
                         [r[0] + 12., r[1] + 28., r[2] - 12., r[3] - 4.],
                         10.,
                         false,
@@ -1205,7 +2198,7 @@ impl State {
                         0,
                     );
                 }
-                for (j, (_, name, on, enabled)) in devices.iter().enumerate() {
+                for (j, (device_id, name, on, enabled)) in devices.iter().enumerate() {
                     let rr = if h <= 240. {
                         [
                             r[0] + 12. + j as f32 * 176.,
@@ -1221,6 +2214,29 @@ impl State {
                             r[1] + 62. + j as f32 * 34.,
                         ]
                     };
+                    let row_now = self.hover_epoch.elapsed().as_secs_f64() * 1000.;
+                    let row_hover = self.hover == Some(Action::Device(tile.index, j))
+                        && *enabled
+                        && !self.editing;
+                    let motion = self
+                        .hover_motion
+                        .entry(format!("row:{}:{}", c.id, device_id))
+                        .or_default();
+                    motion.target(
+                        if row_hover { 1. } else { 0. },
+                        row_now,
+                        180.,
+                        [0.25, 0.1, 0.25, 1.],
+                    );
+                    let amount = motion.sample(row_now);
+                    if motion.moving(row_now) && self.hover_clock.is_none() {
+                        self.hover_clock = Some(crate::motion::FrameClock::start());
+                        SetTimer(self.hwnd, 3, 10, None);
+                    }
+                    if amount > 0.001 {
+                        cv.round(rr, 9., 0xffffff, (34. * amount).round() as u8, false, false);
+                        cv.round(rr, 9., 0xffffff, (100. * amount).round() as u8, true, false);
+                    }
                     let toggle = [
                         rr[2] - 32.,
                         (rr[1] + rr[3]) / 2. - 8.,
@@ -1232,7 +2248,7 @@ impl State {
                         if rr[3] - rr[1] >= 29. {
                             cv.text(
                                 device,
-                                [rr[0], rr[1], toggle[0] - 7., rr[1] + 18.],
+                                [rr[0] + 8., rr[1], toggle[0] - 7., rr[1] + 18.],
                                 11.,
                                 true,
                                 ink,
@@ -1240,7 +2256,7 @@ impl State {
                             );
                             cv.text(
                                 "Main Display",
-                                [rr[0], rr[1] + 17., toggle[0] - 7., rr[3]],
+                                [rr[0] + 8., rr[1] + 17., toggle[0] - 7., rr[3]],
                                 8.,
                                 false,
                                 ink,
@@ -1249,7 +2265,7 @@ impl State {
                         } else {
                             cv.text(
                                 &format!("Main Display · {device}"),
-                                [rr[0], rr[1], toggle[0] - 7., rr[3]],
+                                [rr[0] + 8., rr[1], toggle[0] - 7., rr[3]],
                                 10.,
                                 true,
                                 ink,
@@ -1257,32 +2273,47 @@ impl State {
                             );
                         }
                     } else {
+                        if c.kind != Kind::Display && *on {
+                            cv.round(rr, 9., accent, 85, false, false);
+                            cv.round(rr, 9., accent, 155, true, false);
+                        }
                         cv.text(
                             name,
-                            [rr[0], rr[1], toggle[0] - 7., rr[3]],
+                            [
+                                rr[0] + 8.,
+                                rr[1],
+                                if c.kind == Kind::Display {
+                                    toggle[0] - 7.
+                                } else {
+                                    rr[2] - 8.
+                                },
+                                rr[3],
+                            ],
                             11.,
                             *on,
                             ink,
                             0,
                         );
                     }
-                    cv.round(
-                        toggle,
-                        8.,
-                        if *on && *enabled { accent } else { ink },
-                        if *on && *enabled { 220 } else { 45 },
-                        false,
-                        false,
-                    );
-                    let x = if *on { toggle[2] - 14. } else { toggle[0] + 2. };
-                    cv.round(
-                        [x, toggle[1] + 2., x + 12., toggle[3] - 2.],
-                        6.,
-                        0xffffff,
-                        if *enabled { 255 } else { 120 },
-                        false,
-                        false,
-                    );
+                    if c.kind == Kind::Display {
+                        cv.round(
+                            toggle,
+                            8.,
+                            if *on && *enabled { accent } else { ink },
+                            if *on && *enabled { 220 } else { 45 },
+                            false,
+                            false,
+                        );
+                        let x = if *on { toggle[2] - 14. } else { toggle[0] + 2. };
+                        cv.round(
+                            [x, toggle[1] + 2., x + 12., toggle[3] - 2.],
+                            6.,
+                            0xffffff,
+                            if *enabled { 255 } else { 120 },
+                            false,
+                            false,
+                        );
+                    }
                     if *enabled && !self.editing {
                         self.hits.push((Action::Device(tile.index, j), rr));
                     }
@@ -1339,24 +2370,13 @@ impl State {
                     } else {
                         c.kind
                     },
-                    if collapsed {
-                        if c.kind.is_volume() {
-                            r[0] + 9.
-                        } else {
-                            (r[0] + r[2]) / 2. - 10.
-                        }
+                    if !tiny && matches!(material, lenses::CLOUD | lenses::SOFT | lenses::LIQUID) {
+                        r[0] + 24. - if small { 10. } else { 11. }
                     } else {
-                        r[0] + if (material == lenses::CLOUD || material == lenses::LIQUID) && !tiny
-                        {
-                            16.
-                        } else {
-                            14.
-                        }
+                        r[0] + 14.
                     },
-                    if collapsed {
-                        (r[1] + r[3]) / 2. - 10.
-                    } else if (material == lenses::CLOUD || material == lenses::LIQUID) && !tiny {
-                        r[1] + 14.
+                    if !tiny && matches!(material, lenses::CLOUD | lenses::SOFT | lenses::LIQUID) {
+                        r[1] + 22. - if small { 10. } else { 11. }
                     } else {
                         iy
                     },
@@ -1389,11 +2409,27 @@ impl State {
                         43.
                     };
                 cv.text_alpha(
-                    if collapsed { "" } else { &c.label },
+                    if c.kind == Kind::Hdr {
+                        if tiny {
+                            ""
+                        } else {
+                            "HDR"
+                        }
+                    } else if collapsed {
+                        ""
+                    } else {
+                        &c.label
+                    },
                     [
                         label_x,
                         label_y,
-                        r[2] - if c.kind.is_volume() { 45. } else { 12. },
+                        r[2] - if c.kind.is_volume() {
+                            45.
+                        } else if c.kind == Kind::Hdr && tiny {
+                            48.
+                        } else {
+                            12.
+                        },
                         label_y + 22.,
                     ],
                     if small { 10.5 } else { 12. },
@@ -1499,17 +2535,74 @@ impl State {
                         );
                     }
                 } else {
-                    let y = if small { r[1] + 28. } else { r[1] + 67. };
+                    let y = if c.kind == Kind::Hdr {
+                        r[3] - 28.
+                    } else if small {
+                        r[1] + 28.
+                    } else {
+                        r[1] + 67.
+                    };
                     cv.text_alpha(
-                        if tiny || collapsed { "" } else { &status },
-                        [label_x, y, r[2] - 12., y + 19.],
-                        if small { 8.5 } else { 10. },
-                        false,
+                        if (tiny || collapsed) && c.kind != Kind::Hdr {
+                            ""
+                        } else {
+                            &status
+                        },
+                        [
+                            if c.kind == Kind::Hdr {
+                                r[0] + if tiny { 40. } else { 12. }
+                            } else {
+                                label_x
+                            },
+                            y,
+                            r[2] - if c.kind == Kind::Hdr { 50. } else { 12. },
+                            y + if c.kind == Kind::Hdr { 24. } else { 19. },
+                        ],
+                        if c.kind == Kind::Hdr {
+                            11.
+                        } else if small {
+                            8.5
+                        } else {
+                            10.
+                        },
+                        c.kind == Kind::Hdr,
                         ink,
                         0,
-                        if available { 153 } else { 90 },
+                        if available {
+                            if c.kind == Kind::Hdr {
+                                255
+                            } else {
+                                153
+                            }
+                        } else {
+                            110
+                        },
                     );
-                    if on && !collapsed {
+                    if c.kind == Kind::Hdr {
+                        let y = if tiny {
+                            (r[1] + r[3]) / 2. - 8.
+                        } else {
+                            r[3] - 24.
+                        };
+                        let toggle = [r[2] - 42., y, r[2] - 12., y + 16.];
+                        cv.round(
+                            toggle,
+                            8.,
+                            if on && available { accent } else { ink },
+                            if on && available { 220 } else { 40 },
+                            false,
+                            false,
+                        );
+                        let x = if on { toggle[2] - 14. } else { toggle[0] + 2. };
+                        cv.round(
+                            [x, y + 2., x + 12., y + 14.],
+                            6.,
+                            0xffffff,
+                            if available { 255 } else { 110 },
+                            false,
+                            false,
+                        );
+                    } else if on && !collapsed {
                         cv.round(
                             [r[2] - 22., r[1] + 16., r[2] - 16., r[1] + 22.],
                             3.,
@@ -1549,6 +2642,167 @@ impl State {
                         ink,
                         1,
                     );
+                }
+            }
+        }
+        if let Some(picker_idx) = self.picker {
+            if !self.manager {
+                if let Some(c) = self.config.controls.get(picker_idx) {
+                    let cv = Canvas::new(frame.dc, self.dpi);
+                    let back = [18., 58., 44., 84.];
+                    let back_hover = self.hover == Some(Action::Back);
+                    let back_pressed = self.pressed == Some(Action::Back);
+                    cv.soft_shadow(back, 13., if back_hover { 18. } else { 12. }, 4., 2.);
+                    self.button_lenses.draw(
+                        &cv,
+                        self.dpi,
+                        back,
+                        accent,
+                        lenses::ENABLED
+                            | lenses::CIRCLE
+                            | if light { lenses::LIGHT } else { 0 }
+                            | if back_hover { lenses::HOVER } else { 0 }
+                            | if back_pressed { lenses::PRESSED } else { 0 },
+                    );
+                    if back_hover {
+                        cv.round(back, 13., 0xffffff, 52, false, false);
+                    }
+                    cv.text("←", back, 13., true, ink, 1);
+                    self.hits.push((Action::Back, back));
+                    cv.text(
+                        &c.label,
+                        [54., 58., w - 18., 84.],
+                        12.,
+                        true,
+                        ink,
+                        0,
+                    );
+                    let devices = self.control_devices(c);
+                    if devices.is_empty() {
+                        cv.text_alpha(
+                            if c.kind == Kind::Source {
+                                if self
+                                    .snapshot
+                                    .displays
+                                    .iter()
+                                    .any(|d| d.id == c.target && !d.enabled)
+                                {
+                                    "Use the laptop or monitor menu to switch back"
+                                } else {
+                                    "Input switching not exposed by this monitor"
+                                }
+                            } else {
+                                "No devices connected"
+                            },
+                            [18., 92., w - 18., h - 18.],
+                            11.,
+                            false,
+                            ink,
+                            0,
+                            175,
+                        );
+                    } else {
+                        for (j, (_, name, on, enabled)) in devices.iter().enumerate() {
+                            let y = 92. + j as f32 * 40. - self.scroll;
+                            let rr = [18., y, w - 18., y + 34.];
+                            if rr[3] < 86. || rr[1] > h - 12. {
+                                continue;
+                            }
+                            let row_action = Action::Device(picker_idx, j);
+                            let row_hover = self.hover == Some(row_action) && *enabled;
+                            let row_pressed = self.pressed == Some(row_action) && *enabled;
+                            cv.soft_shadow(rr, 17., if row_hover { 18. } else { 12. }, 4., 2.);
+                            if *on {
+                                cv.round(
+                                    rr,
+                                    17.,
+                                    accent,
+                                    if *enabled { 195 } else { 95 },
+                                    false,
+                                    false,
+                                );
+                            }
+                            self.button_lenses.draw(
+                                &cv,
+                                self.dpi,
+                                rr,
+                                accent,
+                                lenses::ENABLED
+                                    | lenses::CIRCLE
+                                    | if light { lenses::LIGHT } else { 0 }
+                                    | if *on {
+                                        lenses::ACTIVE | lenses::PRIMARY
+                                    } else {
+                                        0
+                                    }
+                                    | if row_hover { lenses::HOVER } else { 0 }
+                                    | if row_pressed { lenses::PRESSED } else { 0 },
+                            );
+                            if row_hover {
+                                cv.round(rr, 17., 0xffffff, 52, false, false);
+                            }
+                            let row_ink = if *on {
+                                if crate::contrast::luminance(accent) > 0.55 {
+                                    rgb(24, 28, 36)
+                                } else {
+                                    0xffffff
+                                }
+                            } else {
+                                ink
+                            };
+                            cv.text_alpha(
+                                name,
+                                [rr[0] + 14., rr[1], rr[2] - 44., rr[3]],
+                                11.,
+                                *on,
+                                row_ink,
+                                0,
+                                if *enabled { 255 } else { 115 },
+                            );
+                            if c.kind == Kind::Display {
+                                let toggle = [
+                                    rr[2] - 38.,
+                                    (rr[1] + rr[3]) / 2. - 8.,
+                                    rr[2] - 8.,
+                                    (rr[1] + rr[3]) / 2. + 8.,
+                                ];
+                                cv.round(
+                                    toggle,
+                                    8.,
+                                    if *on && *enabled { accent } else { ink },
+                                    if *on && *enabled { 220 } else { 45 },
+                                    false,
+                                    false,
+                                );
+                                let x = if *on { toggle[2] - 14. } else { toggle[0] + 2. };
+                                cv.round(
+                                    [x, toggle[1] + 2., x + 12., toggle[3] - 2.],
+                                    6.,
+                                    0xffffff,
+                                    if *enabled { 255 } else { 120 },
+                                    false,
+                                    false,
+                                );
+                            } else if *on {
+                                cv.round(
+                                    [
+                                        rr[2] - 22.,
+                                        (rr[1] + rr[3]) / 2. - 4.,
+                                        rr[2] - 14.,
+                                        (rr[1] + rr[3]) / 2. + 4.,
+                                    ],
+                                    4.,
+                                    row_ink,
+                                    240,
+                                    false,
+                                    false,
+                                );
+                            }
+                            if *enabled {
+                                self.hits.push((row_action, rr));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1744,11 +2998,6 @@ impl State {
                 0,
             );
             self.hits.push((Action::Search, search));
-            let close = [w - 58., 18., w - 24., 52.];
-            c.soft_shadow(close, 17., 10., 3., 1.);
-            c.round(close, 17., 0xffffff, 110, false, false);
-            c.text("×", close, 18., false, ink, 1);
-            self.hits.push((Action::Hide, close));
             c.text(
                 &format!("{} / 40 controls", self.config.controls.len()),
                 [24., h - 46., w - 110., h - 18.],
@@ -1761,7 +3010,7 @@ impl State {
             c.soft_shadow(done, 15., 12., 3., 2.);
             c.round(done, 15., 0xffffff, 130, false, false);
             c.text("Done", done, 11., false, ink, 1);
-            self.hits.push((Action::Hide, done));
+            self.hits.push((Action::Back, done));
         }
         for (label, r) in [
             (
@@ -1815,8 +3064,13 @@ impl State {
             }
         }
         if let Some((track, thumb, _, horizontal)) = self.scrollbar() {
-            c.round(track, 2., ink, 28, false, false);
-            c.round(thumb, 2., ink, 120, false, false);
+            // Only the thumb is painted; the transparent track remains draggable.
+            let reveal = if self.scroll_drag.is_some() {
+                1.
+            } else {
+                crate::widget_header::visual(self.hwnd).alpha
+            };
+            frame.fill_round(thumb, 2., ink, (120. * reveal).round() as u8);
             self.hits.push((
                 Action::Scroll(horizontal),
                 [track[0] - 5., track[1] - 4., track[2] + 5., track[3] + 4.],
@@ -1881,21 +3135,34 @@ impl State {
         }
         drop(c);
         drop(batch);
+        let clip_top = if self.manager { 142. } else { 54. };
+        let clip_bottom = h - if self.manager { 60. } else { 12. };
         if let Some(bg) = &self.backdrop {
             let clip = SaveDC(frame.dc);
             IntersectClipRect(
                 frame.dc,
                 (14. * self.dpi) as i32,
-                (if self.manager { 142. } else { 54. } * self.dpi) as i32,
+                (clip_top * self.dpi) as i32,
                 ((w - 14.) * self.dpi) as i32,
-                ((h - if self.manager { 60. } else { 12. }) * self.dpi) as i32,
+                (clip_bottom * self.dpi) as i32,
             );
+            for (gr, gr_rad) in &compact_groups {
+                frame.retain_control_backing(bg, *gr, *gr_rad, 1.);
+            }
             for (action, r) in &self.hits {
-                if matches!(action, Action::Settings | Action::Hide) {
+                if matches!(action, Action::Settings | Action::Hide | Action::Scroll(_))
+                    || (self.config.design == "compact" && matches!(action, Action::Move(_)))
+                    || r[3] < clip_top
+                    || r[1] > clip_bottom
+                    || r[2] < 14.
+                    || r[0] > w - 14.
+                {
                     continue;
                 }
                 let radius = if r[1] < 54. {
                     15.
+                } else if self.config.design == "compact" && !self.manager {
+                    (r[3] - r[1]) / 2.
                 } else {
                     lenses::radius(lenses::material(&self.config.design), r[3] - r[1])
                 };
@@ -1910,19 +3177,26 @@ impl State {
         }
         if let Some(bg) = &self.fade_base {
             let max = self.scrollbar().map_or(0., |(_, _, max, _)| max);
-            if !self.manager && h<=240. {
-                frame.fade_horizontal_edges(bg,[14.,54.,w-14.,h-12.],self.scroll>0.5,self.scroll<max-0.5);
-            }else{frame.fade_list_edges(
-                bg,
-                if self.manager { 142. } else { 54. },
-                h - if self.manager { 60. } else { 12. },
-                self.scroll > 0.5,
-                self.scroll < max - 0.5,
-            );}
-        }
-        if !self.editing && !self.manager {
-            let reveal=crate::widget_header::visual(self.hwnd).alpha;
-            if let Some(bg)=&self.fade_base {frame.fade_control_region(bg,[10.,5.,75.,51.],reveal);}
+            if !self.manager && h <= 240. {
+                frame.fade_horizontal_edges(
+                    bg,
+                    [14., 54., w - 14., h - 12.],
+                    self.scroll > 0.5,
+                    self.scroll < max - 0.5,
+                );
+            } else {
+                frame.fade_list_edges(
+                    bg,
+                    clip_top,
+                    clip_bottom,
+                    self.scroll > 0.5,
+                    self.scroll < max - 0.5,
+                );
+            }
+            if !self.editing && !self.manager {
+                let reveal = crate::widget_header::visual(self.hwnd).alpha;
+                frame.fade_control_region(bg, [10., 5., 75., 51.], reveal);
+            }
         }
         frame.present_with_alpha(self.hwnd, true);
         self.frame = Some(frame);
@@ -1935,6 +3209,16 @@ impl State {
             );
         }
         EndPaint(self.hwnd, &ps);
+        if IsWindowVisible(self.hwnd) != 0
+            && (self.scroll_clock.is_some() || self.hover_clock.is_some())
+        {
+            crate::motion::pace_vsync(
+                self.hwnd,
+                frame_started,
+                &mut self.frame_queued,
+                crate::motion::VSYNC_FRAME,
+            );
+        }
     }
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -2006,10 +3290,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     (7, Value::Choice(v))
                         if matches!(
                             v.as_str(),
-                            "lumen" | "cloud" | "soft-violet" | "liquid-pastel"
+                            "lumen" | "cloud" | "soft-violet" | "liquid-pastel" | "compact"
                         ) =>
                     {
-                        s.config.design = v
+                        s.config.design = v;
+                        if s.config.design != "compact" {
+                            s.picker = None;
+                        }
                     }
                     (8, Value::Bool(v)) => {
                         s.config.floating = v;
@@ -2019,8 +3306,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     _ => {}
                 }
             }
-            s.save();
-            s.key.clear();
+            SetTimer(hwnd, 99, 180, None);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -2205,17 +3491,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             } else if let Some(Action::Move(i)) = s.pressed {
                 s.moving = Some((i, p, i, false));
             } else if let Some(Action::Slider(i)) = s.pressed {
-                let (w, h) = {
-                    let z = s.size();
-                    (z[0], z[1])
-                };
-                let (t, _, _) = s.tiles(w, h, s.scroll);
-                if let Some(tile) = t.iter().find(|t| t.index == i) {
-                    let v = ((p.x as f32 / s.dpi - tile.rect[0] - 14.)
-                        / (tile.rect[2] - tile.rect[0] - 28.)
-                        * 100.)
+                let z = s.size();
+                if s.slider_rect(i, z[0], z[1]).is_some() {
+                    let cur_v = s
+                        .config
+                        .controls
+                        .get(i)
+                        .map_or(0., |c| {
+                            if c.kind.is_input() {
+                                s.snapshot.mic_volume.unwrap_or(0.)
+                            } else {
+                                s.snapshot.volume.unwrap_or(0.)
+                            }
+                        })
                         .clamp(0., 100.);
-                    s.slider = Some((i, v));
+                    s.slider = Some((i, cur_v));
+                    s.slider_anchor = Some((p.x as f32 / s.dpi, cur_v));
                 }
             } else if s.pressed.is_none() {
                 let mut r = zeroed();
@@ -2262,10 +3553,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 if active {
                     let pos = [p.x as f32 / s.dpi, p.y as f32 / s.dpi];
                     let z = s.size();
-                    let (tiles, _, row) = s.tiles(z[0], z[1], s.scroll);
-                    if let Some(tile) = tiles.iter().find(|t| inside(t.rect, pos)) {
-                        to = tile.index;
-                    }
+                    let row = if s.config.design == "compact" {
+                        let (items, _, row) = s.compact_tiles(z[0], z[1], s.scroll);
+                        if let Some(item) = items.iter().find(|t| inside(t.rect, pos)) {
+                            to = item.control_index;
+                        }
+                        row
+                    } else {
+                        let (tiles, _, row) = s.tiles(z[0], z[1], s.scroll);
+                        if let Some(tile) = tiles.iter().find(|t| inside(t.rect, pos)) {
+                            to = tile.index;
+                        }
+                        row
+                    };
                     if pos[1] < 70.
                         || (!row && pos[1] > z[1] - 28.)
                         || (row && (pos[0] < 26. || pos[0] > z[0] - 26.))
@@ -2311,21 +3611,29 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 InvalidateRect(hwnd, null(), 0);
-            } else if let Some((i, _)) = s.slider {
+            } else if let Some((i, prev_v)) = s.slider {
                 let z = s.size();
-                let (t, _, _) = s.tiles(z[0], z[1], s.scroll);
-                if let Some(tile) = t.iter().find(|t| t.index == i) {
-                    s.slider = Some((
-                        i,
-                        ((p.x as f32 / s.dpi - tile.rect[0] - 14.)
-                            / (tile.rect[2] - tile.rect[0] - 28.)
-                            * 100.)
-                            .clamp(0., 100.),
-                    ));
+                if let Some(rect) = s.slider_rect(i, z[0], z[1]) {
+                    let span = (rect[2] - rect[0] - 28.).max(1.);
+                    let v = if let Some((start_x, start_v)) = s.slider_anchor {
+                        let dx = p.x as f32 / s.dpi - start_x;
+                        (start_v + dx / span * 100.).clamp(0., 100.)
+                    } else {
+                        ((p.x as f32 / s.dpi - rect[0] - 14.) / span * 100.).clamp(0., 100.)
+                    };
+                    s.slider = Some((i, v));
+                    if (v - prev_v).abs() >= 0.5 {
+                        if let Some(c) = s.config.controls.get(i).cloned() {
+                            s.command(c, v);
+                        }
+                    }
                 }
                 InvalidateRect(hwnd, null(), 0);
             } else {
-                let hover = s.hit(p);
+                let hover = s.hit(p).map(|a| match a {
+                    Action::Mute(i) => Action::Slider(i),
+                    _ => a,
+                });
                 if hover != s.hover {
                     s.hover = hover;
                     InvalidateRect(hwnd, null(), 0);
@@ -2343,6 +3651,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_LBUTTONUP => {
             s.scroll_drag = None;
             let slider = s.slider.take();
+            s.slider_anchor = None;
             let drag = s.drag.take().is_some();
             let action = s.pressed.take();
             let moving = s.moving.take();
@@ -2372,6 +3681,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.scroll_drag = None;
             s.moving = None;
             s.slider = None;
+            s.slider_anchor = None;
             s.pressed = None;
             if s.drag.take().is_some() {
                 s.key.clear();
@@ -2380,8 +3690,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_MOUSEWHEEL => {
-            s.scroll_target -= ((wp >> 16) as i16 as f32 / 120.) * 60.;
-            SetTimer(hwnd, 2, 16, None);
+            let max = s.scrollbar().map_or(0., |(_, _, max, _)| max).max(0.);
+            s.scroll_target = (s.scroll_target - ((wp >> 16) as i16 as f32 / 120.) * 60.).clamp(0., max);
+            if (s.scroll_target - s.scroll).abs() >= 0.2 {
+                if s.scroll_clock.is_none() {
+                    s.scroll_clock = Some(crate::motion::FrameClock::start());
+                }
+                s.scroll += (s.scroll_target - s.scroll) * (1. - (-0.00833_f32 / 0.065).exp());
+                s.scroll_tick = Instant::now();
+                SetTimer(hwnd, 2, 10, None);
+                InvalidateRect(hwnd, null(), 0);
+            } else {
+                s.scroll = s.scroll_target;
+                KillTimer(hwnd, 2);
+                s.scroll_clock = None;
+            }
             0
         }
         WM_CHAR if s.manager && s.search_focus => {
@@ -2402,12 +3725,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_KEYDOWN if wp == VK_ESCAPE as usize => {
             s.moving = None;
             s.slider = None;
+            s.slider_anchor = None;
             s.pressed = None;
             ReleaseCapture();
             if s.manager && !s.manager_parent.is_null() {
                 s.hide();
             } else if s.manager {
                 s.manager = false;
+                s.scroll = 0.;
+                s.scroll_target = 0.;
+            } else if s.picker.is_some() {
+                s.picker = None;
                 s.scroll = 0.;
                 s.scroll_target = 0.;
             } else if s.editing {
@@ -2421,25 +3749,73 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             InvalidateRect(hwnd, null(), 0);
             0
         }
+        WM_TIMER if wp == 99 => {
+            KillTimer(hwnd, 99);
+            s.save();
+            0
+        }
+        WM_TIMER if wp == 3 => {
+            let now = s.hover_epoch.elapsed().as_secs_f64() * 1000.;
+            if !s.hover_motion.values().any(|v| v.moving(now)) {
+                KillTimer(hwnd, 3);
+                s.hover_clock = None;
+            }
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_TIMER if wp == 2 => {
-            let z = s.size();
-            let (_, max, _) = s.tiles(z[0], z[1], 0.);
-            let max = if s.manager {
-                s.scrollbar().map_or(0., |(_, _, max, _)| max)
-            } else {
-                max
-            };
-            let max = max.max(0.);
+            let max = s.scrollbar().map_or(0., |(_, _, max, _)| max).max(0.);
             s.scroll_target = s.scroll_target.clamp(0., max);
-            s.scroll += (s.scroll_target - s.scroll) * 0.24;
+            let elapsed = s.scroll_tick.elapsed().as_secs_f32().min(0.1);
+            s.scroll_tick = Instant::now();
+            s.scroll += (s.scroll_target - s.scroll) * (1. - (-elapsed / 0.065).exp());
             if (s.scroll_target - s.scroll).abs() < 0.2 {
                 s.scroll = s.scroll_target;
                 KillTimer(hwnd, 2);
+                s.scroll_clock = None;
             }
-            InvalidateRect(hwnd, null(), 0);
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            s.frame_queued = false;
+            let mut dirty = false;
+            if s.hover_clock.is_some() {
+                let now = s.hover_epoch.elapsed().as_secs_f64() * 1000.;
+                if !s.hover_motion.values().any(|v| v.moving(now)) {
+                    KillTimer(hwnd, 3);
+                    s.hover_clock = None;
+                }
+                dirty = true;
+            }
+            if s.scroll_clock.is_some() {
+                let max = s.scrollbar().map_or(0., |(_, _, max, _)| max).max(0.);
+                s.scroll_target = s.scroll_target.clamp(0., max);
+                let elapsed = s.scroll_tick.elapsed().as_secs_f32().min(0.1);
+                s.scroll_tick = Instant::now();
+                s.scroll += (s.scroll_target - s.scroll) * (1. - (-elapsed / 0.065).exp());
+                if (s.scroll_target - s.scroll).abs() < 0.2 {
+                    s.scroll = s.scroll_target;
+                    KillTimer(hwnd, 2);
+                    s.scroll_clock = None;
+                }
+                dirty = true;
+            }
+            if dirty {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_TIMER if wp == 1 => {
+            let visible = IsWindowVisible(hwnd) != 0;
+            if visible && s.glass.borrow_mut().refresh() {
+                s.key.clear();
+                InvalidateRect(hwnd, null(), 0);
+            }
             let mut result = None;
             if let Some(worker) = &s.worker {
                 while let Ok(value) = worker.rx.try_recv() {
@@ -2460,18 +3836,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 if s.snapshot != result {
                     s.snapshot = result;
+                    s.sync_display_order();
                     s.candidates = s.catalog();
                     if let Some(ui) = &s.manager_window {
                         PostMessageW(ui.hwnd(), MANAGER_SYNC, 0, 0);
                     }
-                    InvalidateRect(hwnd, null(), 0);
+                    if visible {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
                 }
             }
-            if s.last_poll.elapsed() > Duration::from_secs(5) && s.slider.is_none() {
+            if visible && s.last_poll.elapsed() > Duration::from_secs(5) && s.slider.is_none() {
                 s.read();
             }
-            SetTimer(hwnd, 1, if s.pending { 100 } else { 5000 }, None);
-            if !s.inspect && !s.config.floating {
+            SetTimer(hwnd, 1, if s.pending { 16 } else { 5000 }, None);
+            if visible && !s.inspect && !s.config.floating {
                 drop(s);
                 crate::window::pin_to_desktop(hwnd);
             }
@@ -2479,6 +3858,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_SIZE => {
             InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            if (s.config.frosted || crate::glass::liquid_glass())
+                && crate::glass::move_paint_due(hwnd)
+            {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_WINDOWPOSCHANGED => {
@@ -2520,6 +3907,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_NCDESTROY => {
+            KillTimer(hwnd, 3);
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -2537,6 +3925,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 mod tests {
     use super::*;
     #[test]
+    fn accent_boost_triples_saturation_value_and_caps_below_white() {
+        let out = crate::accent::vivid(rgb(40, 50, 60));
+        let c = [out & 255, (out >> 8) & 255, (out >> 16) & 255];
+        assert_eq!(c, [0, 90, 180]);
+        let bright = crate::accent::vivid(rgb(180, 200, 220));
+        assert!(
+            (bright & 255) <= 224 && ((bright >> 8) & 255) <= 224 && ((bright >> 16) & 255) <= 224
+        );
+        assert_eq!(crate::accent::vivid(0), 0);
+    }
+    #[test]
     fn tile_glass_stays_opaque_when_only_widget_background_is_faded() {
         let _lock = crate::native_ui_test_lock();
         let _runtime = render::Runtime::start().unwrap();
@@ -2545,7 +3944,7 @@ mod tests {
         unsafe {
             let shared = Rc::new(RefCell::new(Glass::new(0., 1.)));
             let host = Host::create(&root, shared, true, true).unwrap();
-            for design in ["lumen", "cloud", "soft-violet", "liquid-pastel"] {
+            for design in ["lumen", "cloud", "soft-violet", "liquid-pastel", "compact"] {
                 let mut expected = None;
                 for opacity in [100., 50., 0.] {
                     let mut s = host.state.borrow_mut();
@@ -2619,7 +4018,7 @@ mod tests {
                 430,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            for design in ["lumen", "cloud", "soft-violet", "liquid-pastel"] {
+            for design in ["lumen", "cloud", "soft-violet", "liquid-pastel", "compact"] {
                 let mut energies = vec![];
                 let mut results = vec![];
                 for blur in [0., 60.] {
@@ -2965,7 +4364,7 @@ mod tests {
             let hit_dpi = host.state.borrow().dpi;
             crate::geometry::assert_widget_corner_hits(host.hwnd(), hit_dpi);
             assert!(!Rc::ptr_eq(&host.state.borrow().glass, &shared));
-            for design in ["lumen", "cloud", "soft-violet", "liquid-pastel"] {
+            for design in ["lumen", "cloud", "soft-violet", "liquid-pastel", "compact"] {
                 for dpi in [1., 1.25, 1.5, 2.] {
                     for [w, h] in [[160, 112], [220, 120], [420, 560], [760, 120], [960, 360]] {
                         {
@@ -3008,5 +4407,126 @@ mod tests {
             crate::fusion::shutdown();
         }
         assert!(!root.join("config/native-controls.json").exists());
+    }
+    #[test]
+    fn compact_theme_uses_circular_buttons_and_opens_inline_device_picker() {
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = render::Runtime::start().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("lumen-controls-compact-{}", std::process::id()));
+        unsafe {
+            let shared = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            crate::fusion::init(shared.clone());
+            let host = Host::create(&root, shared, true, true).unwrap();
+            {
+                let mut s = host.state.borrow_mut();
+                s.config.design = "compact".into();
+                s.config.controls = vec![
+                    Control {
+                        id: "vol".into(),
+                        kind: Kind::Volume,
+                        target: String::new(),
+                        label: "Volume".into(),
+                    },
+                    Control {
+                        id: "audio".into(),
+                        kind: Kind::Audio,
+                        target: String::new(),
+                        label: "Audio output".into(),
+                    },
+                    Control {
+                        id: "hdr".into(),
+                        kind: Kind::Hdr,
+                        target: "disp-1".into(),
+                        label: "HDR".into(),
+                    },
+                ];
+                s.snapshot.volume = Some(55.);
+                s.snapshot.outputs = vec![
+                    backend::Device {
+                        id: "spk".into(),
+                        name: "Speakers".into(),
+                        selected: true,
+                    },
+                    backend::Device {
+                        id: "hp".into(),
+                        name: "Headphones".into(),
+                        selected: false,
+                    },
+                ];
+                s.snapshot.displays = vec![backend::Display {
+                    id: "disp-1".into(),
+                    name: "Main".into(),
+                    primary: true,
+                    enabled: true,
+                    hdr_supported: true,
+                    hdr_enabled: false,
+                }];
+                let (min_tiles, _, horizontal) = s.compact_tiles(420., 120., 0.);
+                assert!(horizontal);
+                // Volume (1) + 2 Audio device buttons + 1 HDR button = 4 items
+                assert_eq!(min_tiles.len(), 4);
+                let audio_w = min_tiles[1].rect[2] - min_tiles[1].rect[0];
+                let audio_h = min_tiles[1].rect[3] - min_tiles[1].rect[1];
+                assert!((audio_w - audio_h).abs() < 0.01);
+                let hdr_w = min_tiles[3].rect[2] - min_tiles[3].rect[0];
+                let hdr_h = min_tiles[3].rect[3] - min_tiles[3].rect[1];
+                assert!((hdr_w - hdr_h).abs() < 0.01);
+
+                s.paint();
+                assert!(s.hits.iter().any(|(a, _)| *a == Action::Device(1, 0)));
+                assert!(s.hits.iter().any(|(a, _)| *a == Action::Device(1, 1)));
+                assert!(s.hits.iter().any(|(a, _)| *a == Action::Control(2)));
+
+                assert_eq!(
+                    clean_device_name("Speakers (Realtek(R) Audio)"),
+                    "Realtek(R) Audio"
+                );
+                assert_eq!(
+                    clean_device_name("Microphone (4- Thronmax MDrill One Pro)"),
+                    "4- Thronmax MDrill One Pro"
+                );
+                assert!(!s.catalog().iter().any(|c| c.kind == Kind::Source));
+
+                s.snapshot.displays = vec![
+                    backend::Display {
+                        id: "d1".into(),
+                        name: "Main".into(),
+                        primary: true,
+                        enabled: true,
+                        hdr_supported: false,
+                        hdr_enabled: false,
+                    },
+                    backend::Display {
+                        id: "d2".into(),
+                        name: "DELL U2725QE".into(),
+                        primary: false,
+                        enabled: true,
+                        hdr_supported: false,
+                        hdr_enabled: false,
+                    },
+                    backend::Display {
+                        id: "d3".into(),
+                        name: "S27B80P".into(),
+                        primary: false,
+                        enabled: true,
+                        hdr_supported: false,
+                        hdr_enabled: false,
+                    },
+                ];
+                s.sync_display_order();
+                // Simulate Windows moving disabled d2 to the end of QueryDisplayConfig paths
+                s.snapshot.displays.swap(1, 2);
+                s.snapshot.displays[2].enabled = false;
+                let ordered: Vec<_> = s
+                    .devices(Kind::Display)
+                    .into_iter()
+                    .map(|(id, _, _, _)| id)
+                    .collect();
+                assert_eq!(ordered, vec!["d1", "d2", "d3"]);
+            }
+            drop(host);
+            crate::fusion::shutdown();
+        }
     }
 }

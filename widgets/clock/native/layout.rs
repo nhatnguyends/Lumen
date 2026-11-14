@@ -1,4 +1,47 @@
-//! One proportional vector layout for every size, without theme breakpoints.
+//! Responsive layout classification and 340-DIP classic frame for Clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// Classic 340-DIP proportional layout (medium/large square-ish).
+    Classic,
+    /// Compact square-ish (< 230px on either side, aspect ratio 0.72..1.38).
+    CompactSquare,
+    /// Wide horizontal pill/bar (w / h >= 1.38).
+    Wide,
+    /// Tall vertical column (h / w >= 1.38).
+    Tall,
+}
+
+pub(super) fn mode(w: f32, h: f32) -> Mode {
+    let ratio = w / h.max(1.);
+    if ratio >= 1.38 {
+        Mode::Wide
+    } else if ratio <= 1. / 1.38 {
+        Mode::Tall
+    } else if w < 230. || h < 230. {
+        Mode::CompactSquare
+    } else {
+        Mode::Classic
+    }
+}
+
+pub(super) fn content_box(w: f32, h: f32) -> [f32; 4] {
+    let pad_x = if w < 160. { 15. } else { 20. };
+    let top = if w >= 420. && h >= 360. {
+        50.
+    } else if h < 150. {
+        14.
+    } else {
+        18.
+    };
+    let bottom = if h < 150. { h - 14. } else { h - 18. };
+    [
+        pad_x,
+        top,
+        (w - pad_x).max(pad_x + 20.),
+        bottom.max(top + 20.),
+    ]
+}
+
 pub(super) fn frame(w: f32, h: f32) -> (f32, f32, f32) {
     // Preserve the original 340-DIP artwork. At very small heights reserve
     // header space above the first content row (62), without rearranging it.

@@ -16,6 +16,20 @@ pub fn compact_card(size: [f32; 2]) -> bool {
     size[0] < 184. || size[1] < 112.
 }
 impl Metrics {
+    pub fn card_height(self, empty: bool) -> f32 {
+        if empty {
+            (self.height - self.leading * 2.).max(114.)
+        } else {
+            self.height
+        }
+    }
+    pub fn card_height_for_lines(self, empty: bool, lines: usize) -> f32 {
+        if empty {
+            return self.card_height(true);
+        }
+        let needed = self.top + (lines.max(1) as f32) * self.leading + 34.;
+        needed.max(self.height)
+    }
     pub fn text_rect(self, size: [f32; 2]) -> [f32; 4] {
         [
             self.left,
@@ -157,6 +171,37 @@ impl Typography {
             return text.len() as f32 * self.size * 0.6;
         }
         extent.cx as f32 / self.dpi
+    }
+    pub unsafe fn line_count(
+        &mut self,
+        text: &str,
+        width: f32,
+        dpi: f32,
+        size: f32,
+    ) -> usize {
+        if width <= 0. {
+            return 1;
+        }
+        self.prepare(dpi, size);
+        let width = (width - 3.).max(size);
+        let key = Key {
+            text: text.into(),
+            width: (width * dpi).floor() as i32,
+            dpi: dpi.to_bits(),
+            size: size.to_bits(),
+        };
+        let count = if let Some((_, lines)) = self.cache.iter().find(|(k, _)| *k == key) {
+            lines.len()
+        } else {
+            let lines = wrap_measured(text, width, |s| self.measure(s));
+            let len = lines.len();
+            if self.cache.len() >= 32 {
+                self.cache.pop_front();
+            }
+            self.cache.push_back((key, lines));
+            len
+        };
+        count + usize::from(text.ends_with('\n'))
     }
     pub unsafe fn lines(
         &mut self,

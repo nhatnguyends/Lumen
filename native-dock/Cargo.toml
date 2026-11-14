@@ -1,7 +1,9 @@
 [package]
-name = "lumen-native-dock"
-version = "0.1.1"
+name = "lumen"
+version = "0.1.2"
 edition = "2021"
+license = "MIT"
+authors = ["Nhat Ng"]
 publish = false
 
 [build-dependencies]
@@ -17,6 +19,7 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Devices_Display", "Win32_Networking_WinHttp",
   "Win32_System_Time", "Win32_System_SystemInformation", "Win32_System_LibraryLoader", "Win32_System_Threading",
+  "Win32_System_DataExchange", "Win32_System_Memory",
   "Win32_Security", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Controls",
   "Win32_System_Registry", "Win32_System_ApplicationInstallationAndServicing",
   "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging",
@@ -26,4 +29,10 @@ windows-sys = { version = "0.59", features = [
 [profile.dev]
 opt-level = 3
 debug = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 

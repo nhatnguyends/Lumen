@@ -39,27 +39,6 @@ impl State {
     }
     pub(super) fn settings_rows(&self) -> Vec<Row> {
         let c = &self.config;
-        let mut zones: Vec<Choice> = ZONES
-            .iter()
-            .map(|(id, _)| {
-                Choice::new(
-                    *id,
-                    if *id == "local" {
-                        "System time zone".into()
-                    } else {
-                        id.replace('_', " ")
-                    },
-                    None,
-                )
-            })
-            .collect();
-        if !ZONES.iter().any(|z| z.0 == c.time_zone) {
-            zones.push(Choice::new(
-                &c.time_zone,
-                c.time_zone.replace('_', " "),
-                None,
-            ));
-        }
         let mut rows = vec![
             Row::section("Background"),
             Row::toggle(
@@ -88,7 +67,6 @@ impl State {
                     .map(|(key, name)| Choice::new(*key, *name, Some(face::color(key))))
                     .collect(),
             ),
-            Row::choices(ZONE, "Time zone", &c.time_zone, zones),
             Row::toggle(
                 HOUR12,
                 "12-hour time",
@@ -175,25 +153,35 @@ impl State {
         }
         let mut changed = false;
         let mut mode = false;
+        let mut backdrop_changed = false;
+        let mut structural = false;
         for change in changes {
             let window_mode = change.id == FLOAT;
+            let is_opacity = change.id == OPACITY;
+            let is_slider = matches!(change.id, TINT | STRENGTH | BLUR | OPACITY);
             if self.apply_setting(change) {
                 changed = true;
                 mode |= window_mode;
+                backdrop_changed |= !is_opacity;
+                structural |= !is_slider;
             }
         }
         if changed {
-            self.key.clear();
+            if backdrop_changed {
+                self.key.clear();
+            }
             if !self.config.frosted_glass {
                 self.frost = None;
                 self.frost_key.clear();
             }
             self.arm();
-            self.save();
+            SetTimer(self.hwnd, 99, 180, None);
             if mode {
                 crate::window::apply_window_mode(self.hwnd, self.config.floating, self.inspect);
             }
-            self.sync_settings();
+            if structural {
+                self.sync_settings();
+            }
             InvalidateRect(self.hwnd, null(), 0);
         }
     }

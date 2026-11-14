@@ -20,10 +20,8 @@ pub enum Action {
     Show(String),
     Hide(String),
     Settings(String),
-    ShowAll,
-    HideAll,
-    Opacity(f32),
-    Floating(bool),
+    Pin(String, bool),
+    RefreshGlass,
     RestartUpdate,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -34,6 +32,8 @@ struct Config {
     floating: bool,
     snap_fuse: bool,
     start_with_windows: bool,
+    low_power: bool,
+    liquid_glass: bool,
     position: Option<[i32; 2]>,
 }
 impl Default for Config {
@@ -44,6 +44,8 @@ impl Default for Config {
             floating: false,
             snap_fuse: true,
             start_with_windows: true,
+            low_power: true,
+            liquid_glass: false,
             position: None,
         }
     }
@@ -62,6 +64,8 @@ impl Config {
         }
         c.opacity = c.opacity.clamp(0., 100.);
         crate::fusion::set_enabled(c.snap_fuse);
+        crate::motion::set_low_power(c.low_power);
+        crate::glass::set_liquid_glass(c.liquid_glass);
         Ok(c)
     }
     fn save(&self, root: &Path) -> Result<(), String> {
@@ -102,6 +106,7 @@ pub struct Host {
     config: Config,
     packages: Vec<crate::widget_packages::Manifest>,
     visibility: Vec<(String, bool)>,
+    pinned: Vec<String>,
     error: String,
     smoke: bool,
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<crate::update::Release>, String>>>,
@@ -118,8 +123,8 @@ impl Host {
         let config = Config::load(root)?;
         let ui = settings_ui::Host::create(
             owner,
-            "General Settings",
-            "Manage widgets and shared appearance.",
+            "Lumen Settings",
+            "Your widgets, your desktop.",
             glass,
             vec![],
             ACTION_MESSAGE,
@@ -130,6 +135,7 @@ impl Host {
             config,
             packages: vec![],
             visibility: vec![],
+            pinned: vec![],
             error: String::new(),
             smoke,
             update_rx: None,
@@ -143,11 +149,16 @@ impl Host {
         let mut rows = vec![Row::section("Widgets")];
         for (i, widget) in self.packages.iter().enumerate() {
             rows.push(Row::Widget {
-                id: 1000 + i as u32 * 2,
+                id: 1000 + i as u32 * 3,
                 settings_id: if widget.has_settings {
-                    1001 + i as u32 * 2
+                    1001 + i as u32 * 3
                 } else {
                     0
+                },
+                pin_id: if widget.id == "launcher" {
+                    0
+                } else {
+                    1002 + i as u32 * 3
                 },
                 label: widget.name.clone(),
                 hint: widget.description.clone(),
@@ -155,11 +166,10 @@ impl Host {
                     .visibility
                     .iter()
                     .any(|(id, visible)| id == &widget.id && *visible),
+                pinned: self.pinned.iter().any(|p| p == &widget.id),
             });
         }
         rows.extend([
-            Row::button(4, "Show all widgets"),
-            Row::button(5, "Hide all widgets"),
             Row::section("General"),
             Row::toggle(
                 6,
@@ -167,20 +177,26 @@ impl Host {
                 "Open Lumen automatically when you sign in",
                 self.config.start_with_windows,
             ),
-            Row::slider(1, "Background opacity", self.config.opacity, 0., 100., "%"),
             Row::toggle(
                 3,
                 "Snap & fuse widgets",
                 "Join nearby widgets; drag apart to separate",
                 crate::fusion::enabled(),
             ),
-            Row::note("Widget themes, content and individual sizes remain independent."),
+            Row::toggle(
+                12,
+                "Low-power mode",
+                "Reduce animation rate and blur effects for lower-spec PCs",
+                self.config.low_power,
+            ),
+            Row::toggle(
+                13,
+                "Liquid glass",
+                "Subtle edge refraction and chromatic shift on glass surfaces",
+                self.config.liquid_glass,
+            ),
         ]);
         rows.push(Row::section("Updates"));
-        rows.push(Row::note(format!(
-            "Lumen {} · Windows x64",
-            crate::update::installed_version(&self.root)
-        )));
         if self.update_rx.is_none() {
             rows.push(Row::button(7, "Check for updates"));
             if self.update_candidate.is_some()
@@ -197,12 +213,17 @@ impl Host {
         if !self.update_status.is_empty() {
             rows.push(Row::note(&self.update_status));
         }
-        if !crate::update::portable(&self.root) {
-            rows.push(Row::note("Source edition: install portable updates separately. Widget code updates together with Lumen."));
-        }
         if !self.error.is_empty() {
             rows.push(Row::note(&self.error));
         }
+        rows.extend([
+            Row::section("About Lumen"),
+            Row::note(format!(
+                "Lumen {} · By Nhat Ng · MIT License",
+                crate::update::installed_version(&self.root)
+            )),
+            Row::button(11, "Credits & licenses"),
+        ]);
         rows
     }
     fn update_rows(&mut self) {
@@ -229,13 +250,20 @@ impl Host {
         self.visibility = visibility;
         self.update_rows();
     }
+    pub fn set_pinned(&mut self, pinned: Vec<String>) {
+        if self.pinned == pinned {
+            return;
+        }
+        self.pinned = pinned;
+        self.update_rows();
+    }
     fn apply_changes(&mut self, changes: Vec<Change>) -> Vec<Action> {
         let mut actions = vec![];
         let mut dirty = false;
         for change in changes {
             match (change.id, change.value) {
-                (id, Value::Bool(open)) if id >= 1000 && (id - 1000) % 2 == 0 => {
-                    if let Some(widget) = self.packages.get(((id - 1000) / 2) as usize) {
+                (id, Value::Bool(open)) if id >= 1000 && (id - 1000) % 3 == 0 => {
+                    if let Some(widget) = self.packages.get(((id - 1000) / 3) as usize) {
                         actions.push(if open {
                             Action::Show(widget.id.clone())
                         } else {
@@ -243,15 +271,22 @@ impl Host {
                         });
                     }
                 }
-                (id, Value::Action) if id >= 1001 && (id - 1001) % 2 == 0 => {
-                    if let Some(widget) = self.packages.get(((id - 1001) / 2) as usize) {
+                (id, Value::Action) if id >= 1001 && (id - 1001) % 3 == 0 => {
+                    if let Some(widget) = self.packages.get(((id - 1001) / 3) as usize) {
                         actions.push(Action::Settings(widget.id.clone()));
                     }
                 }
-                (1, Value::Number(v)) if v.is_finite() => {
-                    self.config.opacity = v.clamp(0., 100.);
-                    actions.push(Action::Opacity(self.config.opacity));
-                    dirty = true;
+                (id, Value::Bool(pin)) if id >= 1002 && (id - 1002) % 3 == 0 => {
+                    if let Some(widget) = self.packages.get(((id - 1002) / 3) as usize) {
+                        if pin {
+                            if !self.pinned.iter().any(|p| p == &widget.id) {
+                                self.pinned.push(widget.id.clone());
+                            }
+                        } else {
+                            self.pinned.retain(|p| p != &widget.id);
+                        }
+                        actions.push(Action::Pin(widget.id.clone(), pin));
+                    }
                 }
                 (6, Value::Bool(v)) => {
                     if crate::update::portable(&self.root) {
@@ -290,8 +325,30 @@ impl Host {
                     crate::fusion::set_enabled(v);
                     dirty = true;
                 }
-                (4, Value::Action) => actions.push(Action::ShowAll),
-                (5, Value::Action) => actions.push(Action::HideAll),
+                (12, Value::Bool(v)) => {
+                    self.config.low_power = v;
+                    crate::motion::set_low_power(v);
+                    crate::glass::clear_cache();
+                    if v {
+                        crate::render::clear_caches();
+                        unsafe {
+                            windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(
+                                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                usize::MAX,
+                                usize::MAX,
+                                0,
+                            );
+                        }
+                    }
+                    actions.push(Action::RefreshGlass);
+                    dirty = true;
+                }
+                (13, Value::Bool(v)) => {
+                    self.config.liquid_glass = v;
+                    crate::glass::set_liquid_glass(v);
+                    actions.push(Action::RefreshGlass);
+                    dirty = true;
+                }
                 (7, Value::Action) if self.update_rx.is_none() && !self.smoke => {
                     let (tx, rx) = std::sync::mpsc::channel();
                     let root = self.root.clone();
@@ -317,6 +374,24 @@ impl Host {
                 }
                 (10, Value::Action) if !self.smoke => unsafe {
                     crate::update::open_releases();
+                },
+                (11, Value::Action) if !self.smoke => unsafe {
+                    let file = self.root.join("LICENSES/CREDITS.txt");
+                    if file.is_file() {
+                        let result = windows_sys::Win32::UI::Shell::ShellExecuteW(
+                            std::ptr::null_mut(),
+                            wide("open").as_ptr(),
+                            wide(&file).as_ptr(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                        );
+                        if result as isize <= 32 {
+                            self.error = "Windows could not open the credits text file.".into();
+                        }
+                    } else {
+                        self.error="Credits collection is missing. Rebuild the package or run scripts/third_party.py.".into();
+                    }
                 },
                 _ => {}
             }
@@ -379,18 +454,53 @@ mod tests {
     use super::*;
     #[test]
     fn update_controls_follow_worker_state_without_starting_network_in_tests() {
-        let _lock=crate::native_ui_test_lock();let _runtime=crate::render::Runtime::start().unwrap();
-        let root=std::env::temp_dir().join(format!("lumen-update-ui-{}",std::process::id()));std::fs::create_dir_all(&root).unwrap();
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = crate::render::Runtime::start().unwrap();
+        let root = std::env::temp_dir().join(format!("lumen-update-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
         unsafe {
-            let glass=Rc::new(RefCell::new(Glass::new(13.,1.)));
-            let mut host=Host::create(std::ptr::null_mut(),&root,glass,true).unwrap();
-            let has=|rows:&Vec<Row>,wanted| rows.iter().any(|row|matches!(row,Row::Button{id,..} if *id==wanted));
-            assert!(has(&host.rows(),7));assert!(!has(&host.rows(),8));
-            let (tx,rx)=std::sync::mpsc::channel();host.update_rx=Some(rx);assert!(!has(&host.rows(),7));
-            tx.send(Ok(Some(crate::update::Release{version:"0.2.0".into(),url:String::new(),digest:String::new()}))).unwrap();host.poll_update();
-            assert!(host.update_status.contains("0.2.0"));assert!(has(&host.rows(),7));assert!(!has(&host.rows(),8),"source builds must not install portable updates over source");
-            std::fs::write(root.join("lumen-portable.json"),"{}").unwrap();assert!(has(&host.rows(),8));
-            let (tx,rx)=std::sync::mpsc::channel();host.update_rx=Some(rx);tx.send(Err("offline".into())).unwrap();host.poll_update();assert_eq!(host.update_status,"offline");assert!(has(&host.rows(),7));
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            let mut host = Host::create(std::ptr::null_mut(), &root, glass, true).unwrap();
+            let has = |rows: &Vec<Row>, wanted| {
+                rows.iter()
+                    .any(|row| matches!(row,Row::Button{id,..} if *id==wanted))
+            };
+            assert!(has(&host.rows(), 7));
+            assert!(!has(&host.rows(), 8));
+            assert!(has(&host.rows(), 11));
+            assert!(!has(&host.rows(), 4) && !has(&host.rows(), 5));
+            assert!(!host
+                .rows()
+                .iter()
+                .any(|r| matches!(r, Row::Slider { id: 1, .. })));
+            assert!(host
+                .rows()
+                .iter()
+                .any(|row| matches!(row,Row::Note(text) if text.contains("Nhat Ng"))));
+            let (tx, rx) = std::sync::mpsc::channel();
+            host.update_rx = Some(rx);
+            assert!(!has(&host.rows(), 7));
+            tx.send(Ok(Some(crate::update::Release {
+                version: "0.2.0".into(),
+                url: String::new(),
+                digest: String::new(),
+            })))
+            .unwrap();
+            host.poll_update();
+            assert!(host.update_status.contains("0.2.0"));
+            assert!(has(&host.rows(), 7));
+            assert!(
+                !has(&host.rows(), 8),
+                "source builds must not install portable updates over source"
+            );
+            std::fs::write(root.join("lumen-portable.json"), "{}").unwrap();
+            assert!(has(&host.rows(), 8));
+            let (tx, rx) = std::sync::mpsc::channel();
+            host.update_rx = Some(rx);
+            tx.send(Err("offline".into())).unwrap();
+            host.poll_update();
+            assert_eq!(host.update_status, "offline");
+            assert!(has(&host.rows(), 7));
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -454,7 +564,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, _)| Change {
-                    id: 1001 + i as u32 * 2,
+                    id: 1001 + i as u32 * 3,
                     value: Value::Action,
                 })
                 .collect();
@@ -471,7 +581,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, _)| Change {
-                    id: 1000 + i as u32 * 2,
+                    id: 1000 + i as u32 * 3,
                     value: Value::Bool(i % 2 == 0),
                 })
                 .collect();
@@ -488,6 +598,24 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(host.apply_changes(toggles), expected);
+            let pins = registry
+                .ids()
+                .into_iter()
+                .enumerate()
+                .skip(1)
+                .map(|(i, _)| Change {
+                    id: 1002 + i as u32 * 3,
+                    value: Value::Bool(i % 2 == 1),
+                })
+                .collect();
+            let expected_pins = registry
+                .ids()
+                .into_iter()
+                .enumerate()
+                .skip(1)
+                .map(|(i, id)| Action::Pin(id, i % 2 == 1))
+                .collect::<Vec<_>>();
+            assert_eq!(host.apply_changes(pins), expected_pins);
             let actions = host.apply_changes(vec![
                 Change {
                     id: 1,
@@ -510,10 +638,7 @@ mod tests {
                     value: Value::Action,
                 },
             ]);
-            assert_eq!(
-                actions,
-                vec![Action::Opacity(35.), Action::ShowAll, Action::HideAll]
-            );
+            assert_eq!(actions, Vec::<Action>::new());
             assert!(!crate::fusion::enabled());
             host.hide();
             drop(host);

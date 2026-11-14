@@ -13,6 +13,7 @@ pub(super) const LIGHT: u16 = 32;
 pub(super) const CLOUD: u16 = 64;
 pub(super) const SOFT: u16 = 128;
 pub(super) const LIQUID: u16 = 256;
+pub(super) const CIRCLE: u16 = 512;
 pub(super) fn material(design: &str) -> u16 {
     match design {
         "cloud" => CLOUD,
@@ -22,8 +23,11 @@ pub(super) fn material(design: &str) -> u16 {
     }
 }
 pub(super) fn radius(style: u16, height: f32) -> f32 {
+    if style & CIRCLE != 0 {
+        return height / 2.;
+    }
     (if style & CLOUD != 0 {
-        height / 2.
+        18f32
     } else if style & SOFT != 0 {
         22.
     } else if style & LIQUID != 0 {
@@ -98,9 +102,9 @@ fn pixels(diameter: u32, height: u32, scale: f32, color: u32, style: u16) -> Vec
             let radial = (1. + signed / radius.max(1.)).clamp(0., 1.);
             let facing = (-nx * 0.52 - ny * 0.85).max(0.);
             let strength = if pressed {
-                0.74
+                0.50
             } else if hover {
-                1.18
+                1.48
             } else {
                 1.
             };
@@ -115,28 +119,23 @@ fn pixels(diameter: u32, height: u32, scale: f32, color: u32, style: u16) -> Vec
             };
             // A luminous translucent body; only the lower shoulder carries
             // shade, so the lens stays bright on both milk and dark glass.
+            let body = if soft {
+                if light { 0.68 } else { 0.30 }
+            } else if cloud {
+                if light { 0.42 } else { 0.22 }
+            } else if liquid {
+                0.075
+            } else if light {
+                0.19
+            } else {
+                0.09
+            };
             over(
                 [0.94, 0.97, 1.],
-                if soft {
-                    if light {
-                        0.68
-                    } else {
-                        0.30
-                    }
-                } else if cloud {
-                    if light {
-                        0.42
-                    } else {
-                        0.22
-                    }
-                } else if liquid {
-                    0.075
+                body + if hover && !pressed {
+                    if light { 0.13 } else { 0.11 }
                 } else {
-                    if light {
-                        0.19
-                    } else {
-                        0.09
-                    }
+                    0.
                 },
             );
             over(
@@ -155,9 +154,29 @@ fn pixels(diameter: u32, height: u32, scale: f32, color: u32, style: u16) -> Vec
                     0.012
                 },
             );
+            if cloud {
+                let t=((ny+1.)*0.5+nx*0.18).clamp(0.,1.);
+                let top=[tint[0]*0.78+0.22,tint[1]*0.78+0.22,tint[2]*0.78+0.22];
+                let bottom=[0.95,0.85,0.98];
+                let gradient=[top[0]*(1.-t)+bottom[0]*t,top[1]*(1.-t)+bottom[1]*t,top[2]*(1.-t)+bottom[2]*t];
+                over(gradient,0.93);
+                if hover && !pressed {
+                    over([1.; 3], 0.14);
+                }
+            }
+            if pressed {
+                over([0.; 3], if light { 0.16 } else { 0.24 });
+            }
             over(
                 [0.; 3],
-                (ny * 0.7 + nx * 0.18).max(0.) * if light { 0.045 } else { 0.035 },
+                (ny * 0.7 + nx * 0.18).max(0.)
+                    * if pressed {
+                        0.12
+                    } else if light {
+                        0.045
+                    } else {
+                        0.035
+                    },
             );
             // Broad reflection rolls over the curved upper shoulder, rather than
             // filling the whole circle at the same opacity.
@@ -202,6 +221,9 @@ fn pixels(diameter: u32, height: u32, scale: f32, color: u32, style: u16) -> Vec
                 [0.91, 0.97, 1.],
                 rim * (0.10 + 0.46 * facing.powf(1.4)) * strength,
             );
+            if hover && !pressed {
+                over([1.; 3], rim * if light { 0.24 } else { 0.18 });
+            }
             let opacity = coverage * if enabled { 1. } else { 0.46 };
             let i = ((y * diameter + x) * 4) as usize;
             for ch in 0..3 {
@@ -227,14 +249,14 @@ mod tests {
                 assert_ne!(images[i], images[j]);
             }
         }
-        assert_eq!(radius(CLOUD, 72.), 36.);
+        assert_eq!(radius(CLOUD, 72.), 18.);
         assert_eq!(radius(SOFT, 72.), 22.);
         assert_eq!(radius(LIQUID, 72.), 24.);
         assert_eq!(radius(0, 72.), 16.);
         // The same corner pixel lies inside the soft surface but outside
         // the rounded milk-glass pill. This cannot pass on color alone.
         assert!(images[2][(8 * 180 + 8) * 4 + 3] > 0);
-        assert_eq!(images[1][(8 * 180 + 8) * 4 + 3], 0);
+        assert!(images[1][(8 * 180 + 8) * 4 + 3]>0);
     }
     #[test]
     fn glass_lens_has_directional_volume_and_correct_transparency() {

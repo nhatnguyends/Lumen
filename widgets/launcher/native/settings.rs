@@ -14,6 +14,8 @@ pub(super) enum Action {
     Icon,
     Labels,
     Search,
+    Desktop,
+    PinWidget(usize),
     Quit,
     Close,
 }
@@ -27,6 +29,9 @@ pub(super) struct State {
     pub hwnd: HWND,
     pub dpi: f32,
     pub scroll: i32,
+    pub smooth_scroll: crate::motion::SmoothScroll,
+    pub scroll_clock: Option<crate::motion::FrameClock>,
+    pub frame_queued: bool,
     pub expanded: bool,
     pub hits: Vec<Hit>,
     pub dragging: Option<Action>,
@@ -38,6 +43,9 @@ impl Default for State {
             hwnd: null_mut(),
             dpi: 1.0,
             scroll: 0,
+            smooth_scroll: Default::default(),
+            scroll_clock: None,
+            frame_queued: false,
             expanded: false,
             hits: vec![],
             dragging: None,
@@ -48,7 +56,11 @@ pub(super) const THEMES: [(&str, &str, u32); 12] = crate::surface::PRESETS;
 const PICK_SURFACE_COLOR: u32 = WM_APP + 220;
 impl App {
     pub(super) fn selection_color(&self) -> u32 {
-        crate::accent::interaction(self.theme_color())
+        if self.dock.theme == crate::accent::THEME {
+            self.accent_color
+        } else {
+            crate::accent::vivid(self.theme_color())
+        }
     }
     pub(super) fn theme_color(&self) -> u32 {
         crate::surface::color(&self.dock.theme, self.accent_color)
@@ -158,6 +170,7 @@ impl App {
         InvalidateRect(self.settings.hwnd, null(), 0);
     }
     unsafe fn paint_settings(&mut self, hwnd: HWND) {
+        let frame_started = std::time::Instant::now();
         let mut ps: PAINTSTRUCT = zeroed();
         BeginPaint(hwnd, &mut ps);
         let mut rect: RECT = zeroed();
@@ -174,39 +187,49 @@ impl App {
             })
             .expect("settings paint buffer");
         let dc = frame.dc;
-        let b = CreateSolidBrush(rgb(25, 36, 46));
+        let bg = rgb(30, 32, 36);
+        let b = CreateSolidBrush(bg);
         FillRect(dc, &rect, b);
         DeleteObject(b);
-        self.glass.borrow().draw(dc, hwnd, rect.right, rect.bottom);
         let scale = self.settings.dpi;
         let w = (rect.right as f32 / scale) as i32;
         let h = (rect.bottom as f32 / scale) as i32;
-        self.settings.scroll = self.settings.scroll.clamp(
-            0,
-            (804 + if self.settings.expanded { 162 } else { 0 } - h + 18).max(0),
-        );
+        let max_scroll = (804 + if self.settings.expanded { 162 } else { 0 } - h + 18).max(0);
+        let now = self.now();
+        if self.settings.scroll_clock.is_some() {
+            self.settings.smooth_scroll.bounds(max_scroll as f32, now);
+            self.settings.scroll = self.settings.smooth_scroll.value(now).round() as i32;
+            if !self.settings.smooth_scroll.moving(now) {
+                KillTimer(hwnd, 1);
+                self.settings.scroll_clock = None;
+            }
+        } else {
+            self.settings.scroll = self.settings.scroll.clamp(0, max_scroll);
+            self.settings.smooth_scroll.max = max_scroll as f32;
+            self.settings
+                .smooth_scroll
+                .snap(self.settings.scroll as f32);
+        }
         let c = Canvas::new(dc, scale);
-        let white = if self.dock.light {
-            rgb(32, 39, 49)
-        } else {
-            rgb(241, 242, 248)
-        };
-        let dim = if self.dock.light {
-            rgb(88, 99, 112)
-        } else {
-            rgb(172, 188, 199)
-        };
+        let white = rgb(241, 242, 248);
+        let dim = rgb(172, 188, 199);
         c.round(
             [0., 0., w as f32, h as f32],
             30.,
-            self.theme_color(),
-            205,
+            rgb(30, 32, 36),
+            255,
             false,
             false,
         );
-        c.coating([4., 4., w as f32 - 4., h as f32 - 4.], 30.);
+        c.round(
+            [0.5, 0.5, w as f32 - 0.5, h as f32 - 0.5],
+            30.,
+            0xffffff,
+            22,
+            true,
+            false,
+        );
         drop(c);
-        frame.bevel();
         let c = Canvas::new(dc, scale);
         c.round([17., 16., 45., 44.], 14., white, 14, false, false);
         c.round([17., 16., 45., 44.], 14., white, 24, true, false);
@@ -526,8 +549,8 @@ impl App {
             dim,
             0,
         );
-        round([16, start, w - 16, start + 220], 16., 10, false);
-        round([16, start, w - 16, start + 220], 16., 35, true);
+        round([16, start, w - 16, start + 260], 16., 10, false);
+        round([16, start, w - 16, start + 260], 16., 35, true);
         tx(
             "Columns",
             [28, start + 3, w - 140, start + 26],
@@ -640,6 +663,7 @@ impl App {
         hit([22, start + 68, w - 60, start + 99], Action::Icon);
         line(start + 100);
         for (label, on, y, action) in [
+            ("Sync Desktop items", self.dock.sync_desktop, start + 180, Action::Desktop),
             (
                 "Show labels",
                 self.dock.show_labels,
@@ -658,9 +682,38 @@ impl App {
             hit([w - 76, y, w - 20, y + 40], action);
             line(y + 40);
         }
+        let mut footer_y = start + 236;
+        let manifests: Vec<(String, String)> = self
+            .packages
+            .manifests()
+            .iter()
+            .map(|m| (m.id.clone(), m.name.clone()))
+            .collect();
+        if !manifests.is_empty() {
+            tx("TOOLBAR WIDGETS", [26, footer_y, w - 26, footer_y + 18], 9.5, true, dim, 0);
+            footer_y += 24;
+            for (i, (id, name)) in manifests.iter().enumerate() {
+                let y = footer_y + i as i32 * 40;
+                let on = self.dock.pinned_widgets.iter().any(|p| p == id);
+                self.symbols.draw(
+                    dc,
+                    self.dpi,
+                    crate::symbols::widget_symbol(id),
+                    28.,
+                    y as f32 + 12.,
+                    16.,
+                    white,
+                );
+                tx(name, [52, y, w - 80, y + 40], 11.5, false, white, 0);
+                toggle(y, on);
+                hit([w - 76, y, w - 20, y + 40], Action::PinWidget(i));
+                line(y + 40);
+            }
+            footer_y += manifests.len() as i32 * 40 + 24;
+        }
         tx(
             "Lumen · Native dock",
-            [27, start + 230, w - 110, start + 257],
+            [27, footer_y, w - 110, footer_y + 27],
             10.,
             false,
             dim,
@@ -668,36 +721,35 @@ impl App {
         );
         tx(
             "Quit",
-            [w - 75, start + 230, w - 27, start + 257],
+            [w - 75, footer_y, w - 27, footer_y + 27],
             11.,
             false,
             white,
             2,
         );
-        hit([w - 82, start + 225, w - 22, start + 262], Action::Quit);
+        hit([w - 82, footer_y - 5, w - 22, footer_y + 32], Action::Quit);
         drop(c);
         RestoreDC(dc, saved);
         self.settings.hits = hits;
-        let c = Canvas::new(dc, scale);
-        let content = start + 270;
+        let content = footer_y + 40;
         if content > h - 14 {
             let track = (h - 90).max(30) as f32;
             let thumb = (track * (h - 60) as f32 / content as f32).max(35.);
             let max = (content - h + 18).max(1) as f32;
             let y = 70. + (track - thumb) * scroll as f32 / max;
-            c.round(
-                [w as f32 - 8., y, w as f32 - 5., y + thumb],
-                1.5,
-                white,
-                70,
-                false,
-                false,
-            );
+            frame.fill_round([w as f32 - 8., y, w as f32 - 5., y + thumb], 1.5, white, 70);
         }
-        drop(c);
         frame.present(hwnd);
         self.settings.frame = Some(frame);
         EndPaint(hwnd, &ps);
+        if IsWindowVisible(hwnd) != 0 && self.settings.scroll_clock.is_some() {
+            crate::motion::pace_vsync(
+                hwnd,
+                frame_started,
+                &mut self.settings.frame_queued,
+                crate::motion::VSYNC_FRAME,
+            );
+        }
     }
     unsafe fn settings_action(&mut self, action: Action, x: i32) {
         let w = client_dips(self.settings.hwnd, self.settings.dpi).0;
@@ -742,12 +794,29 @@ impl App {
             }
             Action::Labels => self.dock.show_labels = !self.dock.show_labels,
             Action::Search => self.dock.show_search = !self.dock.show_search,
+            Action::Desktop => {
+                self.dock.sync_desktop = !self.dock.sync_desktop;
+                self.sync_desktop_items(self.hwnd);
+            }
+            Action::PinWidget(index) => {
+                if let Some(id) = self.packages.manifests().get(index).map(|m| m.id.clone()) {
+                    if let Some(pos) = self.dock.pinned_widgets.iter().position(|p| p == &id) {
+                        self.dock.pinned_widgets.remove(pos);
+                    } else {
+                        self.dock.pinned_widgets.push(id);
+                    }
+                    self.layout_edit(self.hwnd);
+                    self.refresh_manager();
+                    self.save();
+                    layout = true;
+                }
+            }
             Action::Quit => {
                 PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
                 return;
             }
         }
-        self.settings_changed(layout, false);
+        self.settings_changed(layout, matches!(action, Action::Blur));
     }
 }
 unsafe fn client_dips(hwnd: HWND, scale: f32) -> (i32, i32) {
@@ -915,12 +984,46 @@ unsafe extern "system" fn settings_proc(
             0
         }
         WM_MOUSEWHEEL => {
-            let delta = ((wparam >> 16) as u16 as i16) as i32;
+            let delta = ((wparam >> 16) as u16 as i16) as f32 / 120.;
             let (_, h) = client_dips(hwnd, app.settings.dpi);
-            let content = 804 + if app.settings.expanded { 162 } else { 0 };
-            app.settings.scroll = (app.settings.scroll + if delta < 0 { 42 } else { -42 })
-                .clamp(0, (content - h + 18).max(0));
+            let content = 844 + if app.settings.expanded { 162 } else { 0 };
+            let max = (content - h + 18).max(0) as f32;
+            let now = app.now();
+            app.settings.smooth_scroll.bounds(max, now);
+            if app.settings.scroll_clock.is_none() {
+                let cur = app.settings.scroll as f32;
+                app.settings.smooth_scroll.snap(cur);
+                app.settings.scroll_clock = Some(crate::motion::FrameClock::start());
+            }
+            app.settings.smooth_scroll.by(-delta * 72., now);
+            app.settings.scroll = app.settings.smooth_scroll.value(now).round() as i32;
+            SetTimer(hwnd, 1, 10, None);
             InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_TIMER if wparam == 1 => {
+            let now = app.now();
+            app.settings.scroll = app.settings.smooth_scroll.value(now).round() as i32;
+            if !app.settings.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            if !app.settings.smooth_scroll.moving(now) {
+                KillTimer(hwnd, 1);
+                app.settings.scroll_clock = None;
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            app.settings.frame_queued = false;
+            let now = app.now();
+            app.settings.scroll = app.settings.smooth_scroll.value(now).round() as i32;
+            if app.settings.smooth_scroll.moving(now) {
+                InvalidateRect(hwnd, null(), 0);
+            } else {
+                KillTimer(hwnd, 1);
+                app.settings.scroll_clock = None;
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_KEYDOWN if wparam == 0x1b => {

@@ -29,7 +29,7 @@ def main() -> int:
         if result.returncode:
             raise RuntimeError(
                 "Lumen could not start. See config\\logs\\double-click-launcher.log "
-                "in the Widget folder for details."
+                "in the Lumen folder for details."
             )
         return 0
     except (OSError, RuntimeError) as error:

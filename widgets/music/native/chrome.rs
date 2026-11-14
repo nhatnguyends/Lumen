@@ -13,8 +13,12 @@ impl State {
         // The compositor owns the fused contour. Baking a private rounded
         // pane into Music leaves a visible inner corner at the join.
         let fused = crate::fusion::fused(self.hwnd);
-        let pane = if fused {[0.,0.,w,h]} else {[4.,4.,w-4.,h-4.]};
-        let radius = if fused {0.} else {34.};
+        let pane = if fused {
+            [0., 0., w, h]
+        } else {
+            [4., 4., w - 4., h - 4.]
+        };
+        let radius = if fused { 0. } else { 34. };
         // Exactly Dock's coating order/units. pane_overlay already includes
         // reflection_gradient: calling both makes the material doubly smoky.
         if self.overlay.is_none() {
@@ -26,15 +30,28 @@ impl State {
             );
         }
         let c = Canvas::new(bg.dc, self.dpi);
+        if self.config.design == "disc" {
+            // Disc's warm printed backing is part of its graphic identity.
+            c.round(pane, radius, 0xf0eeed, 255, false, false);
+            c.coating(pane, radius);
+            return;
+        }
         if !crate::surface::managed(&self.config.palette) {
-            c.round(pane, radius, color, (tint * 2.55).round() as u8, false, false);
+            c.round(
+                pane,
+                radius,
+                color,
+                (tint * 2.55).round() as u8,
+                false,
+                false,
+            );
         }
         crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
         c.coating(pane, radius);
         if let Some(image) = &self.overlay {
             c.image(image, [0., 0., w, h]);
         }
-        c.widget_corner_reflection(pane, radius, light);
+        c.widget_corner_reflection_for(self.hwnd, pane, radius, light);
     }
     pub(super) unsafe fn rounded_cover(&self, c: &Canvas, url: &str, r: [f32; 4], radius: f32) {
         let (w, h) = (r[2] - r[0], r[3] - r[1]);
@@ -91,6 +108,9 @@ impl State {
         action: Action,
         enabled: bool,
     ) {
+        if action == Action::Queue {
+            return;
+        }
         let (x, y) = ((r[0] + r[2]) / 2., (r[1] + r[3]) / 2.);
         let hover = self.hover.as_ref() == Some(&action);
         let down = hover && self.pressed.as_ref() == Some(&action);

@@ -5,6 +5,7 @@ use std::{collections::HashSet, path::Path};
 pub enum Kind {
     Display,
     Hdr,
+    Source,
     Audio,
     Volume,
     Mute,
@@ -12,12 +13,13 @@ pub enum Kind {
     MicVolume,
     MicMute,
 }
-pub const KINDS: [Kind; 8] = [
+pub const KINDS: [Kind; 9] = [
     Kind::Volume,
     Kind::Audio,
     Kind::Mute,
     Kind::Display,
     Kind::Hdr,
+    Kind::Source,
     Kind::Microphone,
     Kind::MicVolume,
     Kind::MicMute,
@@ -29,7 +31,7 @@ impl Kind {
             Self::Volume | Self::Audio | Self::Mute => 0,
             Self::Microphone if !target.is_empty() => 3,
             Self::Microphone | Self::MicVolume | Self::MicMute => 2,
-            Self::Display => 4,
+            Self::Display | Self::Source => 4,
             Self::Hdr => 5,
         }
     }
@@ -37,6 +39,7 @@ impl Kind {
         match self {
             Self::Display => "Display",
             Self::Hdr => "HDR",
+            Self::Source => "Monitor input",
             Self::Audio => "Audio output",
             Self::Volume => "Volume",
             Self::Mute => "Mute",
@@ -46,7 +49,10 @@ impl Kind {
         }
     }
     pub fn is_group(self) -> bool {
-        matches!(self, Self::Audio | Self::Microphone | Self::Display)
+        matches!(
+            self,
+            Self::Audio | Self::Microphone | Self::Display | Self::Source
+        )
     }
     pub fn is_volume(self) -> bool {
         matches!(self, Self::Volume | Self::MicVolume)
@@ -131,7 +137,7 @@ impl Config {
         c.frost_strength = c.frost_strength.clamp(0., 100.);
         if !matches!(
             c.design.as_str(),
-            "lumen" | "cloud" | "soft-violet" | "liquid-pastel"
+            "lumen" | "cloud" | "soft-violet" | "liquid-pastel" | "compact"
         ) {
             c.design = "lumen".into();
         }
@@ -139,7 +145,8 @@ impl Config {
             crate::surface::normalize(&c.palette).unwrap_or_else(|| "wallpaper-auto".into());
         let mut seen = HashSet::new();
         c.controls.retain(|v| {
-            !v.id.is_empty()
+            v.kind != Kind::Source
+                && !v.id.is_empty()
                 && v.id.len() <= 64
                 && v.id
                     .bytes()
@@ -229,7 +236,7 @@ impl Config {
             if c.kind.is_volume() {
                 return seen.insert(c.kind);
             }
-            if c.kind.is_group() {
+            if c.kind.is_group() && c.kind != Kind::Source {
                 c.target.clear();
                 c.label = if c.kind == Kind::Display {
                     "Displays"
@@ -252,12 +259,12 @@ impl Config {
         if kind.is_volume() && self.controls.iter().any(|c| c.kind == kind) {
             return;
         }
-        let target = if kind.is_group() {
+        let target = if kind.is_group() && kind != Kind::Source {
             String::new()
         } else {
             target
         };
-        if kind.is_group() && self.controls.iter().any(|c| c.kind == kind) {
+        if kind.is_group() && kind != Kind::Source && self.controls.iter().any(|c| c.kind == kind) {
             return;
         }
 
@@ -336,10 +343,24 @@ pub fn layout_devices(
     scroll: f32,
     counts: [usize; 3],
 ) -> (Vec<Tile>, f32, bool) {
+    layout_devices_for_design(controls, w, h, scroll, counts, "lumen")
+}
+pub fn layout_devices_for_design(
+    controls: &[Control],
+    w: f32,
+    h: f32,
+    scroll: f32,
+    counts: [usize; 3],
+    design: &str,
+) -> (Vec<Tile>, f32, bool) {
     let (top, pad, gap) = (60., 18., 10.);
     let compact = h <= 240.;
+    let android_compact = design == "compact";
     let mut tiles = vec![];
     let count = |c: &Control| {
+        if c.kind == Kind::Source {
+            return 3;
+        }
         counts[match c.kind {
             Kind::Audio => 0,
             Kind::Microphone => 1,
@@ -349,9 +370,19 @@ pub fn layout_devices(
     };
     if compact {
         let mut x = pad;
-        let height = (h - top - pad).clamp(32., 72.);
+        let height = if android_compact {
+            (h - top - pad).clamp(32., 56.)
+        } else {
+            (h - top - pad).clamp(32., 72.)
+        };
         for (index, c) in controls.iter().enumerate() {
-            let width = if c.kind.is_group() {
+            let width = if android_compact {
+                if c.kind.is_volume() {
+                    160.
+                } else {
+                    height
+                }
+            } else if c.kind.is_group() {
                 24. + 176. * count(c) as f32
             } else if c.kind.is_volume() {
                 184.
@@ -366,46 +397,61 @@ pub fn layout_devices(
         }
         return (tiles, (x - gap + pad - w).max(0.), true);
     }
-    let cols = ((w - 2. * pad + gap) / 108.).floor().max(1.) as usize;
-    let cell = (w - 2. * pad - gap * (cols - 1) as f32) / cols as f32;
-    let (mut col, mut y, mut row_height) = (0, top, 0f32);
+    let cols = if android_compact {
+        ((w - 2. * pad + gap) / 88.).floor().max(1.) as usize
+    } else {
+        ((w - 2. * pad + gap) / 108.).floor().max(1.) as usize
+    };
+    let mut row: Vec<(usize, usize, f32)> = vec![];
+    let mut y = top;
+    let flush_row = |row: &mut Vec<(usize, usize, f32)>, y: &mut f32, tiles: &mut Vec<Tile>| {
+        if row.is_empty() {
+            return;
+        }
+        let k = row.len();
+        let total_span: usize = row.iter().map(|(_, s, _)| *s).sum();
+        let avail = (w - 2. * pad - gap * (k - 1) as f32).max(1.);
+        let row_height = row.iter().map(|(_, _, rh)| *rh).fold(0f32, f32::max);
+        let mut x = pad;
+        for (idx, span, _) in row.drain(..) {
+            let width = avail * (span as f32 / total_span as f32);
+            tiles.push(Tile {
+                index: idx,
+                rect: [x, *y - scroll, x + width, *y + row_height - scroll],
+            });
+            x += width + gap;
+        }
+        *y += row_height + gap;
+    };
+    let mut col = 0;
     for (index, c) in controls.iter().enumerate() {
-        let span = if c.kind.is_group() {
+        let span = if android_compact {
+            if c.kind.is_volume() { cols } else { 1 }
+        } else if c.kind.is_group() || c.kind.is_volume() {
             cols
-        } else if c.kind.is_volume() {
-            2.min(cols)
         } else {
             1
         };
         if col + span > cols {
+            flush_row(&mut row, &mut y, &mut tiles);
             col = 0;
-            y += row_height + gap;
-            row_height = 0.;
         }
-        let height = if c.kind.is_group() {
+        let height = if android_compact {
+            if c.kind.is_volume() { 64. } else { 86. }
+        } else if c.kind.is_group() {
             36. + 34. * count(c) as f32
         } else {
             72.
         };
-        let x = pad + col as f32 * (cell + gap);
-        tiles.push(Tile {
-            index,
-            rect: [
-                x,
-                y - scroll,
-                x + cell * span as f32 + gap * (span - 1) as f32,
-                y + height - scroll,
-            ],
-        });
-        row_height = row_height.max(height);
+        row.push((index, span, height));
         col += span;
         if col == cols {
+            flush_row(&mut row, &mut y, &mut tiles);
             col = 0;
-            y += row_height + gap;
-            row_height = 0.;
         }
     }
-    let end = if col > 0 { y + row_height } else { y - gap };
+    flush_row(&mut row, &mut y, &mut tiles);
+    let end = if tiles.is_empty() { top } else { y - gap };
     (tiles, (end + pad - h).max(0.), false)
 }
 #[cfg(test)]

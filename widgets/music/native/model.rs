@@ -2,14 +2,12 @@ use crate::model::wide;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-pub const DESIGNS: [&str; 7] = [
+pub const DESIGNS: [&str; 5] = [
     "coverflow",
-    "lumen",
-    "sleeve",
+    "compact",
     "turntable",
     "orbit",
     "disc",
-    "sky",
 ];
 pub const MIN_SIZE: [i32; 2] = [168, 104];
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +73,9 @@ impl Config {
             }
             config
         };
+        if matches!(config.design.as_str(), "sleeve" | "lumen" | "sky") {
+            config.design = "compact".into();
+        }
         if let Some(palette) = crate::surface::normalize(&config.palette) {
             config.palette = palette;
         }
@@ -138,6 +139,8 @@ pub struct Track {
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Playback {
+    pub signed_in: bool,
+    pub auth_known: bool,
     pub album: String,
     pub video_id: String,
     pub available: bool,
@@ -169,7 +172,7 @@ mod tests {
         let mut c = Config::default();
         c.design = "missing".into();
         assert!(c.validate().is_err());
-        c.design = "sleeve".into();
+        c.design = "compact".into();
         c.size = [1, 99999];
         c.validate().unwrap();
         assert_eq!(c.size, [168, 1000]);
@@ -183,11 +186,23 @@ mod tests {
         assert_eq!(time(125.9), "2:05");
     }
     #[test]
+    fn account_status_reads_live_signed_in_state_and_defaults_for_old_sessions() {
+        let old: Playback = serde_json::from_str(r#"{"title":"Previous track"}"#).unwrap();
+        assert!(!old.signed_in);
+        let live: Playback =
+            serde_json::from_str(r#"{"signedIn":true,"available":false}"#).unwrap();
+        assert!(live.signed_in);
+        assert!(
+            !live.available,
+            "account status is independent from playback availability"
+        );
+    }
+    #[test]
     fn surface_palettes_round_trip_and_legacy_flat_migrates_without_changing_color() {
         let root =
             std::env::temp_dir().join(format!("lumen-music-surfaces-{}", std::process::id()));
         let mut c = Config::default();
-        c.design = "sky".into();
+        c.design = "orbit".into();
         c.position = Some([-600, 180]);
         c.size = [480, 620];
         for palette in [
@@ -234,7 +249,7 @@ mod tests {
         let source = root.join("config/state.json");
         fs::write(&source, old).unwrap();
         let mut c = Config::load(&root).unwrap();
-        assert_eq!(c.design, "sleeve");
+        assert_eq!(c.design, "compact");
         assert_eq!(c.opacity, 65.);
         c.size = MIN_SIZE;
         c.position = Some([-800, 120]);

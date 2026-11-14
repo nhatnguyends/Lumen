@@ -68,7 +68,7 @@ impl Tray {
         data.uCallbackMessage = MESSAGE;
         data.hIcon = icon;
         data.guidItem = GUID::from_u128(0xc7c6f41d_f516_4c86_9f3e_8db41829601a);
-        let tip = crate::model::wide("Lumen · Native App Dock");
+        let tip = crate::model::wide("Lumen");
         data.szTip[..tip.len().min(127)].copy_from_slice(&tip[..tip.len().min(127)]);
         let tray = Self { data, icon };
         if !tray.add() {

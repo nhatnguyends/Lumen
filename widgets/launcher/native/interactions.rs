@@ -15,7 +15,7 @@ impl App {
     }
     pub(super) unsafe fn clear_hit(&self, hwnd: HWND, p: [f32; 2]) -> bool {
         self.search_visible() && !self.query.is_empty()
-            && (p[0] - crate::geometry::dock_header(self.dimensions(hwnd).0, true).clear_x)
+            && (p[0] - self.header_layout(self.dimensions(hwnd).0).clear_x)
                 .hypot(p[1] - 37.)
                 < 12.
     }
@@ -27,6 +27,7 @@ impl App {
         self.layout_edit(hwnd);
         SetFocus(self.edit);
         self.arm_motion(hwnd);
+        InvalidateRect(hwnd, null(), 0);
     }
     pub(super) unsafe fn widget_hover(&mut self, hwnd: HWND, inside: bool) {
         let target = if inside { 1. } else { 0. };
@@ -64,6 +65,7 @@ impl App {
             // A 10 ms wake-up plus DWM presentation pacing avoids the 31 ms cadence.
             SetTimer(hwnd, MOTION_TIMER, 10, None);
             self.motion.timer_running = true;
+            InvalidateRect(hwnd, null(), 0);
         }
     }
     pub(super) unsafe fn arm_motion(&mut self, hwnd: HWND) {
@@ -76,8 +78,13 @@ impl App {
         }
         self.pointer = p;
         self.hover = hover;
+        let now = self.now();
+        let toolbar_count = self.toolbar_items().len();
         self.motion
-            .toolbar_hover(self.toolbar_hit(self.dimensions(hwnd).0, p), self.now());
+            .toolbar_hover_count(self.toolbar_hit(self.dimensions(hwnd).0, p), toolbar_count, now);
+        self.motion
+            .search_clear_hover(!self.query.is_empty() && self.clear_hit(hwnd, p), now);
+        self.group_selection_move(hwnd, p);
         let visible = self.visible(hwnd);
         let id = self.hover.and_then(|pos| {
             visible
@@ -168,7 +175,8 @@ impl App {
                     .iter()
                     .find(|i| i.id == id)
                     .and_then(|i| i.group.clone());
-                self.motion.toolbar_hover(None, self.now());
+                let toolbar_count = self.toolbar_items().len();
+                self.motion.toolbar_hover_count(None, toolbar_count, self.now());
                 self.motion.hover(None, p, self.now());
                 self.motion.press(None, self.now());
                 let target = self.group_at(hwnd, p, &id);
@@ -216,6 +224,7 @@ impl App {
         }
         self.motion.press(None, self.now());
         self.motion.hover(None, [0.; 2], self.now());
+        self.motion.search_clear_hover(false, self.now());
         self.motion.group_target(None, self.now());
         self.hover = None;
         self.arm_motion(hwnd);
@@ -308,12 +317,14 @@ impl App {
                 self.pointer_move(hwnd, p);
             }
         }
-        if self.scroll.moving(now) && self.tile_drag.is_none() {
+        if !self.scroll.moving(now) && self.tile_drag.is_none() && self.hover.is_none() && self.pointer[0] >= 0. {
             self.hover_tile(hwnd, self.pointer);
         }
         let active = self.motion.tick(now)
             || self.scroll.moving(now)
-            || self.tile_drag.as_ref().is_some_and(|d| d.active);
+            || self.tile_drag.as_ref().is_some_and(|d| d.active)
+            || self.popup.as_ref().is_some_and(|p| p.moving(now))
+            || self.group_selection_moving(now);
         let timer_active = active || self.resize_drag.is_some();
         if !timer_active {
             KillTimer(hwnd, MOTION_TIMER);
@@ -327,6 +338,7 @@ impl App {
     pub(super) unsafe fn paint_item(
         &mut self,
         dc: HDC,
+        batch: Option<&render::Batch>,
         item: &Item,
         r: [f32; 4],
         scale: f32,
@@ -361,10 +373,18 @@ impl App {
                 }
             }
         }
+        let x_moving = self
+            .motion
+            .nodes
+            .get(&item.id)
+            .is_some_and(|node| node.x.moving(self.paint_time));
         let translating = self.scroll.moving(self.paint_time)
-            || self.motion.nodes.get(&item.id).is_some_and(|node| {
-                node.x.moving(self.paint_time) || node.y.moving(self.paint_time)
-            });
+            || x_moving
+            || self
+                .motion
+                .nodes
+                .get(&item.id)
+                .is_some_and(|node| node.y.moving(self.paint_time));
         let text_has_shadow = crate::contrast::luminance(p.text) > 0.5;
         if !text_has_shadow {
             self.label_shadows.remove(&item.id);
@@ -465,12 +485,24 @@ impl App {
                     let width = size[0] as f32 / self.dpi;
                     let height = size[1] as f32 / self.dpi;
                     let center = (r[0] + r[2]) * 0.5;
+                    let left = if x_moving {
+                        center - width * 0.5
+                    } else {
+                        (((r[0] + r[2]) * self.dpi - size[0] as f32) * 0.5).round() / self.dpi
+                    };
                     let rect = [
-                        center - width * 0.5,
+                        left,
                         r[1] - pad,
-                        center + width * 0.5,
+                        left + width,
                         r[1] - pad + height,
                     ];
+                    if !resizing {
+                        if let Some(b) = batch {
+                            if b.blit(image, rect, !translating) {
+                                return;
+                            }
+                        }
+                    }
                     let canvas = Canvas::new(dc, self.dpi);
                     if resizing {
                         canvas.clipped_image(
@@ -687,7 +719,7 @@ impl App {
                     {
                         count += 1;
                     }
-                    let x = (16 + col as i32 * cell) as f32;
+                    let x = ((16 + col as i32 * cell) as f32 * self.dpi).round() / self.dpi;
                     let y = (top + screen_row as i32 * row) as f32 - scroll;
                     if y + (row as f32) < (top - 14) as f32 || y > bottom {
                         col += count;
@@ -699,17 +731,25 @@ impl App {
                         x + cell as f32 * count as f32 - 6.,
                         y + row as f32 - 4.,
                     ];
-                    if self.dock.opacity < 100. {
+                    if self.dock.opacity < 100. || crate::glass::liquid_glass() {
                         if let Some(background) = &self.background {
                             background.restore_glass_card(dc, r, 20.);
                         }
                     }
-                    let canvas = Canvas::new(dc, self.dpi);
-                    canvas.group_surface_live(r, 20., self.resize_drag.is_some());
-                    let amount = self.motion.group_alpha(&group, now);
-                    if amount > 0.001 {
-                        canvas.round(r, 20., accent, (amount * 46.) as u8, false, false);
-                        canvas.round(r, 20., accent, (amount * 205.) as u8, true, false);
+                    let amount = if self.scroll.moving(now) {
+                        0.
+                    } else {
+                        self.motion.group_alpha(&group, now)
+                    };
+                    if self.resize_drag.is_none() && amount <= 0.001 && batch.group_surface(r, 20., !self.scroll.moving(now)) {
+                        // Blitted directly via batch
+                    } else {
+                        let canvas = Canvas::new(dc, self.dpi);
+                        canvas.group_surface_live(r, 20., self.resize_drag.is_some());
+                        if amount > 0.001 {
+                            canvas.round(r, 20., accent, (amount * 46.) as u8, false, false);
+                            canvas.round(r, 20., accent, (amount * 205.) as u8, true, false);
+                        }
                     }
                 }
                 col += count;
@@ -738,7 +778,14 @@ impl App {
             let visual = self.motion.visual(id, *target, now);
             let [x, content_y] = visual.position;
             let y = content_y - scroll;
-            if y + (row as f32) < (top - 14) as f32 || y > bottom {
+            let offscreen = y + (row as f32) < (top - 14) as f32 || y > bottom;
+            if offscreen
+                && (self.scroll.moving(now)
+                    || self.resize_drag.is_some()
+                    || pos >= visible.len()
+                    || self.dock.items[visible[pos]].catalog
+                    || self.tile_cache.contains_key(id))
+            {
                 continue;
             }
             let r = [x, y, x + cell as f32 - 6., y + row as f32 - 4.];
@@ -751,36 +798,46 @@ impl App {
             );
             p.text = ink;
             p.muted = muted;
-            let c = Canvas::new(dc, self.dpi);
             let selected = self.keyboard_selection && self.selected == pos;
-            let hover = if self.resize_drag.is_some() {
+            let scrolling = self.scroll.moving(now);
+            let hover = if self.resize_drag.is_some() || scrolling {
                 0.
             } else {
                 visual.hover.max(if selected { 1. } else { 0. })
             };
-            if hover > 0.001 {
-                c.hover_surface(r, 20., hover, self.dock.light);
-                c.glow(
-                    r,
-                    20.,
-                    visual.pointer,
-                    if self.dock.light { 0xffffff } else { p.text },
-                    (visual.hover * if self.dock.light { 28. } else { 40. }) as u8,
-                );
-            }
-            if visual.launch > 0.001 {
-                c.round(r, 20., accent, (visual.launch * 30.) as u8, false, false);
-                c.round(r, 20., accent, (visual.launch * 170.) as u8, true, false);
-                c.glow(
-                    r,
-                    20.,
-                    [(r[0] + r[2]) / 2., r[1] + 30.],
-                    accent,
-                    (visual.launch * 110.) as u8,
-                );
+            if hover > 0.001 || visual.launch > 0.001 {
+                let c = Canvas::new(dc, self.dpi);
+                if hover > 0.001 {
+                    let bright = self.dock.light || crate::contrast::luminance(p.text) < 0.5;
+                    c.hover_surface(r, 20., hover, bright);
+                    c.glow(
+                        r,
+                        20.,
+                        visual.pointer,
+                        0xffffff,
+                        (visual.hover * if bright { 34. } else { 42. }) as u8,
+                    );
+                }
+                if visual.launch > 0.001 {
+                    c.round(r, 20., accent, (visual.launch * 30.) as u8, false, false);
+                    c.round(r, 20., accent, (visual.launch * 170.) as u8, true, false);
+                    c.glow(
+                        r,
+                        20.,
+                        [(r[0] + r[2]) / 2., r[1] + 30.],
+                        accent,
+                        (visual.launch * 110.) as u8,
+                    );
+                }
             }
             if id == "__add" {
-                let half = self.dock.icon_size as f32 * (1. + visual.hover * 0.04) / 2.;
+                let _add_alpha = if self.dock.opacity < 100. && scrolling {
+                    render::AlphaBatch::new(dc, self.dpi)
+                } else {
+                    None
+                };
+                let c = Canvas::new(dc, self.dpi);
+                let half = self.dock.icon_size as f32 * visual.scale * (1. + hover * 0.04) / 2.;
                 let center = (r[0] + r[2]) / 2.;
                 let cy = y + 8. + self.dock.icon_size as f32 / 2.;
                 let add = [center - half, cy - half, center + half, cy + half];
@@ -789,7 +846,7 @@ impl App {
                     add,
                     13.,
                     p.text,
-                    (90. + visual.hover * 60.) as u8,
+                    (90. + hover * 60.) as u8,
                     true,
                     true,
                 );
@@ -821,23 +878,24 @@ impl App {
             let landing = self.motion.landing.as_ref().is_some_and(|l| l.id == *id);
             if dragged || landing {
                 if dragged {
+                    let c = Canvas::new(dc, self.dpi);
                     c.round(r, 20., p.text, 13, false, false);
                     c.round(r, 20., p.text, 66, true, true);
                 }
                 continue;
             }
             let item = self.dock.items[visible[pos]].clone();
-            drop(c);
             self.paint_item(
                 dc,
+                Some(&batch),
                 &item,
                 r,
-                if self.group_selection.is_some() {
+                if self.group_selection.is_some() || scrolling {
                     1.
                 } else {
                     visual.scale
                 },
-                if self.group_selection.is_some() {
+                if self.group_selection.is_some() || scrolling {
                     0.
                 } else {
                     visual.lift
@@ -845,12 +903,16 @@ impl App {
                 false,
                 0.,
             );
-            self.paint_group_checkbox(dc, &item.id, r);
+            if !offscreen {
+                self.paint_group_checkbox(dc, &item.id, r);
+            }
         }
         drop(batch);
         if self.motion.tick(now)
             || self.scroll.moving(now)
             || self.tile_drag.as_ref().is_some_and(|d| d.active)
+            || self.popup.as_ref().is_some_and(|p| p.moving(now))
+            || self.group_selection_moving(now)
         {
             self.ensure_motion_timer(hwnd);
         }
@@ -885,6 +947,7 @@ impl App {
             if let Some(item) = self.dock.items.iter().find(|i| i.id == id).cloned() {
                 self.paint_item(
                     dc,
+                    None,
                     &item,
                     [x, y, x + cell as f32 - 6., y + row as f32 - 4.],
                     scale,

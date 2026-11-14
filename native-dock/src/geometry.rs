@@ -11,32 +11,44 @@ pub struct DockHeader {
     pub grid_top: i32,
 }
 pub fn dock_header(width: i32, has_query: bool) -> DockHeader {
+    dock_header_with_toolbar(width, has_query, 5)
+}
+pub fn dock_header_with_toolbar(width: i32, has_query: bool, toolbar_count: usize) -> DockHeader {
+    let count = toolbar_count.max(2);
     let compact = width < 440;
-    let step = if width < 224 { 28. } else { 39. };
+    let step = if compact {
+        if width < 224 || count > 6 { 28. } else { 39. }
+    } else if (width - 140) as f32 >= count as f32 * 39. {
+        39.
+    } else {
+        30.
+    };
+    let toolbar_x = if compact {
+        (width as f32 - step * (count - 1) as f32) * 0.5
+    } else {
+        width as f32 - 40. - (count - 1) as f32 * step
+    };
     DockHeader {
         compact,
         toolbar_step: step,
-        toolbar_x: if compact {
-            (width as f32 - step * 4.) * 0.5
-        } else {
-            (width - 196) as f32
-        },
+        toolbar_x,
         toolbar_y: if compact { 77. } else { 37. },
-        clear_x: (width - if compact { 38 } else { 240 }) as f32,
-        edit_width: (width
-            - if compact {
-                if has_query {
-                    112
-                } else {
-                    88
-                }
-            } else if has_query {
-                308
-            } else {
-                282
-            })
+        clear_x: if compact {
+            (width - 38) as f32
+        } else {
+            toolbar_x - 44.
+        },
+        edit_width: (if compact {
+            width - if has_query { 112 } else { 88 }
+        } else {
+            toolbar_x as i32 - if has_query { 112 } else { 86 }
+        })
         .max(40),
-        placeholder_right: (width - if compact { 32 } else { 232 }) as f32,
+        placeholder_right: if compact {
+            (width - 32) as f32
+        } else {
+            toolbar_x - 36.
+        },
         grid_top: if compact { 110 } else { 80 },
     }
 }

@@ -58,6 +58,7 @@ struct State {
     hover: Option<usize>,
     error: String,
     settings: Option<crate::settings_ui::Host>,
+    local_glass: Option<Glass>,
     frost: Option<render::Image>,
     frost_key: String,
     theme_texture: Option<(String, render::Image)>,
@@ -75,7 +76,8 @@ impl Host {
         inspect: bool,
         smoke: bool,
     ) -> Result<Self, String> {
-        let config = Config::load(root)?;
+        let mut config = Config::load(root)?;
+        config.time_zone = "local".into();
         let zone = zone(&config.time_zone)?;
         let location_label = model::location_label(&config.time_zone);
         let class = wide("LumenNativeClockWindow");
@@ -133,6 +135,7 @@ impl Host {
             hover: None,
             error: String::new(),
             settings: None,
+            local_glass: None,
             frost: None,
             frost_key: String::new(),
             theme_texture: None,
@@ -223,7 +226,10 @@ impl Host {
         s.paint();
     }
     pub unsafe fn refresh(&mut self) {
-        let s = self.state.borrow();
+        let mut s = self.state.borrow_mut();
+        if let Some(local) = &mut s.local_glass {
+            local.refresh();
+        }
         if IsWindowVisible(s.hwnd) != 0 {
             if !s.moving && s.background_key() != s.key {
                 InvalidateRect(s.hwnd, null(), 0);
@@ -356,7 +362,7 @@ impl State {
         let mut r = zeroed();
         GetWindowRect(self.hwnd, &mut r);
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             r.left,
             r.top,
             r.right - r.left,
@@ -366,85 +372,31 @@ impl State {
             self.config.palette,
             self.config.frosted_glass,
             self.config.tint,
-            self.config.opacity,
             self.config.frost_strength,
             self.config.blur,
             self.glass.borrow().revision(),
             crate::fusion::revision(self.hwnd)
         )
     }
-    /// Sample the shared SHARP source, then build only this viewport's local frost.
-    /// Never mutate the common Glass blur. Reuse texture while live-resizing.
+    /// Sample the shared wallpaper source via a local Glass instance, matching
+    /// the other widgets' frosted glass + liquid glass pipeline.
     unsafe fn draw_frost(&mut self, dc: HDC, w: i32, h: i32) {
-        let mut pos = zeroed();
-        GetWindowRect(self.hwnd, &mut pos);
-        let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
-            pos.left,
-            pos.top,
+        self.frost = None;
+        self.frost_key.clear();
+        let glass = self.local_glass.get_or_insert_with(|| {
+            let mut g = Glass::new(self.config.blur, self.dpi);
+            g.refresh();
+            g
+        });
+        glass.refresh();
+        glass.set_blur(self.config.blur, self.dpi);
+        glass.draw_blended(
+            dc,
+            self.hwnd,
             w,
             h,
-            self.dpi,
-            self.config.blur,
-            self.config.frost_strength,
-            self.glass.borrow().revision()
+            (self.config.frost_strength * 2.55).round() as u8,
         );
-        if self.frost.is_none() || (!self.moving && self.frost_key != key) {
-            let pad = (self.config.blur * self.dpi * 3.).ceil().min(240.) as i32;
-            let (sw, sh) = (w + pad * 2, h + pad * 2);
-            if let Some(sample) = Buffer::plain(sw, sh, self.dpi) {
-                let brush = CreateSolidBrush(self.surface_color());
-                let r = RECT {
-                    left: 0,
-                    top: 0,
-                    right: sw,
-                    bottom: sh,
-                };
-                FillRect(sample.dc, &r, brush);
-                DeleteObject(brush);
-                SetViewportOrgEx(sample.dc, pad, pad, null_mut());
-                self.glass
-                    .borrow()
-                    .draw_blended(sample.dc, self.hwnd, sw, sh, 0);
-                SetViewportOrgEx(sample.dc, 0, 0, null_mut());
-                let mut source = sample.snapshot();
-                for p in source.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                    p[3] = 255;
-                }
-                if let Some(sharp) = image::RgbaImage::from_raw(sw as u32, sh as u32, source) {
-                    let blurred = if self.config.blur > 0. {
-                        image::imageops::blur(&sharp, (self.config.blur * self.dpi).max(0.1))
-                    } else {
-                        sharp.clone()
-                    };
-                    let mix = self.config.frost_strength / 100.;
-                    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-                    for y in 0..h {
-                        for x in 0..w {
-                            let a = sharp.get_pixel((x + pad) as u32, (y + pad) as u32);
-                            let b = blurred.get_pixel((x + pad) as u32, (y + pad) as u32);
-                            let l =
-                                0.2126 * b[0] as f32 + 0.7152 * b[1] as f32 + 0.0722 * b[2] as f32;
-                            for ch in 0..3 {
-                                let boost = (l + (b[ch] as f32 - l) * 1.28) * 0.92;
-                                pixels.push(
-                                    (a[ch] as f32 * (1. - mix) + boost.clamp(0., 255.) * mix)
-                                        .round() as u8,
-                                );
-                            }
-                            pixels.push(255);
-                        }
-                    }
-                    self.frost = render::Image::from_rgba(w as u32, h as u32, pixels);
-                    self.frost_key = key;
-                }
-            }
-        }
-        if let Some(image) = &self.frost {
-            Canvas::new(dc, self.dpi)
-                .image(image, [0., 0., w as f32 / self.dpi, h as f32 / self.dpi]);
-        }
     }
     /// Cache time/date/typography once per displayed second (or minute).
     /// Animation frames draw only the vector emblem over this native-size sprite.
@@ -530,13 +482,19 @@ impl State {
             return;
         };
         let (w, h) = self.dimensions();
-        let pane = [4., 4., w - 4., h - 4.];
+        let fused = crate::fusion::fused(self.hwnd);
+        let pane = if fused {
+            [0., 0., w, h]
+        } else {
+            [4., 4., w - 4., h - 4.]
+        };
+        let radius = if fused { 0. } else { 34. };
         let key = self.background_key();
         let reusable = self
             .background
             .as_ref()
             .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
-        if !reusable || (!self.moving && key != self.key) {
+        if !reusable || key != self.key {
             let brush = CreateSolidBrush(self.surface_color());
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
@@ -577,7 +535,7 @@ impl State {
                 } else if !crate::surface::managed(&self.config.palette) {
                     c.round(
                         pane,
-                        34.,
+                        radius,
                         self.surface_color(),
                         (tint * 2.55).round() as u8,
                         false,
@@ -585,7 +543,7 @@ impl State {
                     );
                 }
                 crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
-                c.coating(pane, 34.);
+                c.coating(pane, radius);
                 if let Some(overlay) = Canvas::pane_overlay(
                     [r.right as u32, r.bottom as u32],
                     self.dpi,
@@ -594,11 +552,11 @@ impl State {
                 ) {
                     c.image(&overlay, [0., 0., w, h]);
                 }
-                c.widget_corner_reflection(pane, 34., light);
+                c.widget_corner_reflection_for(self.hwnd, pane, radius, light);
             }
             frame.bevel_for(self.hwnd);
             let l = crate::contrast::sample(frame.dc, self.dpi, [20., 20., w - 20., h - 20.]);
-            (self.ink, self.muted) = crate::contrast::inks(l, Some(self.ink));
+            (self.ink, self.muted) = crate::contrast::inks(l, None);
             let Some(bg) = self
                 .background
                 .take()
@@ -614,7 +572,7 @@ impl State {
             frame.copy_from(self.background.as_ref().unwrap().dc);
         }
         let batch = render::AlphaBatch::new(frame.dc, self.dpi);
-        frame.background_alpha((self.config.opacity * 2.55).round() as u8);
+        frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55).round() as u8);
         {
             let c = Canvas::new(frame.dc, self.dpi);
             self.paint_content(frame.dc, w, h);
@@ -738,6 +696,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.settings_changed();
             0
         }
+        WM_TIMER if wp == 99 => {
+            KillTimer(hwnd, 99);
+            s.save();
+            0
+        }
         WM_TIMER if wp == ANIMATION => {
             if afterglow::interval(
                 &s.config,
@@ -767,6 +730,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.key.clear();
             s.frost_key.clear();
             s.glass.borrow_mut().refresh();
+            if let Some(local) = &mut s.local_glass {
+                local.refresh();
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -819,6 +785,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             KillTimer(hwnd, TICK);
             drop(s);
             DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            if (s.config.frosted_glass || crate::glass::liquid_glass())
+                && crate::glass::move_paint_due(hwnd)
+            {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
         }
         WM_SIZE => {
             if wp as u32 == SIZE_MINIMIZED {
@@ -892,6 +866,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             s.pressed = None;
+            if s.moving {
+                s.moving = false;
+                s.key.clear();
+                s.frost_key.clear();
+            }
             if msg == WM_CANCELMODE {
                 ReleaseCapture();
             }

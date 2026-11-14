@@ -31,7 +31,12 @@ export function playerArguments(profile: string, url = 'https://music.youtube.co
   ]
 }
 
-export interface MusicWindowHost { show(): void; hide(): void; destroy(): void }
+export interface MusicWindowHost { show(): void; hide(): void; refreshIcon?(): void; destroy(): void }
+export function signInArguments(profile: string): string[] {
+  return [`--user-data-dir=${profile}`, '--profile-directory=LumenMusic',
+    '--no-first-run', '--no-default-browser-check', '--disable-background-mode',
+    '--new-window', 'https://music.youtube.com/']
+}
 
 /** Exactly one music page. Showing/hiding its frame never creates a target. */
 export class MusicPlayer {
@@ -49,6 +54,8 @@ export class MusicPlayer {
   private playbackRequest = 0
   private stopped = false
   private closing: Promise<void> | null = null
+  private signingIn: Promise<void> | null = null
+  private browserExit: Promise<void> | null = null
   private resume = { videoId: '', position: 0 }
   current: PlayerPageState | null = null
 
@@ -82,6 +89,7 @@ export class MusicPlayer {
   get lastVideoId(): string { return this.resume.videoId }
 
   async ensure(): Promise<void> {
+    if (this.signingIn) throw new Error('Finish signing in, close the sign-in browser window, then press Play.')
     if (this.launching) return this.launching
     if (this.ready) return
     if (!this.launching) {
@@ -93,6 +101,51 @@ export class MusicPlayer {
       })().finally(() => { this.launching = null })
     }
     return this.launching
+  }
+
+  async signIn(): Promise<void> {
+    if (this.signingIn) throw new Error('The sign-in browser is already open. Finish signing in and close it before pressing Play.')
+    if (this.launching) await this.launching.catch(() => {})
+    const candidates = playerBrowserCandidates()
+    if (this.identity.browser) candidates.sort((a, b) => Number(b.browser === this.identity.browser) - Number(a.browser === this.identity.browser))
+    const found = candidates.find(candidate => fs.existsSync(candidate.executable))
+    if (!found) throw new Error('Install Chrome or Edge to sign in to Music.')
+    const exited = this.browserExit
+    this.stop()
+    await this.closing
+    await exited // Profile ownership ends at process exit, not the CDP reply.
+    const profile = path.join(this.directory, 'music-player', found.browser)
+    fs.mkdirSync(profile, { recursive: true })
+    this.identity.browser = found.browser
+    this.save()
+    const child = spawn(found.executable, signInArguments(profile), { stdio: 'ignore', windowsHide: false })
+    const finished = new Promise<void>(resolve => {
+      child.once('error', () => resolve())
+      child.once('exit', () => resolve())
+    })
+    this.signingIn = finished
+    void finished.then(() => {
+      if (this.signingIn !== finished) return
+      this.signingIn = null
+      this.changed(null, 'Sign-in browser closed. Press Play to reconnect Music.')
+    })
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve)
+      child.once('error', reject)
+    })
+    this.changed(null, 'Sign in in the browser, close that window, then press Play. Your Music profile is kept.')
+  }
+  async signOut(): Promise<void> {
+    await this.ensure()
+    // This process uses only Music's isolated user-data-dir, never the user's
+    // everyday browser profile. Drop its authentication cookies and reload.
+    await this.pipe!.send('Network.clearBrowserCookies', {}, this.playbackSession)
+    await this.pipe!.send('Page.navigate', { url: 'https://music.youtube.com/' }, this.playbackSession)
+    if (this.current) {
+      this.current = { ...this.current, signedIn: false, authKnown: true, available: false, playing: false,
+        canNext: false, canPrevious: false, canSeek: false }
+      this.changed(this.current)
+    }
   }
 
   private async launch(): Promise<void> {
@@ -136,6 +189,10 @@ export class MusicPlayer {
       '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows']
     fs.mkdirSync(profile, { recursive: true })
     const child = spawn(found.executable, args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: false })
+    this.browserExit = new Promise(resolve => {
+      child.once('exit', () => resolve())
+      child.once('error', () => resolve())
+    })
     await new Promise<void>((resolve, reject) => {
       child.once('error', reject)
       child.once('spawn', resolve)
@@ -181,7 +238,8 @@ export class MusicPlayer {
       this.host = this.createHost?.(this.pid, { top: Math.round(dimensions.top), side: Math.round(dimensions.side) }, () => this.stop()) || null
       bootstrap.close()
       await pipe.send('Page.navigate', { url: this.resume.videoId ? `https://music.youtube.com/watch?v=${this.resume.videoId}` : 'https://music.youtube.com/' }, this.playbackSession)
-      this.timer = setInterval(() => { void this.poll() }, 1000)
+      this.host?.refreshIcon?.()
+      this.timer = setInterval(() => { this.host?.refreshIcon?.(); void this.poll() }, 1000)
       void this.poll()
     } catch (error) {
       bootstrap.close()
@@ -236,28 +294,21 @@ export class MusicPlayer {
     try {
       const navigation = new URL(`https://music.youtube.com/watch?v=${videoId}`)
       if (this.current?.playlistId) navigation.searchParams.set('list', this.current.playlistId)
-      let queueSelection = false
       if (this.current?.videoId !== videoId) {
         let selected = false
         if (this.current?.queue.some((item) => item.videoId === videoId)) {
           selected = await this.evaluate(this.playbackSession, musicPageSelect(videoId), true)
         }
-        queueSelection = selected
         if (!selected) {
           await this.pipe!.send('Page.navigate', { url: navigation.href }, this.playbackSession)
         }
       }
       let state: PlayerPageState | null = null
       const until = Date.now() + 25_000
-      const selectionTime = Date.now()
       while (Date.now() < until) {
         if (request !== this.playbackRequest) return
         try { state = await this.evaluate(this.playbackSession, MUSIC_PAGE_STATE) } catch { /* document navigation */ }
         if (state?.available && state.videoId === videoId) break
-        if (queueSelection && state?.videoId !== videoId && Date.now() - selectionTime > 1500) {
-          queueSelection = false
-          await this.pipe!.send('Page.navigate', { url: navigation.href }, this.playbackSession)
-        }
         await new Promise((resolve) => setTimeout(resolve, 250))
       }
       if (!state?.available || state.videoId !== videoId) throw new Error('This track did not load. Browse music to check sign-in or playback availability.')
@@ -289,9 +340,15 @@ export class MusicPlayer {
   private async publish(): Promise<void> {
     const state = await this.evaluate(this.playbackSession, MUSIC_PAGE_STATE) as PlayerPageState | null
     if (!state || this.stopped) return
+    state.authKnown = typeof state.signedIn === 'boolean'
+    state.signedIn = state.signedIn ?? this.current?.signedIn ?? false
     // A queue transition briefly clears the page before its next track loads.
     // Keep the existing cover strip until a usable replacement is available.
-    if (this.current?.title && (!state.title || (state.videoId !== this.current.videoId && !state.available))) return
+    if (this.current?.title && (!state.title || (state.videoId !== this.current.videoId && !state.available))) {
+      this.current = { ...this.current, signedIn: state.signedIn, authKnown: state.authKnown }
+      this.changed(this.current)
+      return
+    }
     this.current = state
     if (/^[\w-]{11}$/.test(state.videoId) && state.available) {
       const changed = this.resume.videoId !== state.videoId

@@ -1,6 +1,8 @@
 //! Nine content layouts, drawn with the dock's antialiased native canvas.
 #[path = "layout.rs"]
 mod layout;
+#[path = "responsive.rs"]
+mod responsive;
 use super::model::*;
 use crate::render::Canvas;
 use windows_sys::Win32::Foundation::SYSTEMTIME;
@@ -40,7 +42,7 @@ impl Face<'_> {
         ]
     }
     fn text(&self, t: &str, r: [f32; 4], size: f32, bold: bool, color: u32, align: i32) {
-        if self.s < 0.45 && size < 20. && size * self.s < 6. {
+        if size * self.s < 5.5 {
             return;
         }
         if self.mono {
@@ -59,7 +61,7 @@ impl Face<'_> {
         color: u32,
         spacing: f32,
     ) {
-        if self.s < 0.45 && size * self.s < 6. {
+        if size * self.s < 5.5 {
             return;
         }
         let mut x = r[0];
@@ -93,6 +95,76 @@ impl Face<'_> {
     fn round(&self, r: [f32; 4], radius: f32, color: u32, a: u8) {
         self.c
             .round(self.r(r), radius * self.s, color, a, false, false);
+    }
+    fn fit_digital(&self, t: &SYSTEMTIME, cfg: &Config, r: [f32; 4], max_size: f32) -> f32 {
+        let bw = (r[2] - r[0]).max(10.);
+        let bh = (r[3] - r[1]).max(10.);
+        let mut size = max_size.min(bh * 0.92);
+        let digits = digital(t, cfg.hour12);
+        let is_display = ["lumen", "sunset", "neon"].contains(&cfg.theme.as_str());
+        let probe = 40.;
+        let mut w = if is_display {
+            self.c.measure_clock_display(&digits, probe) / probe
+        } else if self.mono {
+            self.c.measure_clock_monospace(&digits, probe) / probe
+        } else {
+            self.c.measure_clock_label(&digits, probe, false) / probe
+        };
+        if cfg.hour12 {
+            w += 0.72;
+        }
+        if w > 0.1 {
+            size = size.min(bw / w);
+        }
+        size.max(10.)
+    }
+    fn digital_in(&self, t: &SYSTEMTIME, cfg: &Config, r: [f32; 4], size: f32, align: i32) {
+        let digits = digital(t, cfg.hour12);
+        let is_display = ["lumen", "sunset", "neon"].contains(&cfg.theme.as_str());
+        let ampm = if t.wHour < 12 { "AM" } else { "PM" };
+        let ampm_sz = (size * 0.24).max(7.5);
+        let measure = |s: f32| {
+            if is_display {
+                self.c.measure_clock_display(&digits, s)
+            } else if self.mono {
+                self.c.measure_clock_monospace(&digits, s)
+            } else {
+                self.c.measure_clock_label(&digits, s, false)
+            }
+        };
+        if cfg.hour12 {
+            let dw = measure(size);
+            let gap = size * 0.02;
+            let aw = ampm_sz * 2.4;
+            let bw = (r[2] - r[0]).max(10.);
+            let start = match align {
+                1 => r[0] + ((bw - (dw + gap + aw)).max(0.)) / 2.,
+                2 => (r[2] - dw - gap - aw).max(r[0]),
+                _ => r[0],
+            };
+            let d_rect = [start, r[1], (start + dw + 6.).min(r[2] - aw).max(start + 10.), r[3]];
+            if is_display {
+                self.c.text_clock_display(&digits, self.r(d_rect), size * self.s, self.ink, 0, false);
+            } else {
+                self.text(&digits, d_rect, size, false, self.ink, 0);
+            }
+            let ax = (start + dw + gap).min((r[2] - aw).max(r[0]));
+            let cy = (r[1] + r[3]) / 2.;
+            let ampm_cy = cy + (size - ampm_sz) * 0.34;
+            self.text(
+                ampm,
+                [ax, ampm_cy - ampm_sz * 0.85, r[2], ampm_cy + ampm_sz * 0.85],
+                ampm_sz,
+                true,
+                self.muted,
+                0,
+            );
+        } else if is_display {
+            self.c
+                .text_clock_display(&digits, self.r(r), size * self.s, self.ink, align, false);
+        } else {
+            self.text(&digits, r, size, false, self.ink, align);
+        }
     }
     fn digital(&self, t: &SYSTEMTIME, cfg: &Config, r: [f32; 4], size: f32, align: i32) {
         let r = if cfg.hour12 && align == 1 {
@@ -129,38 +201,75 @@ impl Face<'_> {
         }
     }
     fn track(&self, y: f32, f: f32) {
-        self.round([26., y, 314., y + 4.], 2., self.ink, 35);
+        self.track_in([26., y, 314., y + 4.], f);
+    }
+    fn track_in(&self, r: [f32; 4], f: f32) {
+        let h = (r[3] - r[1]).max(2.);
+        let rad = h / 2.;
+        let w = (r[2] - r[0]).max(1.);
+        self.round(r, rad, self.ink, 35);
         self.round(
-            [26., y, 26. + 288. * f.clamp(0., 1.), y + 4.],
-            2.,
+            [r[0], r[1], r[0] + w * f.clamp(0., 1.), r[3]],
+            rad,
             self.accent,
             230,
         );
     }
     fn meter(&self, label: &str, value: &str, y: f32, f: f32, count: usize) {
+        self.meter_in(label, value, [26., y, 314., y + 31.], f, count);
+    }
+    fn meter_in(&self, label: &str, value: &str, r: [f32; 4], f: f32, count: usize) {
         let accent = match label {
             "This hour" => rgb(41, 197, 143),
             "This minute" => rgb(86, 198, 231),
             _ => self.accent,
         };
-        self.text(label, [26., y, 220., y + 18.], 11., false, self.muted, 0);
-        self.text(value, [180., y, 314., y + 18.], 11., true, self.ink, 2);
-        let width = 288. / count as f32;
-        for i in 0..count {
+        let w = (r[2] - r[0]).max(20.);
+        let h = (r[3] - r[1]).max(18.);
+        let label_sz = (h * 0.34).clamp(8., 11.);
+        let label_h = (label_sz + 5.).min(h * 0.56);
+        self.text(
+            label,
+            [r[0], r[1], r[0] + w * 0.62, r[1] + label_h],
+            label_sz,
+            false,
+            self.muted,
+            0,
+        );
+        self.text(
+            value,
+            [r[0] + w * 0.45, r[1], r[2], r[1] + label_h],
+            label_sz,
+            true,
+            self.ink,
+            2,
+        );
+        let segs = if w < 140. {
+            count.min(16)
+        } else if w < 200. {
+            count.min(22)
+        } else {
+            count
+        };
+        let bar_top = r[1] + label_h + 3.;
+        let bar_bot = r[3].max(bar_top + 4.);
+        let width = w / segs as f32;
+        let gap = (width * 0.25).clamp(1.5, 3.);
+        for i in 0..segs {
             self.round(
                 [
-                    26. + i as f32 * width,
-                    y + 24.,
-                    26. + (i + 1) as f32 * width - 3.,
-                    y + 31.,
+                    r[0] + i as f32 * width,
+                    bar_top,
+                    (r[0] + (i + 1) as f32 * width - gap).max(r[0] + i as f32 * width + 1.),
+                    bar_bot,
                 ],
                 2.,
-                if (i as f32) < (f * count as f32).floor() {
+                if (i as f32) < (f * segs as f32).floor() {
                     accent
                 } else {
                     self.ink
                 },
-                if (i as f32) < (f * count as f32).floor() {
+                if (i as f32) < (f * segs as f32).floor() {
                     240
                 } else {
                     32
@@ -179,35 +288,43 @@ impl Face<'_> {
                 ],
                 self.ink,
                 if i % 5 == 0 { 200 } else { 75 },
-                if i % 5 == 0 { 1.8 } else { 0.8 },
+                if i % 5 == 0 {
+                    (r * 0.028).clamp(1.2, 2.0)
+                } else {
+                    (r * 0.014).clamp(0.7, 1.0)
+                },
             );
         }
-        for (n, x, y) in [
-            ("12", cx, cy - r * 0.67),
-            ("3", cx + r * 0.67, cy),
-            ("6", cx, cy + r * 0.67),
-            ("9", cx - r * 0.67, cy),
-        ] {
-            self.text(
-                n,
-                [x - 10., y - 8., x + 10., y + 8.],
-                r * 0.12,
-                true,
-                self.muted,
-                1,
-            );
+        let num_sz = r * 0.14;
+        if num_sz * self.s >= 5.5 {
+            for (n, x, y) in [
+                ("12", cx, cy - r * 0.67),
+                ("3", cx + r * 0.67, cy),
+                ("6", cx, cy + r * 0.67),
+                ("9", cx - r * 0.67, cy),
+            ] {
+                let pad = num_sz * 1.1;
+                self.text(
+                    n,
+                    [x - pad, y - pad * 0.8, x + pad, y + pad * 0.8],
+                    num_sz,
+                    true,
+                    self.muted,
+                    1,
+                );
+            }
         }
         for (angle, len, width, color) in [
             (
                 (t.wHour % 12) as f32 * 30. + t.wMinute as f32 * 0.5,
                 r * 0.48,
-                3.,
+                (r * 0.048).clamp(1.8, 3.2),
                 self.ink,
             ),
             (
                 t.wMinute as f32 * 6. + t.wSecond as f32 * 0.1,
                 r * 0.75,
-                2.,
+                (r * 0.032).clamp(1.3, 2.2),
                 self.ink,
             ),
         ] {
@@ -220,10 +337,11 @@ impl Face<'_> {
                 &[point(a, -r * 0.17), point(a, r * 0.8)],
                 rgb(231, 91, 75),
                 245,
-                1.,
+                (r * 0.018).clamp(0.9, 1.3),
             );
         }
-        self.round([cx - 3., cy - 3., cx + 3., cy + 3.], 3., self.ink, 255);
+        let pin = (r * 0.055).clamp(2.2, 3.4);
+        self.round([cx - pin, cy - pin, cx + pin, cy + pin], pin, self.ink, 255);
     }
 }
 pub fn draw(canvas: &Canvas, cfg: &Config, t: &SYSTEMTIME, w: f32, h: f32, ink: u32, muted: u32) {
@@ -239,7 +357,12 @@ pub(super) fn draw_content(
     muted: u32,
     emblem: bool,
 ) {
-    let (x, y, s) = layout::frame(w, h);
+    let mode = layout::mode(w, h);
+    let (x, y, s) = if mode == layout::Mode::Classic {
+        layout::frame(w, h)
+    } else {
+        (0., 0., 1.)
+    };
     let accent = if crate::contrast::luminance(ink) < 0.5 {
         rgb(62, 102, 69)
     } else {
@@ -275,17 +398,13 @@ pub(super) fn draw_content(
     let date = date(t);
     let seconds = format!("{:02} seconds", t.wSecond);
     let progress = progress(t);
+    if mode != layout::Mode::Classic {
+        responsive::draw(&f, cfg, t, mode, w, h, &date, &zone, progress, emblem);
+        return;
+    }
     match cfg.theme.as_str() {
         "lumen" => {
-            f.text(
-                "A MOMENT FOR YOU",
-                [26., 77., 314., 95.],
-                10.,
-                true,
-                muted,
-                0,
-            );
-            f.digital(t, cfg, [22., 96., 317., 184.], 72., 0);
+            f.digital(t, cfg, [22., 84., 317., 184.], 78., 0);
             f.text(&date, [26., 211., 233., 233.], 12., true, ink, 0);
             f.text(
                 &if cfg.show_seconds {
@@ -303,39 +422,25 @@ pub(super) fn draw_content(
             f.track(288., progress);
         }
         "terminal" => {
-            f.text(
-                "SYSTEM TIME / LIVE",
-                [26., 76., 314., 95.],
-                10.,
-                true,
-                accent,
-                0,
-            );
-            f.digital(t, cfg, [22., 104., 318., 187.], 69., 0);
-            f.text(
-                &if cfg.show_seconds {
-                    format!(":{:02}", t.wSecond)
-                } else {
-                    "──".into()
-                },
-                [26., 207., 104., 250.],
-                32.,
-                false,
-                accent,
-                0,
-            );
-            f.text(
-                if cfg.show_seconds {
-                    "SECONDS"
-                } else {
-                    "TIME SYNCED"
-                },
-                [112., 219., 310., 243.],
-                10.,
-                true,
-                muted,
-                0,
-            );
+            f.digital(t, cfg, [22., 92., 318., 187.], 74., 0);
+            if cfg.show_seconds {
+                f.text(
+                    &format!(":{:02}", t.wSecond),
+                    [26., 207., 104., 250.],
+                    32.,
+                    false,
+                    accent,
+                    0,
+                );
+                f.text(
+                    "SECONDS",
+                    [112., 219., 310., 243.],
+                    10.,
+                    true,
+                    muted,
+                    0,
+                );
+            }
             f.line(&[(26., 277.), (314., 277.)], accent, 100, 1.);
             f.text(
                 &date.to_uppercase(),
@@ -347,8 +452,7 @@ pub(super) fn draw_content(
             );
         }
         "rose" => {
-            f.text("DAY IN MOTION", [26., 66., 314., 85.], 10., true, muted, 0);
-            f.digital(t, cfg, [23., 88., 318., 164.], 65., 0);
+            f.digital(t, cfg, [23., 78., 318., 164.], 70., 0);
             f.meter(
                 "Day elapsed",
                 &format!("{}%", (progress * 100.) as u32),
@@ -424,27 +528,10 @@ pub(super) fn draw_content(
                     t.wSecond as f32 / 60.,
                     30,
                 );
-            } else {
-                f.text(
-                    "TAKE YOUR TIME",
-                    [26., 279., 314., 302.],
-                    10.,
-                    true,
-                    rgb(196, 185, 165),
-                    1,
-                );
             }
         }
         "aurora" => {
-            f.text(
-                "THE PASSING HOURS",
-                [26., 65., 314., 84.],
-                10.,
-                true,
-                muted,
-                0,
-            );
-            f.line(&[(37., 102.), (37., 270.)], ink, 60, 1.);
+            f.line(&[(37., 96.), (37., 270.)], ink, 60, 1.);
             for (i, offset) in [-2, -1, 0, 1, 2].iter().enumerate() {
                 let y = [100., 131., 170., 231., 262.][i];
                 f.line(&[(33., y + 12.), (46., y + 12.)], accent, 200, 1.);
@@ -542,20 +629,12 @@ pub(super) fn draw_content(
             );
         }
         "sunset" => {
-            f.tracked_text(
-                "MAKE TIME FOR TODAY",
-                [26., 75., 314., 94.],
-                8.8,
-                true,
-                ink,
-                1.7,
-            );
             let digits = digital(t, cfg.hour12);
-            let size = 80.;
+            let size = 84.;
             let left = 12.;
             canvas.text_clock_display(
                 &digits,
-                f.r([left, 99., 314., 187.]),
+                f.r([left, 86., 314., 187.]),
                 size * f.s,
                 ink,
                 0,
@@ -566,7 +645,7 @@ pub(super) fn draw_content(
                     left + canvas.measure_clock_display(&digits, size * f.s) / f.s - size * 0.12;
                 f.c.text_light(
                     if t.wHour < 12 { "AM" } else { "PM" },
-                    f.r([end, 142., 314., 187.]),
+                    f.r([end, 132., 314., 187.]),
                     22. * f.s,
                     ink,
                     0,
@@ -585,14 +664,6 @@ pub(super) fn draw_content(
             }
             f.round([26., 282., 314., 284.5], 1.25, ink, 48);
             f.round([26., 282., 26. + 288. * progress, 284.5], 1.25, ink, 235);
-            f.tracked_text(
-                "DAY IN MOTION",
-                [26., 292., 245., 309.],
-                8.,
-                false,
-                ink,
-                1.2,
-            );
             f.text(
                 &format!("{}%", (progress * 100.) as u32),
                 [268., 292., 314., 309.],
@@ -658,30 +729,9 @@ pub(super) fn draw_afterglow_motion(
     h: f32,
     ink: u32,
 ) {
-    let (x, y, scale) = layout::frame(w, h);
-    let rect = [
-        x + 218. * scale,
-        y + 194. * scale,
-        x + 314. * scale,
-        y + 263. * scale,
-    ];
-    super::afterglow::draw(c, rect, cfg, t, ink, ink);
+    super::afterglow::draw(c, responsive::afterglow_emblem_rect(w, h), cfg, t, ink, ink);
 }
 
 pub(super) fn draw_location(c: &Canvas, w: f32, h: f32, label: &str, ink: u32) {
-    let (x, y, s) = layout::frame(w, h);
-    if 12. * s >= 7. && w >= 220. {
-        let f = Face {
-            c,
-            s,
-            x,
-            y,
-            ink,
-            muted: ink,
-            accent: ink,
-            mono: false,
-        };
-        f.round([24.5, 32.5, 27.5, 35.5], 1.5, ink, 170);
-        c.text_medium(label, f.r([34., 21., 246., 47.]), 12. * s, ink, 0);
-    }
+    responsive::draw_location(c, w, h, label, ink);
 }

@@ -26,10 +26,52 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{Controls::WM_MOUSELEAVE, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
+fn image_delete_rect(r: [f32; 4]) -> [f32; 4] {
+    [r[2] - 24., r[1] + 4., r[2] - 4., r[1] + 24.]
+}
+unsafe fn compute_image_rects(
+    note: &model::Note,
+    card_rect: [f32; 4],
+    type_scale: &typography::Metrics,
+    typography: &mut typography::Typography,
+    image_cache: &std::collections::HashMap<String, (u32, u32, crate::render::Image)>,
+    dpi: f32,
+) -> Vec<[f32; 4]> {
+    if note.images.is_empty() {
+        return vec![];
+    }
+    let text = note.plain();
+    let content_x = card_rect[0] + type_scale.left;
+    let text_w = (card_rect[2] - content_x - 16.).max(type_scale.body);
+    let text_lines = if text.trim().is_empty() {
+        0
+    } else {
+        typography.line_count(&text, text_w, dpi, type_scale.body)
+    };
+    let mut img_y = card_rect[1]
+        + type_scale.top
+        + (text_lines as f32) * type_scale.leading
+        + if text.trim().is_empty() { 0. } else { 6. };
+    let mut rects = Vec::with_capacity(note.images.len());
+    for name in &note.images {
+        if let Some((iw, ih, _)) = image_cache.get(name) {
+            if *iw > 0 {
+                let scaled_h = (*ih as f32 / *iw as f32) * text_w;
+                rects.push([content_x, img_y, content_x + text_w, img_y + scaled_h]);
+                img_y += scaled_h + 6.;
+                continue;
+            }
+        }
+        rects.push([0., 0., 0., 0.]);
+    }
+    rects
+}
 const CLASS: &str = "LumenNativeNotesBoard";
 const EVENTS: u32 = WM_APP + 101;
 const KEY: u32 = WM_APP + 102;
 const REDRAW: u32 = WM_APP + 103;
+const EDITOR_HOVER: u32 = WM_APP + 105;
+const EDITOR_FOCUS: u32 = WM_APP + 107;
 const SAVE: usize = 101;
 const ANIMATE: usize = 102;
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +90,13 @@ enum Action {
     Delete(String),
     PickColor(String, usize),
 }
+struct ImageDrag {
+    note_id: String,
+    index: usize,
+    start: [f32; 2],
+    current: [f32; 2],
+    active: bool,
+}
 struct State {
     hwnd: HWND,
     root: PathBuf,
@@ -56,8 +105,12 @@ struct State {
     dpi: f32,
     frame: Option<Buffer>,
     background: Option<Buffer>,
+    header_base: Option<Buffer>,
     list_base: Option<Buffer>,
     background_key: String,
+    header_base_key: String,
+    bg_ink: Option<(u32, u32)>,
+    paint_scroll: Option<f32>,
     shadow: Option<WindowShadow>,
     overlay: Option<(String, crate::render::Image)>,
     editor: Option<editor::Editor>,
@@ -70,7 +123,11 @@ struct State {
     local_glass: Option<Rc<RefCell<Glass>>>,
     pressed: Option<Action>,
     hover: Option<Action>,
+    card_hovers: std::collections::HashMap<String, crate::motion::Tween>,
+    editor_hovered: bool,
     scroll: crate::motion::SmoothScroll,
+    scroll_clock: Option<crate::motion::FrameClock>,
+    frame_queued: bool,
     started: std::time::Instant,
     moving: bool,
     scrollbar_drag: Option<f32>,
@@ -82,6 +139,10 @@ struct State {
     ink: Option<u32>,
     typography: typography::Typography,
     button_lenses: lenses::Lenses,
+    image_cache: std::collections::HashMap<String, (u32, u32, crate::render::Image)>,
+    card_cache: std::collections::HashMap<String, (String, crate::render::Image)>,
+    selected_image: Option<(String, usize)>,
+    image_drag: Option<ImageDrag>,
 }
 pub struct Host {
     state: Box<RefCell<State>>,
@@ -180,8 +241,12 @@ impl Host {
             dpi,
             frame: None,
             background: None,
+            header_base: None,
             list_base: None,
             background_key: String::new(),
+            header_base_key: String::new(),
+            bg_ink: None,
+            paint_scroll: None,
             shadow: None,
             overlay: None,
             editor: None,
@@ -194,7 +259,11 @@ impl Host {
             local_glass: None,
             pressed: None,
             hover: None,
+            card_hovers: Default::default(),
+            editor_hovered: false,
             scroll: Default::default(),
+            scroll_clock: None,
+            frame_queued: false,
             started: std::time::Instant::now(),
             moving: false,
             scrollbar_drag: None,
@@ -206,6 +275,10 @@ impl Host {
             ink: None,
             typography: Default::default(),
             button_lenses: Default::default(),
+            image_cache: Default::default(),
+            card_cache: Default::default(),
+            selected_image: None,
+            image_drag: None,
         }));
         let (size, pos) = {
             let state = s.borrow();
@@ -275,9 +348,18 @@ impl Host {
             s.shadow = WindowShadow::new(s.hwnd);
         }
         s.board.open = true;
-        ShowWindow(s.hwnd, SW_SHOW);
+        ShowWindow(
+            s.hwnd,
+            if crate::desktop_layer::contains(s.hwnd) {
+                SW_SHOWNOACTIVATE
+            } else {
+                SW_SHOW
+            },
+        );
         s.apply_floating();
-        SetForegroundWindow(s.hwnd);
+        if !crate::desktop_layer::contains(s.hwnd) {
+            SetForegroundWindow(s.hwnd);
+        }
         s.paint();
         s.schedule();
     }
@@ -293,6 +375,25 @@ impl Host {
     }
     pub unsafe fn hide(&mut self) {
         self.state.borrow_mut().hide();
+    }
+    pub unsafe fn refresh(&mut self) {
+        let mut s = self.state.borrow_mut();
+        s.glass.borrow_mut().refresh();
+        if let Some(glass) = &s.local_glass {
+            glass.borrow_mut().refresh();
+        }
+        s.background_key.clear();
+        s.overlay = None;
+        if IsWindowVisible(s.hwnd) != 0 {
+            InvalidateRect(s.hwnd, null(), 0);
+        }
+        if s.settings.is_some() {
+            let color = s.surface_color();
+            let light = crate::accent::light(color);
+            if let Some(host) = &mut s.settings {
+                host.set_surface(color, light);
+            }
+        }
     }
     pub unsafe fn apply_common(&mut self, opacity: Option<f32>, floating: Option<bool>) {
         let mut s = self.state.borrow_mut();
@@ -340,7 +441,11 @@ impl State {
         [r.right as f32 / self.dpi, r.bottom as f32 / self.dpi]
     }
     unsafe fn apply_floating(&self) {
-        crate::window::apply_window_mode(self.hwnd, false, GetWindowLongPtrW(self.hwnd,GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW != 0);
+        crate::window::apply_window_mode(
+            self.hwnd,
+            false,
+            GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW != 0,
+        );
         if let Some(e) = &self.editor {
             e.floating(false);
         }
@@ -425,6 +530,7 @@ impl State {
         let note = id.and_then(|id| self.board.notes.iter().find(|n| n.id == id).cloned());
         match editor::Editor::create(
             self.hwnd,
+            self.root.clone(),
             self.events.clone(),
             note,
             self.query.clone(),
@@ -462,13 +568,30 @@ impl State {
         let Some(id) = self.editor.as_ref().map(|e| e.note_id()) else {
             return;
         };
-        let rect = if let Some(id) = id {
+        let rect = if let Some(id) = id.as_ref() {
             self.layout()
                 .into_iter()
-                .find(|(n, _)| *n == id)
+                .find(|(n, _)| n == id)
                 .map(|(_, r)| r)
         } else {
             Some(self.search_rect())
+        };
+        let images_h = if let (Some(id), Some(rect)) = (&id, rect) {
+            let type_scale = self.type_scale();
+            let text_w = (rect[2] - rect[0] - type_scale.left - 16.).max(type_scale.body);
+            if let Some(images) = self
+                .board
+                .notes
+                .iter()
+                .find(|n| n.id == *id)
+                .map(|n| n.images.clone())
+            {
+                self.images_height(&images, text_w)
+            } else {
+                0.
+            }
+        } else {
+            0.
         };
         if let (Some(e), Some(rect)) = (&self.editor, rect) {
             e.place(
@@ -480,7 +603,167 @@ impl State {
                 },
                 self.dpi,
                 self.type_scale(),
+                images_h,
             );
+        }
+    }
+    fn load_image(&mut self, name: &str) -> Option<(u32, u32)> {
+        if let Some((w, h, _)) = self.image_cache.get(name) {
+            return Some((*w, *h));
+        }
+        let path = model::images_dir(&self.root).join(name);
+        let decoded = image::open(path).ok()?.into_rgba8();
+        let (w, h) = decoded.dimensions();
+        let mut pixels = decoded.into_raw();
+        for p in pixels.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            p[0] = ((p[0] as u32 * a + 127) / 255) as u8;
+            p[1] = ((p[1] as u32 * a + 127) / 255) as u8;
+            p[2] = ((p[2] as u32 * a + 127) / 255) as u8;
+        }
+        let img = crate::render::Image::from_rgba(w, h, pixels)?;
+        self.image_cache.insert(name.into(), (w, h, img));
+        Some((w, h))
+    }
+    fn images_height(&mut self, images: &[String], text_w: f32) -> f32 {
+        let mut total = 0f32;
+        for name in images {
+            if let Some((w, h)) = self.load_image(name) {
+                if w > 0 {
+                    let scaled_h = (h as f32 / w as f32) * text_w;
+                    if total > 0. {
+                        total += 6.;
+                    }
+                    total += scaled_h;
+                }
+            }
+        }
+        total
+    }
+    unsafe fn note_image_rects(&mut self, note_id: &str, card_rect: [f32; 4]) -> Vec<[f32; 4]> {
+        let Some(note) = self.board.notes.iter().find(|n| n.id == note_id).cloned() else {
+            return vec![];
+        };
+        for name in &note.images {
+            let _ = self.load_image(name);
+        }
+        let type_scale = self.type_scale();
+        compute_image_rects(
+            &note,
+            card_rect,
+            &type_scale,
+            &mut self.typography,
+            &self.image_cache,
+            self.dpi,
+        )
+    }
+    unsafe fn hit_image(&mut self, p: [f32; 2]) -> Option<(String, usize, [f32; 4])> {
+        if p[1] < self.viewport()[0] || p[1] > self.viewport()[1] {
+            return None;
+        }
+        for (id, r) in self.layout() {
+            if !inside(p, r) {
+                continue;
+            }
+            let rects = self.note_image_rects(&id, r);
+            for (idx, ir) in rects.into_iter().enumerate() {
+                if ir[2] > ir[0] && ir[3] > ir[1] && inside(p, ir) {
+                    return Some((id, idx, ir));
+                }
+            }
+        }
+        None
+    }
+    unsafe fn delete_selected_image(&mut self) {
+        let Some((note_id, idx)) = self.selected_image.take() else {
+            return;
+        };
+        let removed_name = if let Some(note) = self.board.notes.iter_mut().find(|n| n.id == note_id)
+        {
+            if idx < note.images.len() {
+                let name = note.images.remove(idx);
+                note.updated_at = model::now();
+                Some(name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(name) = removed_name {
+            let still_used = self
+                .board
+                .notes
+                .iter()
+                .any(|n| n.images.iter().any(|img| img == &name));
+            if !still_used {
+                let _ = std::fs::remove_file(model::images_dir(&self.root).join(&name));
+                self.image_cache.remove(&name);
+            }
+            self.card_cache.remove(&note_id);
+            self.place_editor();
+            self.schedule();
+        }
+    }
+    unsafe fn move_image(&mut self, from_id: &str, from_idx: usize, p: [f32; 2]) {
+        let target_card = self
+            .layout()
+            .into_iter()
+            .find(|(_, r)| inside(p, *r))
+            .map(|(id, r)| (id, r));
+        let Some((target_id, target_rect)) = target_card else {
+            return;
+        };
+        if target_id == from_id {
+            let rects = self.note_image_rects(from_id, target_rect);
+            if rects.len() <= 1 || from_idx >= rects.len() {
+                return;
+            }
+            let mut target_idx = rects.len() - 1;
+            for (i, r) in rects.iter().enumerate() {
+                let mid = (r[1] + r[3]) * 0.5;
+                if p[1] < mid {
+                    target_idx = i;
+                    break;
+                }
+            }
+            if target_idx == from_idx {
+                return;
+            }
+            if let Some(note) = self.board.notes.iter_mut().find(|n| n.id == from_id) {
+                let img = note.images.remove(from_idx);
+                let insert_at = target_idx.min(note.images.len());
+                note.images.insert(insert_at, img);
+                note.updated_at = model::now();
+                self.selected_image = Some((from_id.to_string(), insert_at));
+                self.card_cache.remove(from_id);
+                self.place_editor();
+                self.schedule();
+            }
+            return;
+        }
+        let img_name = if let Some(src) = self.board.notes.iter_mut().find(|n| n.id == from_id) {
+            if from_idx < src.images.len() {
+                let name = src.images.remove(from_idx);
+                src.updated_at = model::now();
+                Some(name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(name) = img_name {
+            if let Some(dst) = self.board.notes.iter_mut().find(|n| n.id == target_id) {
+                dst.images.push(name);
+                dst.updated_at = model::now();
+                let new_idx = dst.images.len() - 1;
+                self.selected_image = Some((target_id.clone(), new_idx));
+                self.card_cache.remove(from_id);
+                self.card_cache.remove(&target_id);
+                self.place_editor();
+                self.schedule();
+            }
         }
     }
     unsafe fn bounds(&mut self) {
@@ -509,11 +792,15 @@ impl State {
         self.shadow.take();
         self.frame.take();
         self.background.take();
+        self.header_base.take();
         self.list_base.take();
         self.overlay.take();
         self.typography.clear();
         self.button_lenses.clear();
+        self.card_cache.clear();
         self.background_key.clear();
+        self.header_base_key.clear();
+        self.bg_ink = None;
     }
     fn color(note: &model::Note) -> u32 {
         match note.color.as_str() {
@@ -556,6 +843,63 @@ impl State {
     unsafe fn viewport(&self) -> [f32; 2] {
         self.chrome().viewport()
     }
+    fn hovered_card_id(&self) -> Option<String> {
+        match &self.hover {
+            Some(
+                Action::Card(id)
+                | Action::Pin(id)
+                | Action::Delete(id)
+                | Action::Color(id)
+                | Action::PickColor(id, _),
+            ) => Some(id.clone()),
+            _ if self.editor_hovered => self.editor.as_ref().and_then(|e| e.note_id()),
+            _ => None,
+        }
+    }
+    fn card_hover(&self, id: &str, now: f64) -> f32 {
+        self.card_hovers.get(id).map_or(0., |t| t.sample(now))
+    }
+    fn animating(&self, now: f64) -> bool {
+        self.scroll.moving(now) || self.card_hovers.values().any(|t| t.moving(now))
+    }
+    unsafe fn sync_hover(&mut self) {
+        let now = self.now();
+        // Suppress transient hover glow trails while actively scrolling.
+        let active_id = if self.scroll.moving(now) {
+            None
+        } else {
+            self.hovered_card_id()
+        };
+        let ids: Vec<String> = self.board.notes.iter().map(|n| n.id.clone()).collect();
+        self.card_hovers
+            .retain(|id, t| ids.contains(id) && (t.moving(now) || t.sample(now) > 0.001));
+        for id in ids {
+            let to = if active_id.as_deref() == Some(id.as_str()) {
+                1.
+            } else {
+                0.
+            };
+            if let Some(tween) = self.card_hovers.get_mut(&id) {
+                tween.target(
+                    to,
+                    now,
+                    if to > 0. { 150. } else { 200. },
+                    [0.25, 0.1, 0.25, 1.],
+                );
+            } else if to > 0. {
+                let mut tween = crate::motion::Tween::default();
+                tween.target(1., now, 150., [0.25, 0.1, 0.25, 1.]);
+                self.card_hovers.insert(id, tween);
+            }
+        }
+        if self.animating(now) {
+            if self.scroll_clock.is_none() {
+                self.scroll_clock = Some(crate::motion::FrameClock::start());
+            }
+            SetTimer(self.hwnd, ANIMATE, 10, None);
+            InvalidateRect(self.hwnd, null(), 0);
+        }
+    }
     unsafe fn layout(&mut self) -> Vec<(String, [f32; 4])> {
         let [w, _] = self.dimensions();
         if self.viewport()[1] <= self.viewport()[0] {
@@ -577,26 +921,78 @@ impl State {
             1
         };
         let chrome = self.chrome();
-        let height = chrome.card_height(self.type_scale().height);
+        let type_scale = self.type_scale();
         let inset = chrome.card_inset(&self.board.design);
         let top = self.content_top();
         let gap = 14.;
         let width = (w - inset * 2. - gap * (cols - 1) as f32) / cols as f32;
-        let rows = list.len().div_ceil(cols);
-        let max = (rows as f32 * (height + gap) - gap + top - self.viewport()[1]).max(0.);
-        self.scroll.bounds(max, self.now());
-        let offset = self.scroll.value(self.now());
-        list.iter()
-            .enumerate()
-            .map(|(i, &index)| {
-                let x = inset + (i % cols) as f32 * (width + gap);
-                let y = top + (i / cols) as f32 * (height + gap) - offset;
-                (
-                    self.board.notes[index].id.clone(),
-                    [x, y, x + width, y + height],
-                )
+        let text_width = (width - type_scale.left - 16.).max(type_scale.body);
+        let dpi = self.dpi;
+        let notes_meta: Vec<(String, String, Vec<String>, bool)> = list
+            .iter()
+            .map(|&index| {
+                let note = &self.board.notes[index];
+                let plain = note.plain();
+                let empty = plain.trim().is_empty() && note.images.is_empty();
+                (note.id.clone(), plain, note.images.clone(), empty)
             })
-            .collect()
+            .collect();
+        let mut out = Vec::with_capacity(notes_meta.len());
+        let mut row_top = top;
+        for chunk in notes_meta.chunks(cols) {
+            let mut row_height = 0f32;
+            for (col, (id, plain, images, empty)) in chunk.iter().enumerate() {
+                let img_h = self.images_height(images, text_width);
+                let img_gap = if img_h > 0. && !plain.trim().is_empty() {
+                    6.
+                } else {
+                    0.
+                };
+                let lines = if *empty {
+                    1
+                } else if plain.trim().is_empty() {
+                    0
+                } else {
+                    self.typography
+                        .line_count(plain, text_width, dpi, type_scale.body)
+                };
+                let needed = type_scale.top
+                    + (lines as f32) * type_scale.leading
+                    + img_gap
+                    + img_h
+                    + 34.;
+                let raw_h = if *empty {
+                    type_scale.card_height(true)
+                } else {
+                    needed.max(type_scale.height)
+                };
+                let h = if raw_h <= type_scale.height {
+                    chrome.card_height(raw_h)
+                } else {
+                    raw_h
+                };
+                row_height = row_height.max(h);
+                let x = inset + col as f32 * (width + gap);
+                out.push((id.clone(), [x, row_top, x + width, row_top + h]));
+            }
+            row_top += row_height + gap;
+        }
+        let content_bottom = if out.is_empty() { top } else { row_top - gap };
+        // Keep 14 DIP bottom clearance so the last card's shadow is fully scrollable into view.
+        let max = if out.is_empty() {
+            0.
+        } else {
+            (content_bottom + 14. - self.viewport()[1]).max(0.)
+        };
+        self.scroll.bounds(max, self.now());
+        let offset = self
+            .paint_scroll
+            .unwrap_or_else(|| self.scroll.value(self.now()));
+        for (_, r) in &mut out {
+            r[1] -= offset;
+            r[3] -= offset;
+        }
+        out
     }
     unsafe fn toolbar(&self) -> Vec<(Action, [f32; 4], &'static str)> {
         let [w, _] = self.dimensions();
@@ -772,7 +1168,199 @@ impl State {
         }
         InvalidateRect(self.hwnd, null(), 0);
     }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_card_contents(
+        c: &Canvas,
+        note: &model::Note,
+        rect: [f32; 4],
+        color: u32,
+        ink: u32,
+        muted: u32,
+        paper: bool,
+        index: bool,
+        honey: bool,
+        tiny: bool,
+        number: Option<usize>,
+        hover_t: f32,
+        pin_hover: bool,
+        delete_hover: bool,
+        type_scale: &typography::Metrics,
+        typography: &mut typography::Typography,
+        image_cache: &std::collections::HashMap<String, (u32, u32, crate::render::Image)>,
+        dpi: f32,
+        draw_text: bool,
+    ) {
+        let [x, y, right, bottom] = rect;
+        if !paper && !index && !honey {
+            // Tint belongs below the reflective finish: painting it last
+            // muted the card's upper highlight and directional rim.
+            c.round(rect, 18., color, 78, false, false);
+            c.glass_surface(rect, 18., 20, false);
+            // A second thin coating brings the upper-left sheen close
+            // to the legacy card's subtle 9% white highlight. Coating
+            // adds no outline, so the existing single rim stays intact.
+            c.coating(rect, 18.);
+        }
+        if paper {
+            c.round(rect, 10., rgb(255, 252, 243), 170, false, false);
+            c.line(
+                &[(x + 16., bottom - 1.), (right - 16., bottom - 1.)],
+                rgb(121, 100, 68),
+                55,
+                0.8,
+            );
+        }
+        if honey {
+            c.round(
+                [x, y + 2., right, bottom + 2.],
+                20.,
+                rgb(134, 109, 68),
+                30,
+                false,
+                false,
+            );
+            c.round(rect, 14., rgb(255, 252, 245), 242, false, false);
+            c.line(
+                &[(x + 20., bottom - 1.), (right - 20., bottom - 1.)],
+                rgb(176, 149, 104),
+                65,
+                0.8,
+            );
+        }
+        if index {
+            c.line(&[(x + 4., y + 1.), (right - 4., y + 1.)], ink, 26, 1.);
+        }
+        if hover_t > 0.001 {
+            if paper || index || honey {
+                c.round(
+                    rect,
+                    10.,
+                    ink,
+                    (hover_t * 12.).round() as u8,
+                    false,
+                    false,
+                );
+            } else {
+                c.hover_surface(rect, 18., hover_t * 0.28, false);
+            }
+        }
+        let (card_ink, card_muted) = (ink, muted);
+        if let Some(number) = number {
+            c.text(
+                &format!("{number:02}"),
+                [x + 12., y + 42., x + 48., y + 76.],
+                16.,
+                false,
+                card_muted,
+                0,
+            );
+        }
+        let icon_y = y + if tiny { 8. } else { 12. };
+        icons::bead(c, x + 14., icon_y, color);
+        icons::pin(
+            c,
+            right - 66.,
+            icon_y,
+            card_ink,
+            note.pinned,
+            hover_t,
+            pin_hover,
+        );
+        icons::trash(
+            c,
+            right - 34.,
+            icon_y,
+            card_ink,
+            hover_t,
+            delete_hover,
+        );
+        if paper {
+            let mut line = y + type_scale.top + type_scale.leading;
+            while line < bottom - 28. {
+                c.line(
+                    &[(x + type_scale.left, line), (right - 18., line)],
+                    card_ink,
+                    28,
+                    0.8,
+                );
+                line += type_scale.leading;
+            }
+            if !tiny {
+                c.line(
+                    &[(x + 38., y + 36.), (x + 38., bottom - 28.)],
+                    rgb(184, 91, 89),
+                    90,
+                    1.,
+                );
+            }
+        }
+        let text = note.plain();
+        let content_x = x + type_scale.left;
+        let text_w = (right - content_x - 16.).max(type_scale.body);
+        let text_lines = if text.trim().is_empty() {
+            if note.images.is_empty() { 1 } else { 0 }
+        } else {
+            typography.line_count(&text, text_w, dpi, type_scale.body)
+        };
+        if !note.images.is_empty() {
+            let mut img_y = y
+                + type_scale.top
+                + (text_lines as f32) * type_scale.leading
+                + if text.trim().is_empty() { 0. } else { 6. };
+            for name in &note.images {
+                if let Some((iw, ih, image)) = image_cache.get(name) {
+                    if *iw > 0 {
+                        let scaled_h = (*ih as f32 / *iw as f32) * text_w;
+                        c.image(
+                            image,
+                            [content_x, img_y, content_x + text_w, img_y + scaled_h],
+                        );
+                        img_y += scaled_h + 6.;
+                    }
+                }
+            }
+        }
+        if !draw_text {
+            return;
+        }
+        let preview = if text.trim().is_empty() && note.images.is_empty() {
+            "Write something…".into()
+        } else {
+            text.clone()
+        };
+        let compact_card = typography::compact_card([right - x, bottom - y]);
+        for (i, line) in typography
+            .lines(&preview, text_w, dpi, type_scale.body, usize::MAX)
+            .iter()
+            .enumerate()
+        {
+            let top = y + type_scale.top + i as f32 * type_scale.leading;
+            c.text(
+                line,
+                [content_x, top, right - 16., top + type_scale.leading],
+                type_scale.body,
+                false,
+                if text.trim().is_empty() {
+                    card_muted
+                } else {
+                    card_ink
+                },
+                0,
+            );
+        }
+        if !compact_card {
+            c.text(
+                &icons::note_day(note.updated_at),
+                [x + 17., bottom - 26., right - 17., bottom - 8.],
+                type_scale.caption,
+                false,
+                card_muted,
+                0,
+            );
+        }
+    }
     unsafe fn paint(&mut self) {
+        let frame_started = std::time::Instant::now();
         let mut ps: PAINTSTRUCT = zeroed();
         BeginPaint(self.hwnd, &mut ps);
         let mut r: RECT = zeroed();
@@ -787,6 +1375,9 @@ impl State {
             EndPaint(self.hwnd, &ps);
             return;
         };
+        // Layout, editor placement and palette hit geometry share one scroll
+        // position for this frame, even when rendering takes several ms.
+        self.paint_scroll = Some(self.scroll.value(self.now()));
         let [w, h] = self.dimensions();
         let mut wr: RECT = zeroed();
         GetWindowRect(self.hwnd, &mut wr);
@@ -797,7 +1388,7 @@ impl State {
         let base = self.surface_color();
         let source_glass = self.source_glass();
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             wr.left,
             wr.top,
             r.right,
@@ -806,7 +1397,9 @@ impl State {
             self.board.design,
             self.board.palette,
             self.content_top(),
+            self.board.frosted,
             self.board.tint,
+            self.board.frost_strength,
             source_glass.borrow().revision(),
             crate::fusion::revision(self.hwnd)
         );
@@ -814,9 +1407,62 @@ impl State {
             .background
             .as_ref()
             .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
-        if cached && (self.background_key == key || self.moving) {
+        let bg_reused = cached && self.background_key == key;
+        let own_alpha = (self.board.opacity * 2.55) as u8;
+        let group_op = crate::fusion::group_opacities(self.hwnd, own_alpha);
+        let header_action_key = |a: Option<&Action>| match a {
+            Some(Action::Settings) => 1u8,
+            Some(Action::Hide) => 2,
+            Some(Action::New) => 3,
+            Some(Action::Undo) => 4,
+            Some(Action::Done) => 5,
+            Some(Action::Search) => 6,
+            _ => 0,
+        };
+        let header_key = if bg_reused
+            && !self.moving
+            && self.editor.as_ref().is_none_or(|e| e.note_id().is_some())
+            && !self.background_key.is_empty()
+        {
+            let hv = crate::widget_header::visual(self.hwnd);
+            let mut hk = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                self.background_key,
+                own_alpha,
+                self.chrome().tiny(),
+                self.chrome().search_icon(),
+                self.query,
+                self.undo.is_some(),
+                header_action_key(self.hover.as_ref()),
+                header_action_key(self.pressed.as_ref()),
+                hv.alpha.to_bits(),
+                hv.hover[0].to_bits(),
+                hv.hover[1].to_bits(),
+                hv.rotation[0].to_bits(),
+                hv.rotation[1].to_bits(),
+            );
+            if let Some((_, ops)) = &group_op {
+                for o in ops {
+                    hk.push_str(&format!(":{o}"));
+                }
+            }
+            hk
+        } else {
+            String::new()
+        };
+        let reused_header = !header_key.is_empty()
+            && header_key == self.header_base_key
+            && self.bg_ink.is_some()
+            && self
+                .header_base
+                .as_ref()
+                .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
+        if reused_header {
+            frame.copy_from(self.header_base.as_ref().unwrap().dc);
+        } else if bg_reused {
             frame.copy_from(self.background.as_ref().unwrap().dc);
         } else {
+            self.bg_ink = None;
             let brush = CreateSolidBrush(base);
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
@@ -884,7 +1530,9 @@ impl State {
                     "{}:{}:{}:{}:{}",
                     r.right, r.bottom, self.dpi, self.board.tint, paper
                 );
-                if self.overlay.as_ref().is_none_or(|(k, _)| *k != overlay_key) {
+                if (!self.moving && self.overlay.as_ref().is_none_or(|(k, _)| *k != overlay_key))
+                    || self.overlay.is_none()
+                {
                     self.overlay = Canvas::pane_overlay(
                         [r.right as u32, r.bottom as u32],
                         self.dpi,
@@ -898,7 +1546,7 @@ impl State {
                     if let Some((_, image)) = &self.overlay {
                         c.image(image, [0., 0., w, h]);
                     }
-                    c.widget_corner_reflection([0., 0., w, h], 30., paper);
+                    c.widget_corner_reflection_for(self.hwnd, [0., 0., w, h], 30., paper);
                 }
             }
             frame.bevel_for(self.hwnd);
@@ -917,10 +1565,17 @@ impl State {
         self.place_editor();
         let palette_rect = self.palette_rect();
         let backing = self.background.as_ref().unwrap();
-        let lum = crate::contrast::sample(frame.dc, self.dpi, [20., 20., w - 20., h - 20.]);
-        let (ink, muted) = crate::contrast::inks(lum, self.ink);
-        self.ink = Some(ink);
-        frame.background_alpha((self.board.opacity * 2.55) as u8);
+        let (ink, muted) = if let Some(pair) = self.bg_ink.filter(|_| bg_reused) {
+            pair
+        } else {
+            let lum = crate::contrast::sample(frame.dc, self.dpi, [20., 20., w - 20., h - 20.]);
+            let pair = crate::contrast::inks(lum, None);
+            self.ink = Some(pair.0);
+            self.bg_ink = Some(pair);
+            pair
+        };
+        if !reused_header {
+        frame.background_alpha_for(self.hwnd, own_alpha);
         {
             let c = Canvas::new(frame.dc, self.dpi);
             let header_action = |a: Option<&Action>| match a {
@@ -996,11 +1651,16 @@ impl State {
                 }
             }
             let search = self.search_rect();
-            backing.restore_glass_card(frame.dc, search, 17.);
+            if self.board.opacity < 100. {
+                backing.restore_glass_card(frame.dc, search, 17.);
+            }
             if self.chrome().search_icon() {
                 let mut style = lenses::ENABLED;
                 if self.hover.as_ref() == Some(&Action::Search) {
                     style |= lenses::HOVER;
+                }
+                if self.pressed.as_ref() == Some(&Action::Search) {
+                    style |= lenses::PRESSED;
                 }
                 if !self.query.is_empty() {
                     style |= lenses::ACTIVE;
@@ -1009,20 +1669,47 @@ impl State {
                     style |= lenses::LIGHT;
                 }
                 self.button_lenses.draw(&c, self.dpi, search, base, style);
-                icons::search(&c, search[0] + 6., search[1] + 6., ink);
+                icons::search(
+                    &c,
+                    self.dpi,
+                    (search[0] + search[2]) * 0.5 - 8.,
+                    (search[1] + search[3]) * 0.5 - 8.,
+                    ink,
+                    235,
+                );
             } else {
                 c.search_surface(search, 16., base, paper);
                 c.round(search, 16., base, 35, false, false);
-                icons::search(&c, search[0] + 12., search[1] + 8., ink);
+                icons::search(
+                    &c,
+                    self.dpi,
+                    search[0] + 12.,
+                    search[1] + 8.,
+                    ink,
+                    if self.query.is_empty() { 155 } else { 235 },
+                );
                 if let Some(e) = self.editor.as_ref().filter(|e| e.note_id().is_none()) {
                     e.draw(frame.dc, ink);
+                } else if self.query.is_empty() {
+                    if search[2] - search[0] >= 136. {
+                        c.text_alpha(
+                            "Search notes…",
+                            [
+                                search[0] + 34.,
+                                search[1] + 6.,
+                                search[2] - 12.,
+                                search[3] - 4.,
+                            ],
+                            14.,
+                            false,
+                            muted,
+                            0,
+                            108,
+                        );
+                    }
                 } else {
                     c.text(
-                        if self.query.is_empty() {
-                            "Search notes…"
-                        } else {
-                            &self.query
-                        },
+                        &self.query,
                         [
                             search[0] + 34.,
                             search[1] + 6.,
@@ -1031,7 +1718,7 @@ impl State {
                         ],
                         14.,
                         false,
-                        if self.query.is_empty() { muted } else { ink },
+                        ink,
                         0,
                     );
                 }
@@ -1052,17 +1739,59 @@ impl State {
                 }
             }
         }
-        let fade_base = if self.scroll.max > 0. {
-            self.list_base
+        for (a, r, _) in self.toolbar() {
+            if a == Action::New
+                || (self.hover.as_ref() == Some(&a)
+                    && !matches!(a, Action::Settings | Action::Hide))
+            {
+                frame.retain_control_backing(
+                    backing,
+                    r,
+                    if a == Action::New {
+                        (r[2] - r[0]) / 2.
+                    } else {
+                        16.
+                    },
+                    1.,
+                );
+            }
+        }
+        crate::settings_ui::retain_header_backing(&mut frame, backing, self.hwnd, w);
+        if !header_key.is_empty() {
+            if let Some(hb) = self
+                .header_base
                 .take()
                 .filter(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
                 .or_else(|| Buffer::plain(r.right, r.bottom, self.dpi))
+            {
+                hb.copy_from(frame.dc);
+                self.header_base = Some(hb);
+                self.header_base_key = header_key;
+            }
+        } else {
+            self.header_base_key.clear();
+        }
+        }
+        let fade_base = if self.scroll.max > 0. {
+            let had_valid = reused_header
+                && self
+                    .list_base
+                    .as_ref()
+                    .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
+            let base = self
+                .list_base
+                .take()
+                .filter(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
+                .or_else(|| Buffer::plain(r.right, r.bottom, self.dpi));
+            if let Some(b) = &base {
+                if !had_valid {
+                    b.copy_from(frame.dc);
+                }
+            }
+            base
         } else {
             None
         };
-        if let Some(base) = &fade_base {
-            base.copy_from(frame.dc);
-        }
         // Content is clipped before drawing, not a full-board screenshot buffer.
         let saved = SaveDC(frame.dc);
         IntersectClipRect(
@@ -1072,169 +1801,225 @@ impl State {
             r.right,
             (self.viewport()[1] * self.dpi) as i32,
         );
+        let now = self.now();
+        let scrolling = self.scroll.moving(now);
+        let tiny = self.chrome().tiny();
+        if self.card_cache.len() > 128 {
+            self.card_cache
+                .retain(|id, _| self.board.notes.iter().any(|n| n.id == *id));
+        }
+        let mut batch = Some(crate::render::Batch::new(frame.dc, self.dpi));
         {
-            let c = Canvas::new(frame.dc, self.dpi);
-            for (id, rect) in &layout {
+            for (pos, (id, rect)) in layout.iter().enumerate() {
                 if rect[3] < self.viewport()[0] || rect[1] > self.viewport()[1] {
                     continue;
                 }
-                let Some(note) = self.board.notes.iter().find(|n| n.id == *id) else {
+                let Some(note) = self.board.notes.iter().find(|n| n.id == *id).cloned() else {
                     continue;
                 };
                 let [x, y, right, bottom] = *rect;
-                let color = Self::color(note);
-                backing.restore_glass_card(
-                    frame.dc,
+                let color = Self::color(&note);
+                let hover_t = if scrolling { 0. } else { self.card_hover(id, now) };
+                let has_editor = self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|e| e.note_id().as_deref() == Some(id.as_str()));
+                let pin_hover = !scrolling && self.hover.as_ref() == Some(&Action::Pin(id.clone()));
+                let delete_hover =
+                    !scrolling && self.hover.as_ref() == Some(&Action::Delete(id.clone()));
+                let number = (index && !tiny).then_some(pos + 1);
+                if !has_editor && hover_t <= 0.001 && !pin_hover && !delete_hover {
+                    use std::hash::{Hash, Hasher};
+                    let pad_px = if honey {
+                        (3. * self.dpi).ceil() as u32
+                    } else {
+                        (1. * self.dpi).ceil() as u32
+                    };
+                    let pad = pad_px as f32 / self.dpi;
+                    let cw_px = ((right - x) * self.dpi).round().max(1.) as u32;
+                    let ch_px = ((bottom - y) * self.dpi).round().max(1.) as u32;
+                    let ax = (x * self.dpi).round() / self.dpi;
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    note.body.hash(&mut hasher);
+                    note.rtf.hash(&mut hasher);
+                    for name in &note.images {
+                        name.hash(&mut hasher);
+                        self.image_cache.contains_key(name).hash(&mut hasher);
+                    }
+                    let day = icons::note_day(note.updated_at);
+                    let card_key = format!(
+                        "{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{}",
+                        cw_px,
+                        ch_px,
+                        self.dpi.to_bits(),
+                        self.board.design,
+                        color,
+                        note.pinned,
+                        ink,
+                        muted,
+                        number,
+                        day,
+                        hasher.finish()
+                    );
+                    if !self.moving && self.card_cache.get(id).is_none_or(|(k, _)| *k != card_key) {
+                        let local = [
+                            pad,
+                            pad,
+                            pad + cw_px as f32 / self.dpi,
+                            pad + ch_px as f32 / self.dpi,
+                        ];
+                        let dpi = self.dpi;
+                        let typography = &mut self.typography;
+                        let image_cache = &self.image_cache;
+                        if let Some(sprite) = Canvas::render_sprite(
+                            cw_px + pad_px * 2,
+                            ch_px + pad_px * 2,
+                            dpi,
+                            |c| {
+                                Self::draw_card_contents(
+                                    c,
+                                    &note,
+                                    local,
+                                    color,
+                                    ink,
+                                    muted,
+                                    paper,
+                                    index,
+                                    honey,
+                                    tiny,
+                                    number,
+                                    0.,
+                                    false,
+                                    false,
+                                    &type_scale,
+                                    typography,
+                                    image_cache,
+                                    dpi,
+                                    true,
+                                );
+                            },
+                        ) {
+                            self.card_cache.insert(id.clone(), (card_key.clone(), sprite));
+                        }
+                    }
+                    if let (Some(b), Some((_, sprite))) =
+                        (&batch, self.card_cache.get(id).filter(|(k, _)| *k == card_key))
+                    {
+                        if self.board.opacity < 100. {
+                            backing.restore_glass_card(
+                                frame.dc,
+                                *rect,
+                                if paper {
+                                    14.
+                                } else if index {
+                                    0.
+                                } else {
+                                    18.
+                                },
+                            );
+                        }
+                        let [sw, sh] = sprite.pixel_size();
+                        let sprite_rect = [
+                            ax - pad,
+                            y - pad,
+                            ax - pad + sw as f32 / self.dpi,
+                            y - pad + sh as f32 / self.dpi,
+                        ];
+                        if b.blit(sprite, sprite_rect, !scrolling) {
+                            continue;
+                        }
+                    }
+                }
+                batch.take();
+                // At full background opacity the cached frame already contains
+                // this exact backing. Avoid a GDI flush and pixel mask per card.
+                if self.board.opacity < 100. {
+                    backing.restore_glass_card(
+                        frame.dc,
+                        *rect,
+                        if paper {
+                            14.
+                        } else if index {
+                            0.
+                        } else {
+                            18.
+                        },
+                    );
+                }
+                let c = Canvas::new(frame.dc, self.dpi);
+                Self::draw_card_contents(
+                    &c,
+                    &note,
                     *rect,
-                    if paper {
-                        14.
-                    } else if index {
-                        0.
-                    } else {
-                        18.
-                    },
+                    color,
+                    ink,
+                    muted,
+                    paper,
+                    index,
+                    honey,
+                    tiny,
+                    number,
+                    hover_t,
+                    pin_hover,
+                    delete_hover,
+                    &type_scale,
+                    &mut self.typography,
+                    &self.image_cache,
+                    self.dpi,
+                    !has_editor,
                 );
-                if !paper && !index && !honey {
-                    // Tint belongs below the reflective finish: painting it last
-                    // muted the card's upper highlight and directional rim.
-                    c.round(*rect, 18., color, 78, false, false);
-                    c.glass_surface(*rect, 18., 20, false);
-                    // A second thin coating brings the upper-left sheen close
-                    // to the legacy card's subtle 9% white highlight. Coating
-                    // adds no outline, so the existing single rim stays intact.
-                    c.coating(*rect, 18.);
-                }
-                if paper {
-                    c.round(*rect, 10., rgb(255, 252, 243), 170, false, false);
-                    c.line(
-                        &[(x + 16., bottom - 1.), (right - 16., bottom - 1.)],
-                        rgb(121, 100, 68),
-                        55,
-                        0.8,
-                    );
-                }
-                if honey {
-                    c.round(
-                        [x, y + 2., right, bottom + 2.],
-                        20.,
-                        rgb(134, 109, 68),
-                        30,
-                        false,
-                        false,
-                    );
-                    c.round(*rect, 14., rgb(255, 252, 245), 242, false, false);
-                    c.line(
-                        &[(x + 20., bottom - 1.), (right - 20., bottom - 1.)],
-                        rgb(176, 149, 104),
-                        65,
-                        0.8,
-                    );
-                }
-                if index {
-                    c.line(&[(x + 4., y + 1.), (right - 4., y + 1.)], ink, 26, 1.);
-                }
-                if self.hover.as_ref() == Some(&Action::Card(id.clone())) {
-                    if paper || index || honey {
-                        c.round(*rect, 10., ink, 8, false, false);
-                    } else {
-                        c.hover_surface(*rect, 18., 0.25, false);
-                    }
-                }
-                let card_lum = crate::contrast::sample(frame.dc, self.dpi, *rect);
-                let (card_ink, card_muted) = crate::contrast::inks(card_lum, None);
-                if index && !self.chrome().tiny() {
-                    let number = layout.iter().position(|(n, _)| n == id).unwrap_or(0) + 1;
-                    c.text(
-                        &format!("{number:02}"),
-                        [x + 12., y + 42., x + 48., y + 76.],
-                        16.,
-                        false,
-                        card_muted,
-                        0,
-                    );
-                }
-                let icon_y = y + if self.chrome().tiny() { 8. } else { 12. };
-                icons::bead(&c, x + 14., icon_y, color);
-                icons::pin(&c, right - 66., icon_y, card_ink, note.pinned);
-                icons::trash(&c, right - 34., icon_y, card_ink);
-                if paper {
-                    let mut line = y + type_scale.top + type_scale.leading;
-                    while line < bottom - 28. {
-                        c.line(
-                            &[(x + type_scale.left, line), (right - 18., line)],
-                            card_ink,
-                            28,
-                            0.8,
-                        );
-                        line += type_scale.leading;
-                    }
-                    if !self.chrome().tiny() {
-                        c.line(
-                            &[(x + 38., y + 36.), (x + 38., bottom - 28.)],
-                            rgb(184, 91, 89),
-                            90,
-                            1.,
-                        );
-                    }
-                }
-                let text = note.plain();
+                drop(c);
                 if let Some(e) = self
                     .editor
                     .as_ref()
                     .filter(|e| e.note_id().as_deref() == Some(id.as_str()))
                 {
-                    e.draw(frame.dc, card_ink);
-                    continue;
+                    e.draw(frame.dc, ink);
                 }
-                let preview = if text.trim().is_empty() {
-                    "Write something…".into()
-                } else {
-                    text.chars().take(340).collect::<String>()
-                };
-                let content_x = x + type_scale.left;
-                let compact_card = typography::compact_card([right - x, bottom - y]);
-                let available =
-                    (bottom - y - type_scale.top - if compact_card { 10. } else { 32. })
-                        .max(type_scale.leading);
-                let count = (available / type_scale.leading).floor().max(1.) as usize;
-                for (i, line) in self
-                    .typography
-                    .lines(
-                        &preview,
-                        right - content_x - 16.,
-                        self.dpi,
-                        type_scale.body,
-                        count,
-                    )
-                    .iter()
-                    .enumerate()
-                {
-                    let top = y + type_scale.top + i as f32 * type_scale.leading;
-                    c.text(
-                        line,
-                        [content_x, top, right - 16., top + type_scale.leading],
-                        type_scale.body,
-                        honey && i == 0,
-                        if text.trim().is_empty() {
-                            card_muted
-                        } else {
-                            card_ink
-                        },
-                        0,
-                    );
+            }
+            if let Some((sel_id, sel_idx)) = self.selected_image.clone() {
+                if let Some((_, card_rect)) = layout.iter().find(|(id, _)| *id == sel_id) {
+                    if let Some(note) = self.board.notes.iter().find(|n| n.id == sel_id) {
+                        let rects = compute_image_rects(
+                            note,
+                            *card_rect,
+                            &type_scale,
+                            &mut self.typography,
+                            &self.image_cache,
+                            self.dpi,
+                        );
+                        if let Some(&ir) = rects.get(sel_idx) {
+                            if ir[2] > ir[0] && ir[3] > ir[1] {
+                                let c = Canvas::new(frame.dc, self.dpi);
+                                c.round(
+                                    [ir[0] - 1., ir[1] - 1., ir[2] + 1., ir[3] + 1.],
+                                    6.,
+                                    rgb(96, 165, 250),
+                                    0,
+                                    false,
+                                    true,
+                                );
+                                let dr = image_delete_rect(ir);
+                                c.round(dr, 10., rgb(24, 24, 28), 210, false, true);
+                                c.text("×", dr, 13., true, rgb(255, 255, 255), 1);
+                            }
+                        }
+                    }
                 }
-                if !compact_card {
-                    c.text(
-                        &icons::note_day(note.updated_at),
-                        [x + 17., bottom - 26., right - 17., bottom - 8.],
-                        type_scale.caption,
-                        false,
-                        card_muted,
-                        0,
-                    );
+            }
+            if let Some(drag) = &self.image_drag {
+                if drag.active {
+                    if let Some((_, target_rect)) =
+                        layout.iter().find(|(_, r)| inside(drag.current, *r))
+                    {
+                        let c = Canvas::new(frame.dc, self.dpi);
+                        c.round(*target_rect, 18., rgb(96, 165, 250), 28, false, true);
+                    }
                 }
             }
             if layout.is_empty() && self.viewport()[1] > self.viewport()[0] {
+                batch.take();
+                let c = Canvas::new(frame.dc, self.dpi);
                 let top = self.content_top() + if self.chrome().tiny() { 8. } else { 20. };
                 c.text(
                     if self.query.is_empty() {
@@ -1260,10 +2045,13 @@ impl State {
                 }
             }
         }
+        drop(batch);
         RestoreDC(frame.dc, saved);
         if let Some(base) = &fade_base {
             let viewport = self.viewport();
-            let offset = self.scroll.value(self.now());
+            let offset = self
+                .paint_scroll
+                .unwrap_or_else(|| self.scroll.value(self.now()));
             // Reveal each fade gradually as content enters that edge; full
             // notes at the first/last scroll stop retain their original rim.
             let top = viewport[0] - (14. - offset).max(0.);
@@ -1309,7 +2097,7 @@ impl State {
                     self.scroll.max,
                     self.scroll.value(self.now()),
                 ) {
-                    c.round(bar, 2., ink, 120, false, false);
+                    frame.fill_round(bar, 2., ink, 120);
                 }
             }
             c.text(
@@ -1342,29 +2130,20 @@ impl State {
                 );
             }
         }
-        for (a, r, _) in self.toolbar() {
-            if a == Action::New
-                || (self.hover.as_ref() == Some(&a)
-                    && !matches!(a, Action::Settings | Action::Hide))
-            {
-                frame.retain_control_backing(
-                    backing,
-                    r,
-                    if a == Action::New {
-                        (r[2] - r[0]) / 2.
-                    } else {
-                        16.
-                    },
-                    1.,
-                );
-            }
-        }
-        crate::settings_ui::retain_header_backing(&mut frame, backing, self.hwnd, w);
+        self.paint_scroll = None;
         frame.present_with_alpha(self.hwnd, true);
         self.frame = Some(frame);
         EndPaint(self.hwnd, &ps);
         if let Some(shadow) = &mut self.shadow {
             shadow.sync_with_radius(self.hwnd, self.dpi, (self.board.opacity * 2.55) as u8, 30.);
+        }
+        if IsWindowVisible(self.hwnd) != 0 && self.animating(self.now()) {
+            crate::motion::pace_vsync(
+                self.hwnd,
+                frame_started,
+                &mut self.frame_queued,
+                crate::motion::VSYNC_FRAME,
+            );
         }
     }
 }
@@ -1439,9 +2218,55 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             };
             0
         }
+        WM_NCLBUTTONDOWN => {
+            if s.editor.is_some() || s.palette_note.is_some() {
+                s.finish_editor();
+                s.palette_note = None;
+                InvalidateRect(hwnd, null(), 0);
+            }
+            drop(s);
+            DefWindowProcW(hwnd, msg, w, l)
+        }
         WM_LBUTTONDOWN => {
             let p = point(l).map(|v| v / s.dpi);
             s.scrollbar_drag = None;
+            if let Some((sel_id, sel_idx)) = s.selected_image.clone() {
+                if let Some((_, card_rect)) = s.layout().into_iter().find(|(id, _)| *id == sel_id)
+                {
+                    let rects = s.note_image_rects(&sel_id, card_rect);
+                    if let Some(&ir) = rects.get(sel_idx) {
+                        if inside(p, image_delete_rect(ir)) {
+                            s.delete_selected_image();
+                            InvalidateRect(hwnd, null(), 0);
+                            return 0;
+                        }
+                    }
+                }
+            }
+            if let Some((id, idx, _)) = s.hit_image(p) {
+                if s
+                    .editor
+                    .as_ref()
+                    .and_then(|e| e.note_id())
+                    .as_deref()
+                    != Some(id.as_str())
+                {
+                    s.finish_editor();
+                }
+                s.selected_image = Some((id.clone(), idx));
+                s.image_drag = Some(ImageDrag {
+                    note_id: id,
+                    index: idx,
+                    start: p,
+                    current: p,
+                    active: false,
+                });
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
+            s.selected_image = None;
             if let Some(bar) = crate::geometry::scrollbar(
                 s.dimensions()[0] as i32,
                 (s.viewport()[1] + 40.) as i32,
@@ -1459,11 +2284,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         WM_LBUTTONUP => {
             ReleaseCapture();
+            let dpi = s.dpi;
+            let p = point(l).map(|v| v / dpi);
+            if let Some(drag) = s.image_drag.take() {
+                if drag.active {
+                    s.move_image(&drag.note_id, drag.index, p);
+                }
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
             if s.scrollbar_drag.take().is_none() {
                 let a = s.pressed.take();
-                let dpi = s.dpi;
-                if a.is_some() && a == s.hit(point(l).map(|v| v / dpi)) {
+                let hit = s.hit(p);
+                if a.is_some() && a == hit {
                     s.action(a.unwrap());
+                } else if a.is_none()
+                    && hit.is_none()
+                    && (s.editor.is_some() || s.palette_note.is_some())
+                {
+                    s.finish_editor();
+                    s.palette_note = None;
+                    InvalidateRect(hwnd, null(), 0);
                 }
             }
             0
@@ -1471,6 +2312,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         WM_CAPTURECHANGED => {
             s.pressed = None;
             s.scrollbar_drag = None;
+            s.image_drag = None;
             0
         }
         WM_LBUTTONDBLCLK => {
@@ -1482,6 +2324,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         WM_MOUSEMOVE => {
             let p = point(l).map(|v| v / s.dpi);
+            if let Some(drag) = &mut s.image_drag {
+                drag.current = p;
+                if (p[0] - drag.start[0]).hypot(p[1] - drag.start[1]) > 4. {
+                    drag.active = true;
+                }
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
             if let Some(grab) = s.scrollbar_drag {
                 let value = crate::geometry::scroll_drag(
                     (s.viewport()[1] + 40.) as i32,
@@ -1496,6 +2346,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             if hover != s.hover || !s.scrollbar_visible || s.scrollbar_drag.is_some() {
                 s.hover = hover;
                 s.scrollbar_visible = true;
+                s.sync_hover();
                 InvalidateRect(hwnd, null(), 0);
             }
             let mut track = TRACKMOUSEEVENT {
@@ -1510,21 +2361,69 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         WM_MOUSELEAVE => {
             s.hover = None;
             s.scrollbar_visible = false;
+            s.sync_hover();
             InvalidateRect(hwnd, null(), 0);
             0
+        }
+        EDITOR_HOVER => {
+            let hovered = w != 0;
+            if s.editor_hovered != hovered {
+                s.editor_hovered = hovered;
+                s.sync_hover();
+            }
+            0
+        }
+        EDITOR_FOCUS => {
+            if s.selected_image.take().is_some() {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if (w == VK_DELETE as usize || w == VK_BACK as usize)
+                && s.selected_image.is_some()
+            {
+                s.delete_selected_image();
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
+            if w == VK_ESCAPE as usize && s.selected_image.is_some() {
+                s.selected_image = None;
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
+            drop(s);
+            DefWindowProcW(hwnd, msg, w, l)
         }
         WM_MOUSEWHEEL => {
             let now = s.now();
             s.scroll
                 .by(-((w >> 16) as u16 as i16) as f32 / 120. * 96., now);
             s.scrollbar_visible = true;
-            SetTimer(hwnd, ANIMATE, 16, None);
+            if s.scroll_clock.is_none() {
+                s.scroll_clock = Some(crate::motion::FrameClock::start());
+            }
+            SetTimer(hwnd, ANIMATE, 10, None);
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_TIMER if w == ANIMATE => {
-            InvalidateRect(hwnd, null(), 0);
-            if !s.scroll.moving(s.now()) {
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            if !s.animating(s.now()) {
                 KillTimer(hwnd, ANIMATE);
+                s.scroll_clock = None;
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            s.frame_queued = false;
+            if s.animating(s.now()) {
+                InvalidateRect(hwnd, null(), 0);
+            } else {
+                KillTimer(hwnd, ANIMATE);
+                s.scroll_clock = None;
             }
             0
         }
@@ -1568,12 +2467,30 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         WM_EXITSIZEMOVE => {
             s.moving = false;
             s.background_key.clear();
+            s.overlay = None;
             s.bounds();
             InvalidateRect(hwnd, null(), 0);
             0
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            if (s.board.frosted || crate::glass::liquid_glass())
+                && crate::glass::move_paint_due(hwnd)
+            {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_SIZE => {
-            InvalidateRect(hwnd, null(), 0);
+            let width = (l as u32 & 0xffff) as i32;
+            let height = ((l as u32 >> 16) & 0xffff) as i32;
+            if width > 0
+                && height > 0
+                && s.frame
+                    .as_ref()
+                    .is_none_or(|b| !b.matches_geometry(width, height, s.dpi, 30.))
+            {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_WINDOWPOSCHANGING => {
@@ -1590,6 +2507,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 glass.borrow_mut().refresh();
             }
             s.background_key.clear();
+            s.overlay = None;
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1612,10 +2530,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_ACTIVATE if (w as u16) as u32 == WA_INACTIVE => {
-            if let Some(e) = &s.editor {
+            let target = l as HWND;
+            let to_settings = s
+                .settings
+                .as_ref()
+                .is_some_and(|h| !target.is_null() && h.hwnd() == target);
+            if !to_settings {
+                s.finish_editor();
+                s.palette_note = None;
+                InvalidateRect(hwnd, null(), 0);
+            } else if let Some(e) = &s.editor {
                 e.flush();
+                s.consume();
             }
-            s.consume();
             s.flush();
             0
         }
@@ -2213,6 +3140,112 @@ mod tests {
                 !root.join("config/native-notes.json").exists(),
                 "Smoke mode must never write live data"
             );
+        }
+    }
+    #[test]
+    fn pasted_image_scales_to_note_width_and_preserves_channels() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-image-scale-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            let dir = model::images_dir(&root);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Solid red 800x400 image (2:1 aspect ratio)
+            let mut rgba = vec![0u8; 800 * 400 * 4];
+            for p in rgba.chunks_exact_mut(4) {
+                p[0] = 240;
+                p[1] = 20;
+                p[2] = 10;
+                p[3] = 255;
+            }
+            let img = image::RgbaImage::from_raw(800, 400, rgba).unwrap();
+            img.save(dir.join("test-wide.png")).unwrap();
+
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                s.board.create().unwrap();
+                s.board.notes[0].images.push("test-wide.png".into());
+
+                SetWindowPos(
+                    s.hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    (280. * s.dpi).round() as i32,
+                    (420. * s.dpi).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let layout_narrow = s.layout();
+                let narrow_rect = layout_narrow[0].1;
+                let narrow_w = narrow_rect[2] - narrow_rect[0];
+                let narrow_text_w = (narrow_w - s.type_scale().left - 16.).max(s.type_scale().body);
+                let narrow_img_h = s.images_height(&["test-wide.png".into()], narrow_text_w);
+                assert!(
+                    (narrow_img_h - narrow_text_w * 0.5).abs() < 0.5,
+                    "2:1 image should scale to half of note text width: {narrow_img_h} vs {}",
+                    narrow_text_w * 0.5
+                );
+                assert!(
+                    (narrow_rect[3] - narrow_rect[1]) >= narrow_img_h,
+                    "Card height must expand to fit scaled image"
+                );
+
+                SetWindowPos(
+                    s.hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    (380. * s.dpi).round() as i32,
+                    (520. * s.dpi).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let layout_wide = s.layout();
+                let wide_rect = layout_wide[0].1;
+                let wide_w = wide_rect[2] - wide_rect[0];
+                let wide_text_w = (wide_w - s.type_scale().left - 16.).max(s.type_scale().body);
+                let wide_img_h = s.images_height(&["test-wide.png".into()], wide_text_w);
+                assert!(
+                    wide_img_h > narrow_img_h,
+                    "Scaled image height must grow when note width grows: {wide_img_h} vs {narrow_img_h}"
+                );
+                assert!(
+                    (wide_img_h - wide_text_w * 0.5).abs() < 0.5,
+                    "2:1 image should remain proportional to wider note width"
+                );
+
+                SetWindowPos(
+                    s.hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    (280. * s.dpi).round() as i32,
+                    (420. * s.dpi).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                s.paint();
+                let frame = s.frame.as_ref().unwrap();
+                let pixels = frame.snapshot();
+                let x = ((narrow_rect[0] + s.type_scale().left + 20.) * s.dpi) as usize;
+                let y = ((narrow_rect[1] + s.type_scale().top + 20.) * s.dpi) as usize;
+                let idx = (y * frame.width as usize + x) * 4;
+                // BGRA in DIBSection: R is at idx + 2, B is at idx + 0
+                assert!(
+                    pixels[idx + 2] > pixels[idx] + 80,
+                    "Red channel must dominate blue for a red image (no R/B swap)"
+                );
+                s.hide();
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

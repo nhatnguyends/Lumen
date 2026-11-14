@@ -169,15 +169,17 @@ unsafe fn font_at(size: f32, weight: u16) -> Ptr {
         let entry = cache
             .entry(((size * 64.).round() as i32, weight))
             .or_insert_with(|| {
+                let base_weight = weight & 0x0fff;
+                let extra_style = ((weight >> 12) & 0x0f) as i32;
                 let mut family = null_mut();
                 if GdipCreateFontFamilyFromName(
-                    wide(if weight >= 3000 {
+                    wide(if base_weight >= 3000 {
                         "Segoe UI Light"
-                    } else if weight >= 2000 {
+                    } else if base_weight >= 2000 {
                         "Impact"
-                    } else if weight >= 1000 {
+                    } else if base_weight >= 1000 {
                         "Consolas"
-                    } else if weight == 600 {
+                    } else if base_weight == 600 {
                         "Segoe UI Semibold"
                     } else {
                         "Segoe UI Variable Text"
@@ -197,7 +199,7 @@ unsafe fn font_at(size: f32, weight: u16) -> Ptr {
                 GdipCreateFont(
                     family,
                     size,
-                    if weight % 1000 >= 700 { 1 } else { 0 },
+                    extra_style | if base_weight % 1000 >= 700 { 1 } else { 0 },
                     2,
                     &mut font,
                 );
@@ -224,12 +226,21 @@ impl Runtime {
         }
     }
 }
+thread_local! {
+    static OVERLAYS: RefCell<HashMap<([u32; 2], u32, i32, bool), (Vec<u8>, Option<[f32; 3]>)>> =
+        RefCell::new(HashMap::new());
+}
+pub fn clear_caches() {
+    crate::surface::clear_cache();
+    SHADOWS.with(|shadows| shadows.borrow_mut().clear());
+    GROUPS.with(|groups| groups.borrow_mut().clear());
+    REFLECTIONS.with(|cache| cache.borrow_mut().clear());
+    OVERLAYS.with(|cache| cache.borrow_mut().clear());
+}
 impl Drop for Runtime {
     fn drop(&mut self) {
+        clear_caches();
         FONTS.with(|fonts| fonts.borrow_mut().clear());
-        SHADOWS.with(|shadows| shadows.borrow_mut().clear());
-        GROUPS.with(|groups| groups.borrow_mut().clear());
-        REFLECTIONS.with(|cache| cache.borrow_mut().clear());
         unsafe {
             GdiplusShutdown(self.0);
         }
@@ -313,6 +324,84 @@ impl Image {
             height as u32,
             recover_icon_alpha(&black, &white),
         )
+    }
+    pub unsafe fn from_hbitmap(
+        hbitmap: windows_sys::Win32::Graphics::Gdi::HBITMAP,
+    ) -> Option<Self> {
+        if hbitmap.is_null() {
+            return None;
+        }
+        let mut bitmap: BITMAP = std::mem::zeroed();
+        if GetObjectW(
+            hbitmap,
+            std::mem::size_of::<BITMAP>() as i32,
+            &mut bitmap as *mut _ as _,
+        ) == 0
+        {
+            return None;
+        }
+        let width = bitmap.bmWidth;
+        let height = bitmap.bmHeight.abs();
+        if width <= 0 || height <= 0 || width > 2048 || height > 2048 {
+            return None;
+        }
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
+        let dc = GetDC(null_mut());
+        let rows = GetDIBits(
+            dc,
+            hbitmap,
+            0,
+            height as u32,
+            bgra.as_mut_ptr() as _,
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(null_mut(), dc);
+        if rows == 0 {
+            return None;
+        }
+        let opaque_fallback = bgra.chunks_exact(4).all(|p| p[3] == 0);
+        let w = width as u32;
+        let h = height as u32;
+        let side = w.max(h);
+        let ox = (side - w) / 2;
+        let oy = (side - h) / 2;
+        let mut rgba = vec![0u8; (side as usize) * (side as usize) * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let src = ((y * w + x) as usize) * 4;
+                let dst = (((y + oy) * side + (x + ox)) as usize) * 4;
+                let a = if opaque_fallback { 255 } else { bgra[src + 3] };
+                rgba[dst] = bgra[src + 2].min(a);
+                rgba[dst + 1] = bgra[src + 1].min(a);
+                rgba[dst + 2] = bgra[src].min(a);
+                rgba[dst + 3] = a;
+            }
+        }
+        Self::from_rgba(side, side, rgba)
+    }
+    pub fn max_opaque_extent(&self) -> [u32; 2] {
+        let Some(pixels) = &self._pixels else {
+            return [self.width, self.height];
+        };
+        let (mut max_x, mut max_y) = (0u32, 0u32);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let a = pixels[((y * self.width + x) as usize) * 4 + 3];
+                if a > 8 {
+                    max_x = max_x.max(x + 1);
+                    max_y = max_y.max(y + 1);
+                }
+            }
+        }
+        [max_x, max_y]
     }
     pub fn load(path: &Path) -> Option<Self> {
         let decoded = image::open(path).ok()?.into_rgba8();
@@ -521,6 +610,7 @@ impl Drop for Cost {
     }
 }
 thread_local! {static ACTIVE_BATCH:Cell<Option<(usize,usize)>>=const{Cell::new(None)};}
+thread_local! {static BATCH_DIRTY:Cell<bool>=const{Cell::new(true)};}
 thread_local! {static ALPHA_DC:Cell<Option<usize>>=const{Cell::new(None)};}
 pub fn has_alpha(dc: HDC) -> bool {
     ALPHA_DC.with(|a| a.get() == Some(dc as usize))
@@ -574,19 +664,13 @@ impl AlphaBatch {
         GdipSetTextRenderingHint(g, 3);
         GdipSetInterpolationMode(g, 3);
         GdipSetPixelOffsetMode(g, 4);
-        let canvas = Canvas {
-            g,
-            scale: dpi,
-            target: None,
-            transform: Cell::new([0., 0., 1., 0.]),
-            owned: true,
-            state: 0,
-        };
         let previous = ALPHA_DC.with(|a| a.replace(Some(dc as usize)));
         let previous_batch = ACTIVE_BATCH.with(|a| a.replace(Some((dc as usize, g as usize))));
         Some(Self {
             batch: Some(Batch {
-                _canvas: canvas,
+                scale: dpi,
+                target: target_for_dc(dc),
+                owns_g: true,
                 previous: previous_batch,
             }),
             bitmap,
@@ -603,23 +687,141 @@ impl Drop for AlphaBatch {
         ALPHA_DC.with(|a| a.set(self.previous));
     }
 }
+unsafe fn target_for_dc(dc: HDC) -> Option<crate::sampling::Target> {
+    let mut dib: DIBSECTION = std::mem::zeroed();
+    let bitmap = GetCurrentObject(dc, OBJ_BITMAP as u32);
+    let mut clip = std::mem::zeroed();
+    GetClipBox(dc, &mut clip);
+    if GetObjectW(
+        bitmap,
+        std::mem::size_of::<DIBSECTION>() as i32,
+        &mut dib as *mut _ as _,
+    ) == std::mem::size_of::<DIBSECTION>() as i32
+        && !dib.dsBm.bmBits.is_null()
+        && dib.dsBm.bmBitsPixel == 32
+        && dib.dsBm.bmWidthBytes == dib.dsBm.bmWidth * 4
+    {
+        Some(crate::sampling::Target {
+            bits: dib.dsBm.bmBits as _,
+            width: dib.dsBm.bmWidth as usize,
+            height: dib.dsBm.bmHeight.unsigned_abs() as usize,
+            clip: [clip.left, clip.top, clip.right, clip.bottom],
+            opaque: !ALPHA_DC.with(|a| a.get() == Some(dc as usize)),
+        })
+    } else {
+        None
+    }
+}
 pub struct Batch {
-    _canvas: Canvas,
+    scale: f32,
+    target: Option<crate::sampling::Target>,
+    owns_g: bool,
     previous: Option<(usize, usize)>,
 }
 impl Batch {
     pub unsafe fn new(dc: HDC, dpi: f32) -> Self {
-        let canvas = Canvas::new(dc, dpi);
-        let previous = ACTIVE_BATCH.with(|a| a.replace(Some((dc as usize, canvas.g as usize))));
+        GdiFlush();
+        let existing = ACTIVE_BATCH
+            .with(|a| a.get())
+            .filter(|(handle, _)| *handle == dc as usize);
+        let (owns_g, previous) = if let Some((_, g)) = existing {
+            (false, ACTIVE_BATCH.with(|a| a.replace(Some((dc as usize, g)))))
+        } else {
+            BATCH_DIRTY.with(|d| d.set(false));
+            (true, ACTIVE_BATCH.with(|a| a.replace(Some((dc as usize, 0)))))
+        };
         Self {
-            _canvas: canvas,
+            scale: dpi,
+            target: target_for_dc(dc),
+            owns_g,
             previous,
         }
+    }
+    pub fn blit(&self, image: &Image, r: [f32; 4], snapped: bool) -> bool {
+        let (Some(target), Some(pixels)) = (self.target, image._pixels.as_ref()) else {
+            return false;
+        };
+        let _cost = Cost::new(2);
+        let scale = self.scale;
+        let w = image.width as f32;
+        let h = image.height as f32;
+        let x0 = r[0] * scale;
+        let y0 = r[1] * scale;
+        let x = if snapped || (x0 - x0.round()).abs() < 0.01 {
+            x0.round()
+        } else {
+            x0
+        };
+        let y = if snapped { y0.round() } else { y0 };
+        let r = [x, y, x + w, y + h];
+        unsafe {
+            if BATCH_DIRTY.with(|d| d.replace(false)) {
+                if let Some((_, g)) = ACTIVE_BATCH.with(|a| a.get()).filter(|(_, g)| *g != 0) {
+                    GdipFlush(g as Ptr, 1);
+                }
+                GdiFlush();
+            }
+            target.draw(
+                pixels,
+                [image.width as usize, image.height as usize],
+                r,
+                [0., 0., 1., 0.],
+                1.,
+                image.tint,
+            );
+        }
+        true
+    }
+    pub fn group_surface(&self, r: [f32; 4], radius: f32, snapped: bool) -> bool {
+        let _cost = Cost::new(3);
+        let key = (
+            ((r[2] - r[0]) * self.scale).round() as u32,
+            ((r[3] - r[1]) * self.scale).round() as u32,
+            (radius * self.scale * 16.).round() as u32,
+            (self.scale * 1000.).round() as u32,
+        );
+        let pad = (14. * self.scale).ceil() as u32;
+        let p = pad as f32 / self.scale;
+        GROUPS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(&key) {
+                if cache.len() >= 16 {
+                    cache.clear();
+                }
+                let width = key.0 + pad * 2;
+                let height = key.1 + pad * 2;
+                if let Some(mut image) =
+                    Image::from_rgba(width, height, vec![0; (width * height * 4) as usize])
+                {
+                    unsafe {
+                        if let Some(canvas) = Canvas::on_image(&image, self.scale) {
+                            canvas.draw_group_material(
+                                [p, p, p + r[2] - r[0], p + r[3] - r[1]],
+                                radius,
+                            );
+                        }
+                    }
+                    image.refresh_tint();
+                    cache.insert(key, image);
+                }
+            }
+            cache
+                .get(&key)
+                .is_some_and(|image| self.blit(image, [r[0] - p, r[1] - p, r[2] + p, r[3] + p], snapped))
+        })
     }
 }
 impl Drop for Batch {
     fn drop(&mut self) {
-        ACTIVE_BATCH.with(|a| a.set(self.previous));
+        let current = ACTIVE_BATCH.with(|a| a.replace(self.previous));
+        if self.owns_g {
+            if let Some((_, g)) = current.filter(|(_, g)| *g != 0) {
+                unsafe {
+                    GdipFlush(g as Ptr, 1);
+                    GdipDeleteGraphics(g as Ptr);
+                }
+            }
+        }
     }
 }
 pub struct Canvas {
@@ -817,7 +1019,49 @@ impl Canvas {
             transform: Cell::new([0., 0., 1., 0.]),
         })
     }
+    pub fn render_sprite(
+        width: u32,
+        height: u32,
+        scale: f32,
+        draw: impl FnOnce(&Canvas),
+    ) -> Option<Image> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut image = Image::from_rgba(width, height, vec![0; (width * height * 4) as usize])?;
+        unsafe {
+            if let Some(canvas) = Self::on_image(&image, scale) {
+                draw(&canvas);
+            }
+        }
+        image.refresh_tint();
+        Some(image)
+    }
     pub fn pane_overlay(size: [u32; 2], dpi: f32, tint: f32, light: bool) -> Option<Image> {
+        let key = (size, dpi.to_bits(), (tint * 1000.).round() as i32, light);
+        if let Some((mut pixels, cached_tint)) = OVERLAYS.with(|c| c.borrow().get(&key).cloned()) {
+            unsafe {
+                let mut raw = null_mut();
+                if GdipCreateBitmapFromScan0(
+                    size[0] as i32,
+                    size[1] as i32,
+                    size[0] as i32 * 4,
+                    0xe200b,
+                    pixels.as_mut_ptr(),
+                    &mut raw,
+                ) == 0
+                {
+                    return Some(Image {
+                        raw,
+                        _pixels: Some(pixels),
+                        width: size[0],
+                        height: size[1],
+                        tint: cached_tint,
+                        horizontal_parts: RefCell::new(None),
+                    });
+                }
+            }
+        }
         let mut image =
             Image::from_rgba(size[0], size[1], vec![0; (size[0] * size[1] * 4) as usize])?;
         unsafe {
@@ -845,6 +1089,15 @@ impl Canvas {
             }
         }
         image.refresh_tint();
+        if let Some(pixels) = image._pixels.as_ref() {
+            OVERLAYS.with(|c| {
+                let mut cache = c.borrow_mut();
+                if cache.len() >= 12 {
+                    cache.clear();
+                }
+                cache.insert(key, (pixels.clone(), image.tint));
+            });
+        }
         Some(image)
     }
     pub fn tile(
@@ -1051,13 +1304,69 @@ impl Canvas {
         }
     }
     pub fn widget_corner_reflection(&self, r: [f32; 4], radius: f32, light: bool) {
+        let x = r[0] + radius * 0.65;
+        let y = r[1] + 4.;
+        let reach = ((r[2] - r[0]) * 0.40).clamp(160., 270.);
+        self.draw_corner_reflection_at(r, radius, x, y, reach, light);
+    }
+    pub unsafe fn widget_corner_reflection_for(
+        &self,
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        r: [f32; 4],
+        radius: f32,
+        light: bool,
+    ) {
+        let Some(panes) = crate::fusion::group(hwnd) else {
+            self.widget_corner_reflection(r, radius, light);
+            return;
+        };
+        let mut wr: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
+        for p in &panes {
+            let scale = p.dpi;
+            let left_covered = panes.iter().any(|q| {
+                q.id != p.id
+                    && q.rect[0] < p.rect[0] + 6. * scale
+                    && q.rect[2] >= p.rect[0] - 6. * scale
+                    && q.rect[1] <= p.rect[1] + p.radius * 0.5
+                    && q.rect[3] >= p.rect[1] + 6. * scale
+            });
+            let top_covered = panes.iter().any(|q| {
+                q.id != p.id
+                    && q.rect[1] < p.rect[1] + 6. * scale
+                    && q.rect[3] >= p.rect[1] - 6. * scale
+                    && q.rect[0] <= p.rect[0] + p.radius * 0.5
+                    && q.rect[2] >= p.rect[0] + 6. * scale
+            });
+            if left_covered || top_covered {
+                continue;
+            }
+            let p_l = (p.rect[0] - wr.left as f32) / self.scale;
+            let p_t = (p.rect[1] - wr.top as f32) / self.scale;
+            let p_w = (p.rect[2] - p.rect[0]) / self.scale;
+            let p_rad = p.radius / p.dpi;
+            let x = p_l + p_rad * 0.65;
+            let y = p_t + 4.;
+            let reach = (p_w * 0.40).clamp(160., 270.);
+            if x + reach < r[0] || x - reach > r[2] || y + 160. < r[1] || y - 160. > r[3] {
+                continue;
+            }
+            self.draw_corner_reflection_at(r, radius, x, y, reach, light);
+        }
+    }
+    fn draw_corner_reflection_at(
+        &self,
+        r: [f32; 4],
+        radius: f32,
+        x: f32,
+        y: f32,
+        reach: f32,
+        light: bool,
+    ) {
         // Localized reflection belongs to the enclosing glass, not the search
         // pane. Its short falloff leaves the rest of the wallpaper transparent.
         unsafe {
             let clip = self.path(r, radius);
-            let x = r[0] + radius * 0.65;
-            let y = r[1] + 4.;
-            let reach = ((r[2] - r[0]) * 0.40).clamp(160., 270.);
             let reflection = self.path([x - reach, y - 160., x + reach, y + 160.], 160.);
             let mut brush = null_mut();
             GdipCreatePathGradientFromPath(reflection, &mut brush);
@@ -1151,7 +1460,7 @@ impl Canvas {
                 if light {
                     argb(0xffffff, (amount * 36.) as u8)
                 } else {
-                    argb(0, (amount * 18.) as u8)
+                    argb(0xffffff, (amount * 6.) as u8)
                 },
                 80.,
                 0,
@@ -1263,6 +1572,7 @@ impl Canvas {
     }
     pub unsafe fn new(dc: HDC, scale: f32) -> Self {
         let _cost = Cost::new(0);
+        BATCH_DIRTY.with(|d| d.set(true));
         // Complete queued GDI copies before GDI+ blends into the same DIB.
         GdiFlush();
         let shared = ACTIVE_BATCH
@@ -1270,8 +1580,19 @@ impl Canvas {
             .filter(|(handle, _)| *handle == dc as usize);
         let owned = shared.is_none();
         let mut state = 0;
-        let g = if let Some((_, pointer)) = shared {
-            let g = pointer as Ptr;
+        let g = if let Some((handle, pointer)) = shared {
+            let g = if pointer != 0 {
+                pointer as Ptr
+            } else {
+                let mut g = null_mut();
+                GdipCreateFromHDC(dc, &mut g);
+                GdipSetSmoothingMode(g, 4);
+                GdipSetTextRenderingHint(g, 4);
+                GdipSetInterpolationMode(g, 3);
+                GdipSetPixelOffsetMode(g, 4);
+                ACTIVE_BATCH.with(|a| a.set(Some((handle, g as usize))));
+                g
+            };
             GdipSaveGraphics(g, &mut state);
             GdipResetWorldTransform(g);
             g
@@ -1664,6 +1985,12 @@ impl Canvas {
         let result=GdipMeasureString(self.g,text.as_ptr(),text.len()as i32-1,font,&layout,format,&mut bounds,null_mut(),null_mut());GdipDeleteStringFormat(format);
         if result==0 {bounds.w/self.scale}else{size}}
     }
+    pub fn measure_clock_monospace(&self,text:&str,size:f32)->f32 {
+        unsafe {let font=font_at(size*self.scale,1400);let mut format=null_mut();GdipCreateStringFormat(0x1000,0,&mut format);
+        let layout=Rect{x:0.,y:0.,w:10000.,h:1000.};let mut bounds=Rect{x:0.,y:0.,w:0.,h:0.};let text=wide(text);
+        let result=GdipMeasureString(self.g,text.as_ptr(),text.len()as i32-1,font,&layout,format,&mut bounds,null_mut(),null_mut());GdipDeleteStringFormat(format);
+        if result==0 {bounds.w/self.scale}else{size*3.75}}
+    }
     pub fn text_light(&self, text: &str, r: [f32; 4], size: f32, color: u32, align: i32) {
         let r = r.map(|v| (v * self.scale).round() / self.scale);
         self.text_weight(
@@ -1686,6 +2013,26 @@ impl Canvas {
             color,
             align,
             255,
+        );
+    }
+    pub fn text_styled(
+        &self,
+        text: &str,
+        r: [f32; 4],
+        size: f32,
+        style: u8,
+        color: u32,
+        align: i32,
+        opacity: u8,
+    ) {
+        self.text_weight(
+            text,
+            r,
+            size,
+            400 | (((style & 0x0f) as u16) << 12),
+            color,
+            align,
+            opacity,
         );
     }
     fn text_weight(

@@ -4,8 +4,9 @@ use super::Pane;
 use std::cell::RefCell;
 type Point = [f32; 2];
 #[derive(Clone)]
-struct Corner {
-    vertex: Point,
+pub(crate) struct Corner {
+    pub(crate) min: Point,
+    pub(crate) max: Point,
     center: Point,
     a: Point,
     b: Point,
@@ -14,33 +15,24 @@ struct Corner {
     radius: f32,
     convex: bool,
 }
-struct Outline {
+pub struct Outline {
     rects: Vec<[f32; 4]>,
-    lines: Vec<(Point, Point)>,
-    corners: Vec<Corner>,
+    h_lines: Vec<[f32; 3]>,
+    pub(crate) v_lines: Vec<[f32; 3]>,
+    pub(crate) corners: Vec<Corner>,
 }
 thread_local! { static CACHE: RefCell<Option<(Vec<Pane>, Outline)>> = const { RefCell::new(None) }; }
+#[inline]
 fn sub(a: Point, b: Point) -> Point {
     [a[0] - b[0], a[1] - b[1]]
 }
-fn dot(a: Point, b: Point) -> f32 {
-    a[0] * b[0] + a[1] * b[1]
-}
+#[inline]
 fn length(a: Point) -> f32 {
-    a[0].hypot(a[1])
+    (a[0] * a[0] + a[1] * a[1]).sqrt()
 }
+#[inline]
 fn point(v: Point, u: Point, amount: f32) -> Point {
     [v[0] + u[0] * amount, v[1] + u[1] * amount]
-}
-fn segment(p: Point, a: Point, b: Point) -> f32 {
-    let d = sub(b, a);
-    let n = dot(d, d);
-    let t = if n > 0. {
-        (dot(sub(p, a), d) / n).clamp(0., 1.)
-    } else {
-        0.
-    };
-    length(sub(p, point(a, d, t)))
 }
 fn coordinates(panes: &[Pane], axis: usize, tolerance: f32) -> Vec<f32> {
     let mut raw: Vec<_> = panes
@@ -85,7 +77,8 @@ impl Outline {
             .collect();
         let mut out = Self {
             rects,
-            lines: vec![],
+            h_lines: vec![],
+            v_lines: vec![],
             corners: vec![],
         };
         if xs.len() < 2 || ys.len() < 2 {
@@ -200,7 +193,8 @@ impl Outline {
                 let b = point(v, w, r);
                 let center = point(a, w, r);
                 corners.push(Corner {
-                    vertex: v,
+                    min: [v[0].min(center[0]), v[1].min(center[1])],
+                    max: [v[0].max(center[0]), v[1].max(center[1])],
                     center,
                     a,
                     b,
@@ -211,37 +205,64 @@ impl Outline {
                 });
             }
             for i in 0..corners.len() {
-                out.lines
-                    .push((corners[i].b, corners[(i + 1) % corners.len()].a));
+                let a = corners[i].b;
+                let b = corners[(i + 1) % corners.len()].a;
+                if (a[1] - b[1]).abs() <= (a[0] - b[0]).abs() {
+                    out.h_lines.push([a[1], a[0].min(b[0]), a[0].max(b[0])]);
+                } else {
+                    out.v_lines.push([a[0], a[1].min(b[1]), a[1].max(b[1])]);
+                }
             }
             out.corners.extend(corners);
         }
         out
     }
-    fn distance(&self, p: Point) -> f32 {
-        let mut inside = self
-            .rects
-            .iter()
-            .any(|r| p[0] >= r[0] && p[0] <= r[2] && p[1] >= r[1] && p[1] <= r[3]);
-        let mut d = f32::INFINITY;
-        for &(a, b) in &self.lines {
-            d = d.min(segment(p, a, b));
+    #[inline]
+    pub fn distance(&self, p: Point) -> f32 {
+        let px = p[0];
+        let py = p[1];
+        let mut inside = false;
+        for r in &self.rects {
+            if px >= r[0] && px <= r[2] && py >= r[1] && py <= r[3] {
+                inside = true;
+                break;
+            }
         }
+        let mut d_sq = f32::INFINITY;
+        for &[y0, x0, x1] in &self.h_lines {
+            let dx = (x0 - px).max(px - x1).max(0.);
+            let dy = py - y0;
+            d_sq = d_sq.min(dx * dx + dy * dy);
+        }
+        for &[x0, y0, y1] in &self.v_lines {
+            let dx = px - x0;
+            let dy = (y0 - py).max(py - y1).max(0.);
+            d_sq = d_sq.min(dx * dx + dy * dy);
+        }
+        let mut d = d_sq.sqrt();
         for c in &self.corners {
-            let q = sub(p, c.center);
-            let on_quadrant = dot(q, [-c.v[0], -c.v[1]]) >= 0. && dot(q, c.u) >= 0.;
+            let qx = px - c.center[0];
+            let qy = py - c.center[1];
+            let box_d = (qx.abs() - c.radius).max(qy.abs() - c.radius);
+            if box_d > 0. && box_d >= d {
+                continue;
+            }
+            let q_len = (qx * qx + qy * qy).sqrt();
+            let on_quadrant = qx * -c.v[0] + qy * -c.v[1] >= 0. && qx * c.u[0] + qy * c.u[1] >= 0.;
             d = d.min(if on_quadrant {
-                (length(q) - c.radius).abs()
+                (q_len - c.radius).abs()
             } else {
-                length(sub(p, c.a)).min(length(sub(p, c.b)))
+                let dax = px - c.a[0];
+                let day = py - c.a[1];
+                let dbx = px - c.b[0];
+                let dby = py - c.b[1];
+                (dax * dax + day * day).min(dbx * dbx + dby * dby).sqrt()
             });
-            if (0..2).all(|i| {
-                p[i] >= c.vertex[i].min(c.center[i]) && p[i] <= c.vertex[i].max(c.center[i])
-            }) {
+            if px >= c.min[0] && px <= c.max[0] && py >= c.min[1] && py <= c.max[1] {
                 inside = if c.convex {
-                    length(q) <= c.radius
+                    q_len <= c.radius
                 } else {
-                    length(q) >= c.radius
+                    q_len >= c.radius
                 };
             }
         }
@@ -251,13 +272,52 @@ impl Outline {
             d
         }
     }
+    #[inline]
+    pub fn coverage_with_distance(&self, x: f32, y: f32, d: f32) -> f32 {
+        if d < -0.625 {
+            return 1.;
+        }
+        if d > 0.625 {
+            return 0.;
+        }
+        let mut inside = 0;
+        for sy in 0..8 {
+            let py = y + (sy as f32 + 0.5) * 0.125 - 0.5;
+            for sx in 0..8 {
+                let px = x + (sx as f32 + 0.5) * 0.125 - 0.5;
+                inside += (self.distance([px, py]) <= 0.) as u32;
+            }
+        }
+        inside as f32 * (1. / 64.)
+    }
+    #[inline]
+    pub fn rim_light(&self, x: f32, y: f32, d: f32, dpi: f32) -> f32 {
+        let band = 2.5 * dpi;
+        if d < -band {
+            return 0.;
+        }
+        let nx = self.distance([x + 0.5, y]) - self.distance([x - 0.5, y]);
+        let ny = self.distance([x, y + 0.5]) - self.distance([x, y - 0.5]);
+        let length = (nx * nx + ny * ny).sqrt().max(0.001);
+        (0.09 + 0.28 * ((-nx * 0.6 - ny * 0.8) / length).max(0.))
+            * (1. + d.min(0.) / band).clamp(0., 1.)
+    }
 }
-pub(super) fn distance(panes: &[Pane], x: f32, y: f32) -> f32 {
+#[inline]
+pub fn with_outline<R>(panes: &[Pane], f: impl FnOnce(&Outline) -> R) -> R {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.as_ref().is_none_or(|(key, _)| key != panes) {
+        if cache.as_ref().is_none_or(|(key, _)| key.as_slice() != panes) {
             *cache = Some((panes.to_vec(), Outline::new(panes)));
         }
-        cache.as_ref().unwrap().1.distance([x, y])
+        f(&cache.as_ref().unwrap().1)
     })
+}
+#[cfg(test)]
+pub(super) fn distance(panes: &[Pane], x: f32, y: f32) -> f32 {
+    with_outline(panes, |outline| outline.distance([x, y]))
+}
+#[cfg(test)]
+pub(super) fn coverage_with_distance(panes: &[Pane], x: f32, y: f32, d: f32) -> f32 {
+    with_outline(panes, |outline| outline.coverage_with_distance(x, y, d))
 }

@@ -47,6 +47,18 @@ def main():
                 if dependency.lower().startswith(('vcruntime','msvcp','concrt')):
                     assert (file.parent/dependency).exists(),f'Missing app-local runtime: {dependency}'
     assert all(not name.startswith(('config/','target/','.scratch/')) for name in manifest['files'])
+    for name in ['LICENSE.txt','LICENSES/CREDITS.txt','LICENSES/THIRD-PARTY-NOTICES.txt','LICENSES/inventory.json']:
+        assert name in manifest['files'],f'Missing credits/license file: {name}'
+    license_text=(root/'LICENSE.txt').read_text(encoding='utf-8')
+    assert 'MIT License' in license_text and '2026 Nhat Ng' in license_text
+    inventory=json.loads((root/'LICENSES/inventory.json').read_text(encoding='utf-8'))
+    for entry in inventory['entries']:
+        assert entry['notices'],f"No full notice for {entry['name']}"
+        for notice in entry['notices']:
+            assert 'LICENSES/'+notice in manifest['files'],f'Missing upstream notice: {notice}'
+    assert any(e['name']=='lucide-controls' for e in inventory['entries'])
+    assert any(e['name']=='lucide-music' for e in inventory['entries'])
+    assert any(e['name']=='lucide-toolbar' for e in inventory['entries'])
     print(f"Verified {len(manifest['files'])} portable files; user state is excluded")
 
 if __name__=='__main__':main()

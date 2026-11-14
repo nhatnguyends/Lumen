@@ -57,9 +57,11 @@ pub enum Row {
     Widget {
         id: u32,
         settings_id: u32,
+        pin_id: u32,
         label: String,
         hint: String,
         value: bool,
+        pinned: bool,
     },
     Toggle {
         id: u32,
@@ -84,6 +86,7 @@ pub enum Row {
     Button {
         id: u32,
         label: String,
+        color: Option<u32>,
     },
     Note(String),
 }
@@ -133,6 +136,14 @@ impl Row {
         Self::Button {
             id,
             label: label.into(),
+            color: None,
+        }
+    }
+    pub fn accent_button(id: u32, label: impl Into<String>, color: u32) -> Self {
+        Self::Button {
+            id,
+            label: label.into(),
+            color: Some(color),
         }
     }
     pub fn note(text: impl Into<String>) -> Self {
@@ -168,6 +179,10 @@ struct State {
     message: u32,
     dpi: f32,
     scroll: f32,
+    smooth_scroll: crate::motion::SmoothScroll,
+    scroll_clock: Option<crate::motion::FrameClock>,
+    frame_queued: bool,
+    started: std::time::Instant,
     hits: Vec<Hit>,
     pressed: Option<Target>,
     bar_grab: f32,
@@ -234,7 +249,7 @@ impl Host {
             (info.rcWork.bottom - h).max(info.rcWork.top),
         );
         let surface = glass.borrow().wallpaper_accent();
-        let light = crate::contrast::luminance(surface) > 0.42;
+        let _light = crate::contrast::luminance(surface) > 0.42;
         let mut state = Box::new(RefCell::new(State {
             hwnd: null_mut(),
             owner,
@@ -245,6 +260,10 @@ impl Host {
             message: notify_message,
             dpi,
             scroll: 0.,
+            smooth_scroll: Default::default(),
+            scroll_clock: None,
+            frame_queued: false,
+            started: std::time::Instant::now(),
             hits: vec![],
             pressed: None,
             bar_grab: 0.,
@@ -255,8 +274,8 @@ impl Host {
             backdrop: None,
             key: String::new(),
             shadow: None,
-            surface,
-            light,
+            surface: 0x24201e,
+            light: false,
         }));
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW,
@@ -319,10 +338,14 @@ impl Host {
             }
         }
     }
-    pub fn set_surface(&mut self, color: u32, light: bool) {
+    pub fn set_surface(&mut self, _color: u32, _light: bool) {
         let mut s = self.state.borrow_mut();
-        s.surface = color;
-        s.light = light;
+        let fixed = 0x24201e;
+        if s.surface == fixed && !s.light {
+            return;
+        }
+        s.surface = fixed;
+        s.light = false;
         s.key.clear();
         unsafe {
             if IsWindowVisible(s.hwnd) != 0 {
@@ -371,27 +394,61 @@ fn inside(r: [f32; 4], p: [f32; 2]) -> bool {
 }
 fn height(row: &Row, columns: usize) -> f32 {
     match row {
-        Row::Section(_) => 18.,
+        Row::Section(_) => 32.,
         Row::Toggle { .. } => 48.,
-        Row::Widget { .. } => 116.,
+        Row::Widget { .. } => 104.,
         Row::Slider { .. } => 55.,
         Row::Choices { options, .. } => 34. + options.len().div_ceil(columns) as f32 * 36.,
-        Row::Button { .. } => 44.,
-        Row::Note(_) => 36.,
+        Row::Button { .. } => 40.,
+        Row::Note(_) => 30.,
     }
 }
+/// Shared geometry drives painting, scrolling and hit regions, including odd grid tails.
+fn row_layout(rows: &[Row], w: f32) -> Vec<[f32; 4]> {
+    let mut result = Vec::with_capacity(rows.len());
+    let mut y = 94.;
+    let mut i = 0;
+    while i < rows.len() {
+        if matches!(rows[i], Row::Widget { .. }) {
+            let count = rows[i..]
+                .iter()
+                .take_while(|r| matches!(r, Row::Widget { .. }))
+                .count();
+            let columns = if w >= 520. { 2 } else { 1 };
+            let gap = 12.;
+            let cell = (w - 48. - gap * (columns - 1) as f32) / columns as f32;
+            for n in 0..count {
+                let x = 24. + (n % columns) as f32 * (cell + gap);
+                let top = y + (n / columns) as f32 * 104.;
+                result.push([x, top, x + cell, top + 96.]);
+            }
+            y += count.div_ceil(columns) as f32 * 104.;
+            i += count;
+        } else {
+            if i > 0 && matches!(rows[i], Row::Section(_)) {
+                y += 12.;
+            }
+            let h = height(&rows[i], if w < 480. { 2 } else { 3 });
+            result.push([24., y, w - 24., y + h]);
+            y += h;
+            i += 1;
+        }
+    }
+    result
+}
 impl State {
+    fn now(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.
+    }
     unsafe fn size(&self) -> [f32; 2] {
         let mut r: RECT = zeroed();
         GetClientRect(self.hwnd, &mut r);
         [r.right as f32 / self.dpi, r.bottom as f32 / self.dpi]
     }
     fn content_height(&self, w: f32) -> f32 {
-        100. + self
-            .rows
-            .iter()
-            .map(|r| height(r, if w < 480. { 2 } else { 3 }))
-            .sum::<f32>()
+        row_layout(&self.rows, w)
+            .last()
+            .map_or(100., |r| r[3] + 18.)
     }
     unsafe fn emit(&mut self, id: u32, value: Value) {
         self.changes.retain(|c| c.id != id);
@@ -408,6 +465,9 @@ impl State {
             ReleaseCapture();
         }
         ShowWindow(self.hwnd, SW_HIDE);
+        KillTimer(self.hwnd, 1);
+        self.scroll_clock = None;
+        self.frame_queued = false;
         self.frame = None;
         self.backdrop = None;
         self.shadow = None;
@@ -431,6 +491,9 @@ impl State {
         let thumb = (track * track / content).max(24.);
         self.scroll = ((y - self.bar_grab - 64.) / (track - thumb).max(1.)).clamp(0., 1.)
             * (content - h + 18.).max(0.);
+        self.smooth_scroll.snap(self.scroll);
+        KillTimer(self.hwnd, 1);
+        self.scroll_clock = None;
         InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn activate(&mut self, target: Target) {
@@ -479,6 +542,12 @@ impl State {
                     *value = !*value;
                     change = Some((id, Value::Bool(*value)));
                 }
+                (Target::Toggle(id), Row::Widget { pin_id, pinned, .. })
+                    if *pin_id != 0 && id == *pin_id =>
+                {
+                    *pinned = !*pinned;
+                    change = Some((id, Value::Bool(*pinned)));
+                }
                 (
                     Target::Choice(id, index),
                     Row::Choices {
@@ -521,15 +590,18 @@ impl State {
             } = row
             {
                 if *key == id && min.is_finite() && max.is_finite() && *max > *min {
-                    *value = (*min + ratio * (*max - *min)).round().clamp(*min, *max);
-                    change = Some(*value);
+                    let next = (*min + ratio * (*max - *min)).round().clamp(*min, *max);
+                    if (*value - next).abs() > f32::EPSILON {
+                        *value = next;
+                        change = Some(next);
+                    }
                 }
             }
         }
         if let Some(value) = change {
             self.emit(id, Value::Number(value));
+            InvalidateRect(self.hwnd, null(), 0);
         }
-        InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn hit(&self, p: POINT) -> Option<Target> {
         let p = [p.x as f32 / self.dpi, p.y as f32 / self.dpi];
@@ -539,6 +611,7 @@ impl State {
             .map(|h| h.target)
     }
     unsafe fn paint(&mut self) {
+        let frame_started = std::time::Instant::now();
         let mut ps = zeroed();
         BeginPaint(self.hwnd, &mut ps);
         let mut rect: RECT = zeroed();
@@ -572,17 +645,15 @@ impl State {
                 b.width == rect.right && b.height == rect.bottom && b.dpi == self.dpi
             });
         if self.backdrop.is_none() || self.key != key && !frozen {
-            let brush = CreateSolidBrush(0x2e2419);
+            let bg = 0x24201e;
+            let brush = CreateSolidBrush(bg);
             FillRect(dc, &rect, brush);
             DeleteObject(brush);
-            self.glass
-                .borrow()
-                .draw(dc, self.hwnd, rect.right, rect.bottom);
             let c = Canvas::new(dc, self.dpi);
-            c.round([0., 0., w, h], 30., self.surface, 205, false, false);
-            c.coating([4., 4., w - 4., h - 4.], 30.);
+            c.round([0., 0., w, h], 30., bg, 255, false, false);
+            c.round([0.5, 0.5, w - 0.5, h - 0.5], 30., 0xffffff, 22, true, false);
             drop(c);
-            frame.bevel();
+            self.light = false;
             if let Some(back) = Buffer::plain(rect.right, rect.bottom, self.dpi) {
                 back.copy_from(dc);
                 self.backdrop = Some(back);
@@ -591,9 +662,20 @@ impl State {
         } else if let Some(back) = &self.backdrop {
             frame.copy_from(back.dc);
         }
-        self.scroll = self
-            .scroll
-            .clamp(0., (self.content_height(w) - h + 18.).max(0.));
+        let max_scroll = (self.content_height(w) - h + 18.).max(0.);
+        let now = self.now();
+        if self.scroll_clock.is_some() {
+            self.smooth_scroll.bounds(max_scroll, now);
+            self.scroll = self.smooth_scroll.value(now);
+            if !self.smooth_scroll.moving(now) {
+                KillTimer(self.hwnd, 1);
+                self.scroll_clock = None;
+            }
+        } else {
+            self.scroll = self.scroll.clamp(0., max_scroll);
+            self.smooth_scroll.max = max_scroll;
+            self.smooth_scroll.snap(self.scroll);
+        }
         let white = if self.light { 0x312720 } else { 0xf8f2f1 };
         let dim = if self.light { 0x706358 } else { 0xc7bcac };
         let c = Canvas::new(dc, self.dpi);
@@ -633,40 +715,25 @@ impl State {
             0,
         );
         let cols = if w < 480. { 2 } else { 3 };
-        let mut y = 94.;
-        // Reuse Dock's grouped 16-DIP card/rim around each section.
+        let positions = row_layout(&self.rows, w);
         for (i, row) in self.rows.iter().enumerate() {
             if matches!(row, Row::Section(_)) {
-                let end = y
-                    + 26.
-                    + self.rows[i + 1..]
-                        .iter()
-                        .take_while(|r| !matches!(r, Row::Section(_)))
-                        .map(|r| height(r, cols))
-                        .sum::<f32>();
-                c.round(
-                    shift([16., y + 26., w - 16., end]),
-                    16.,
-                    white,
-                    10,
-                    false,
-                    false,
-                );
-                c.round(
-                    shift([16., y + 26., w - 16., end]),
-                    16.,
-                    white,
-                    35,
-                    true,
-                    false,
-                );
+                let end = self.rows[i + 1..]
+                    .iter()
+                    .position(|r| matches!(r, Row::Section(_)))
+                    .map_or(self.rows.len(), |n| i + 1 + n);
+                if end > i + 1 && !matches!(self.rows[i + 1], Row::Widget { .. }) {
+                    let r = shift([16., positions[i][3], w - 16., positions[end - 1][3] + 4.]);
+                    c.round(r, 16., white, 10, false, false);
+                    c.round(r, 16., white, 35, true, false);
+                }
             }
-            y += height(row, cols);
         }
-        y = 94.;
         let mut hits = vec![];
-        for row in &self.rows {
-            let rh = height(row, cols);
+        for (i, row) in self.rows.iter().enumerate() {
+            let bounds = positions[i];
+            let y = bounds[1];
+            let rh = bounds[3] - y;
             match row {
                 Row::Section(label) => c.text(
                     &label
@@ -684,59 +751,107 @@ impl State {
                 Row::Widget {
                     id,
                     settings_id,
+                    pin_id,
                     label,
                     hint,
                     value,
+                    pinned,
                 } => {
+                    let left = bounds[0];
+                    let right = bounds[2];
+                    c.round(shift(bounds), 16., white, 12, false, false);
+                    c.round(shift(bounds), 16., white, 25, true, false);
+                    let preview = shift([left + 12., y + 12., left + 72., y + 59.]);
+                    let mini = Canvas::new(dc, self.dpi);
+                    mini.transform_about([preview[0], preview[1]], 60. / 112., 0.);
+                    widget_preview(
+                        &mini,
+                        [preview[0], preview[1], preview[0] + 112., preview[1] + 88.],
+                        label,
+                        self.dpi * 60. / 112.,
+                        white,
+                    );
+                    drop(mini);
                     c.text(
                         label,
-                        shift([158., y + 5., w - 85., y + 27.]),
-                        12.,
+                        shift([left + 84., y + 10., right - 12., y + 31.]),
+                        11.5,
                         true,
                         white,
                         0,
                     );
                     c.text(
                         hint,
-                        shift([158., y + 28., w - 85., y + 66.]),
-                        9.5,
+                        shift([left + 84., y + 33., right - 12., y + 63.]),
+                        9.,
                         false,
                         dim,
                         0,
                     );
+                    let settings = shift([left + 12., y + 67., left + 88., y + 89.]);
+                    if *settings_id != 0 {
+                        c.round(
+                            settings,
+                            11.,
+                            white,
+                            if self.pressed == Some(Target::Button(*settings_id)) {
+                                30
+                            } else {
+                                12
+                            },
+                            false,
+                            false,
+                        );
+                        c.text("Settings", settings, 10., false, white, 1);
+                        hits.push(Hit {
+                            rect: settings,
+                            target: Target::Button(*settings_id),
+                        });
+                    }
+                    if *pin_id != 0 {
+                        let pin_btn = shift([right - 86., y + 67., right - 64., y + 89.]);
+                        let pressed = self.pressed == Some(Target::Toggle(*pin_id));
+                        c.round(
+                            pin_btn,
+                            11.,
+                            white,
+                            if *pinned {
+                                if pressed { 75 } else { 52 }
+                            } else if pressed {
+                                30
+                            } else {
+                                12
+                            },
+                            false,
+                            false,
+                        );
+                        if let Some(icon) = header_icon(
+                            if *pinned { 3 } else { 2 },
+                            self.dpi,
+                            if *pinned { white } else { dim },
+                        ) {
+                            c.image(
+                                &icon,
+                                shift([right - 81.5, y + 71.5, right - 68.5, y + 84.5]),
+                            );
+                        }
+                        hits.push(Hit {
+                            rect: shift([right - 90., y + 63., right - 60., y + 93.]),
+                            target: Target::Toggle(*pin_id),
+                        });
+                    }
+                    let toggle = shift([right - 48., y + 69., right - 14., y + 89.]);
                     c.round(
-                        shift([18., y, w - 18., y + 108.]),
-                        16.,
+                        toggle,
+                        10.,
                         white,
-                        12,
+                        if *value { 80 } else { 20 },
                         false,
                         false,
                     );
-                    let preview = shift([28., y + 10., 140., y + 98.]);
-                    c.round(preview, 14., self.surface, 220, false, false);
-                    c.round(preview, 14., white, 65, true, false);
-                    widget_preview(&c, preview, label, self.dpi, white);
-                    let settings = shift([158., y + 74., 238., y + 100.]);
-                    let hover = self.pressed == Some(Target::Button(*settings_id));
+                    let x = if *value { right - 24. } else { right - 38. };
                     c.round(
-                        settings,
-                        14.,
-                        white,
-                        if hover { 30 } else { 12 },
-                        false,
-                        false,
-                    );
-                    c.text("Settings", settings, 10., false, white, 1);
-                    hits.push(Hit {
-                        rect: settings,
-                        target: Target::Button(*settings_id),
-                    });
-                    let r = shift([w - 61., y + 12., w - 27., y + 32.]);
-                    c.round(r, 10., white, if *value { 80 } else { 20 }, false, false);
-                    c.round(r, 10., white, 60, true, false);
-                    let x = if *value { w - 37. } else { w - 51. };
-                    c.round(
-                        shift([x - 7., y + 15., x + 7., y + 29.]),
+                        shift([x - 7., y + 72., x + 7., y + 86.]),
                         7.,
                         white,
                         255,
@@ -744,7 +859,7 @@ impl State {
                         false,
                     );
                     hits.push(Hit {
-                        rect: shift([w - 68., y, w - 20., y + 46.]),
+                        rect: shift([right - 58., y + 62., right - 7., y + 94.]),
                         target: Target::Toggle(*id),
                     });
                 }
@@ -894,11 +1009,16 @@ impl State {
                         });
                     }
                 }
-                Row::Button { id, label } => {
+                Row::Button { id, label, color } => {
                     let r = shift([28., y + 5., w - 28., y + 37.]);
-                    c.round(r, 9., white, 14, false, false);
-                    c.round(r, 9., white, 35, true, false);
-                    c.text(label, r, 11., false, white, 1);
+                    if let Some(color) = color {
+                        c.round(r, 9., *color, 255, false, false);
+                        c.text(label, r, 11., true, 0xffffff, 1);
+                    } else {
+                        c.round(r, 9., white, 14, false, false);
+                        c.round(r, 9., white, 35, true, false);
+                        c.text(label, r, 11., false, white, 1);
+                    }
                     hits.push(Hit {
                         rect: r,
                         target: Target::Button(*id),
@@ -913,7 +1033,14 @@ impl State {
                     0,
                 ),
             }
-            if !matches!(row, Row::Section(_) | Row::Choices { .. }) {
+            if !matches!(
+                row,
+                Row::Section(_) | Row::Choices { .. } | Row::Widget { .. }
+            ) && self
+                .rows
+                .get(i + 1)
+                .is_some_and(|r| !matches!(r, Row::Section(_)))
+            {
                 c.line(
                     &[(16., y + rh - self.scroll), (w - 16., y + rh - self.scroll)],
                     white,
@@ -921,7 +1048,6 @@ impl State {
                     0.5,
                 );
             }
-            y += rh;
         }
         for mut hit in hits {
             hit.rect[1] = hit.rect[1].max(58.);
@@ -938,14 +1064,7 @@ impl State {
             let thumb = (track * track / self.content_height(w)).max(24.);
             let yy =
                 64. + (track - thumb) * self.scroll / (self.content_height(w) - h + 18.).max(1.);
-            c.round(
-                [w - 10., yy, w - 7., yy + thumb],
-                1.5,
-                white,
-                100,
-                false,
-                false,
-            );
+            frame.fill_round([w - 10., yy, w - 7., yy + thumb], 1.5, white, 100);
             if let Some(rect) = self.scrollbar() {
                 self.hits.push(Hit {
                     rect,
@@ -961,6 +1080,14 @@ impl State {
             shadow.sync(self.hwnd, self.dpi, 255);
         }
         EndPaint(self.hwnd, &ps);
+        if IsWindowVisible(self.hwnd) != 0 && self.scroll_clock.is_some() {
+            crate::motion::pace_vsync(
+                self.hwnd,
+                frame_started,
+                &mut self.frame_queued,
+                crate::motion::VSYNC_FRAME,
+            );
+        }
     }
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1117,8 +1244,45 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_MOUSEWHEEL => {
-            s.scroll -= (wp >> 16) as i16 as f32 / 120. * 48.;
+            let [w, h] = s.size();
+            let now = s.now();
+            let max = (s.content_height(w) - h + 18.).max(0.);
+            s.smooth_scroll.bounds(max, now);
+            if s.scroll_clock.is_none() {
+                let cur = s.scroll;
+                s.smooth_scroll.snap(cur);
+                s.scroll_clock = Some(crate::motion::FrameClock::start());
+            }
+            s.smooth_scroll
+                .by(-((wp >> 16) as i16 as f32 / 120. * 72.), now);
+            s.scroll = s.smooth_scroll.value(now);
+            SetTimer(hwnd, 1, 10, None);
             InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_TIMER if wp == 1 => {
+            let now = s.now();
+            s.scroll = s.smooth_scroll.value(now);
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            if !s.smooth_scroll.moving(now) {
+                KillTimer(hwnd, 1);
+                s.scroll_clock = None;
+            }
+            0
+        }
+        m if m == crate::motion::VSYNC_FRAME => {
+            s.frame_queued = false;
+            let now = s.now();
+            s.scroll = s.smooth_scroll.value(now);
+            if s.smooth_scroll.moving(now) {
+                InvalidateRect(hwnd, null(), 0);
+            } else {
+                KillTimer(hwnd, 1);
+                s.scroll_clock = None;
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_KEYDOWN if wp == 0x1B => {
@@ -1175,7 +1339,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_KEYDOWN if wp == 0x21 || wp == 0x22 => {
-            s.scroll += if wp == 0x21 { -240. } else { 240. };
+            let [w, h] = s.size();
+            let now = s.now();
+            let max = (s.content_height(w) - h + 18.).max(0.);
+            s.smooth_scroll.bounds(max, now);
+            if s.scroll_clock.is_none() {
+                let cur = s.scroll;
+                s.smooth_scroll.snap(cur);
+                s.scroll_clock = Some(crate::motion::FrameClock::start());
+            }
+            s.smooth_scroll
+                .by(if wp == 0x21 { -240. } else { 240. }, now);
+            s.scroll = s.smooth_scroll.value(now);
+            SetTimer(hwnd, 1, 10, None);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1346,6 +1522,8 @@ pub fn palette_choices() -> Vec<Choice> {
 }
 const SETTINGS_SVG: &str = include_str!("../assets/toolbar/5.svg");
 const CLOSE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg>"##;
+const PIN_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>"##;
+const PIN_FILLED_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path fill="currentColor" d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>"##;
 fn header_icon(kind: usize, dpi: f32, ink: u32) -> Option<crate::render::Image> {
     let px = (16. * dpi * 2.).ceil().max(1.) as u32;
     thread_local! {static PIXELS:RefCell<Vec<(usize,u32,u32,Vec<u8>)>>=const {RefCell::new(Vec::new())};}
@@ -1364,7 +1542,13 @@ fn header_icon(kind: usize, dpi: f32, ink: u32) -> Option<crate::render::Image> 
         (ink >> 8) & 255,
         (ink >> 16) & 255
     );
-    let svg = (if kind == 0 { SETTINGS_SVG } else { CLOSE_SVG }).replace("currentColor", &color);
+    let svg = match kind {
+        0 => SETTINGS_SVG,
+        1 => CLOSE_SVG,
+        2 => PIN_SVG,
+        _ => PIN_FILLED_SVG,
+    }
+    .replace("currentColor", &color);
     let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px)?;
     resvg::render(
@@ -1375,7 +1559,7 @@ fn header_icon(kind: usize, dpi: f32, ink: u32) -> Option<crate::render::Image> 
     let pixels = pixmap.data().to_vec();
     PIXELS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.len() >= 8 {
+        if cache.len() >= 16 {
             cache.remove(0);
         }
         cache.push((kind, px, ink, pixels.clone()));
@@ -1416,16 +1600,26 @@ pub unsafe fn draw_widget_header(
             [r[0] + 1., r[1] + 1., r[2] - 1., r[3] - 1.],
             15.,
             0xffffff,
-            (motion.alpha * amount * if light { 128. } else { 19. }).round() as u8,
+            (motion.alpha * amount * if light { 140. } else { 42. }).round() as u8,
             false,
             false,
         );
+        if amount > 0.01 {
+            c.round(
+                [r[0] + 1., r[1] + 1., r[2] - 1., r[3] - 1.],
+                15.,
+                0xffffff,
+                (motion.alpha * amount * if light { 64. } else { 48. }).round() as u8,
+                true,
+                false,
+            );
+        }
         if pressed == Some(action) {
             c.round(
                 r,
                 16.,
                 ink,
-                (26. * motion.alpha).round() as u8,
+                (if light { 54. } else { 64. } * motion.alpha).round() as u8,
                 false,
                 false,
             );
@@ -1456,6 +1650,36 @@ pub unsafe fn retain_header_backing(frame: &mut Buffer, backing: &Buffer, hwnd: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn widget_grid_keeps_cards_and_following_sections_separate() {
+        let mut rows = vec![Row::section("Widgets")];
+        for id in 0..5 {
+            rows.push(Row::Widget {
+                id,
+                settings_id: id + 100,
+                pin_id: id + 200,
+                label: "Widget".into(),
+                hint: String::new(),
+                value: true,
+                pinned: false,
+            });
+        }
+        rows.push(Row::section("General"));
+        rows.push(Row::toggle(20, "Start with Windows", "", true));
+        let wide = row_layout(&rows, 568.);
+        assert_eq!(wide[1][1], wide[2][1]);
+        assert!(wide[1][2] < wide[2][0]);
+        assert_eq!(wide[3][1], wide[4][1]);
+        assert!(wide[5][3] < wide[6][1]);
+        let narrow = row_layout(&rows, 420.);
+        assert!(narrow[1][3] < narrow[2][1]);
+        for (rect, row) in wide.iter().zip(&rows) {
+            assert!(rect[0] >= 16. && rect[2] <= 552.);
+            if matches!(row, Row::Widget { .. }) {
+                assert!(rect[2] - rect[0] >= 200.);
+            }
+        }
+    }
     fn rows() -> Vec<Row> {
         vec![
             Row::section("Background"),
@@ -1476,7 +1700,7 @@ mod tests {
     }
     #[test]
     fn dock_metrics_and_header_use_the_outline_gear() {
-        assert_eq!(height(&Row::section("Background"), 3), 18.);
+        assert_eq!(height(&Row::section("Background"), 3), 32.);
         assert!(SETTINGS_SVG.contains("cx=\"12\" cy=\"12\" r=\"3\""));
         for (_, r) in widget_header_hits(240.) {
             assert_eq!(r[2] - r[0], 32.);

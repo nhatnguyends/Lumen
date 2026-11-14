@@ -4,6 +4,7 @@ use crate::render::Canvas;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Browse,
+    SignIn,
     Library,
     Close,
     Settings,
@@ -81,28 +82,26 @@ pub(super) fn design_scale(design: &str, w: f32, h: f32, queue: bool) -> Option<
         "coverflow" => (320., if queue { 300. } else { 244. }),
         "orbit" => (320., if queue { 408. } else { 352. }),
         "disc" => (560., if queue { 302. } else { 222. }),
-        "sky" => (420., 422.),
-        "sleeve" | "turntable" => (300., 370.),
+        "compact" | "turntable" => (300., 370.),
         _ => (240., 172.),
     };
     let scale = (w / (width + 1.)).min((h - 54.) / (body + 1.)).min(1.);
     (scale >= 0.5).then_some(scale)
 }
-pub(super) fn layout_plan(design: &str, w: f32, h: f32, queue: bool) -> Option<(f32, bool)> {
-    design_scale(design, w, h, queue)
-        .map(|scale| (scale, queue))
-        .or_else(|| {
-            queue
-                .then(|| design_scale(design, w, h, false))
-                .flatten()
-                .map(|scale| (scale, false))
-        })
+pub(super) fn layout_plan(design: &str, w: f32, h: f32, _queue: bool) -> Option<(f32, bool)> {
+    design_scale(design, w, h, false).map(|scale| (scale, false))
 }
 
 impl State {
     pub unsafe fn content(&mut self, dc: HDC, w: f32, h: f32) {
         self.buttons.clear();
         self.control_plates.clear();
+        if self.config.design != "coverflow" {
+            self.content_scale = 1.;
+            self.responsive_content(dc, w, h);
+            self.draw_header(dc, w);
+            return;
+        }
         if let Some((scale, draw_queue)) = layout_plan(&self.config.design, w, h, self.config.queue)
         {
             let dpi = self.dpi;
@@ -147,12 +146,16 @@ impl State {
         if self.content_scale < 1. {
             54. / self.content_scale
         } else {
-            crate::settings_ui::widget_content_top(w, h)
+            crate::settings_ui::widget_content_top(w, h).max(if self.playback.signed_in {
+                0.
+            } else {
+                54.
+            })
         }
     }
     unsafe fn design_content(&mut self, dc: HDC, w: f32, h: f32) {
         let c = Canvas::new(dc, self.dpi);
-        if matches!(self.config.design.as_str(), "orbit" | "disc" | "sky") {
+        if matches!(self.config.design.as_str(), "orbit" | "disc") {
             self.reference_theme(&c, dc, w, h);
             return;
         }
@@ -160,7 +163,7 @@ impl State {
             self.coverflow_content(&c, dc, w, h);
             return;
         }
-        if h < 380. || w < 300. || self.config.design == "lumen" {
+        if h < 380. || w < 300. {
             self.compact_content(&c, dc, w, h);
             return;
         }
@@ -295,6 +298,23 @@ impl State {
     }
     unsafe fn draw_header(&mut self, dc: HDC, w: f32) {
         use crate::settings_ui::{widget_header_hits, HeaderAction};
+        if !self.playback.signed_in {
+            let r = [18., 14., 80., 40.];
+            let c = Canvas::new(dc, self.dpi);
+            let color = if self.pressed == Some(Action::SignIn) {
+                0x0000cc
+            } else if self.hover == Some(Action::SignIn) {
+                0x0000e6
+            } else {
+                0x0000ff
+            };
+            c.round(r, 13., color, 255, false, false);
+            c.text("Sign in", r, 11., true, 0xffffff, 1);
+            self.buttons.push(Button {
+                rect: r,
+                action: Action::SignIn,
+            });
+        }
         // Match the visual stacking order: chrome is drawn and hit-tested last,
         // so compact Coverflow cards never intercept Settings/Hide.
         for (action, rect) in widget_header_hits(w) {
@@ -330,7 +350,12 @@ impl State {
         }
     }
     unsafe fn tiny_content(&mut self, c: &Canvas, dc: HDC, w: f32, h: f32) {
-        let l = tiny_layout(w, h);
+        let mut l = tiny_layout(w, h);
+        if !self.playback.signed_in && w < 220. && h < 220. {
+            l.art = [18., l.title[1], 46., l.title[1] + 28.];
+            l.title[0] = 54.;
+            l.artist[0] = 54.;
+        }
         self.rounded_cover(c, self.playback.art.as_deref().unwrap_or(""), l.art, 9.);
         c.text_medium(self.track_title(), l.title, 13., self.ink, 0);
         c.text(&self.playback.artist, l.artist, 11., false, self.muted, 0);
@@ -351,17 +376,12 @@ impl State {
         } else {
             0
         };
-        let reserve = if rows > 0 {
+        let _reserve = if rows > 0 {
             rows as f32 * 38. + 12.
         } else {
             0.
         };
-        let extra =
-            if self.config.design == "lumen" && crate::settings_ui::widget_title_visible(w, h) {
-                ((h - body - 164. - bump - reserve - 12.) / 2.).max(0.)
-            } else {
-                0.
-            };
+        let extra = 0.;
         let top = body + extra;
         let right = w - if crate::settings_ui::widget_title_visible(w, h) {
             24.
@@ -404,17 +424,15 @@ impl State {
         }
         self.timeline(c, [22., top + 54. + bump, w - 22., top + 74. + bump], true);
         self.transport(c, w, top + 82. + bump, 40.);
-        self.button(
-            c,
-            [20., top + 128. + bump, w - 70., top + 154. + bump],
-            Action::Browse,
-            "Browse music",
-            true,
-        );
         self.media_button(
             c,
-            [w - 62., top + 120. + bump, w - 22., top + 154. + bump],
-            Action::Queue,
+            [
+                w / 2. - 16.,
+                top + 124. + bump,
+                w / 2. + 16.,
+                top + 156. + bump,
+            ],
+            Action::Browse,
             true,
         );
         if rows > 0 {
@@ -491,76 +509,8 @@ impl State {
             self.playback.available && self.playback.can_next,
         );
     }
-    pub(super) unsafe fn compact_queue(&mut self, c: &Canvas, w: f32, top: f32, rows: usize) {
-        let rows = self.background.as_ref().map_or(rows, |bg| {
-            rows.min(queue_capacity(bg.height as f32 / self.dpi, top))
-        });
-        if rows == 0 {
-            return;
-        }
-        self.queue_offset = self
-            .queue_offset
-            .min(self.playback.queue.len().saturating_sub(rows));
-        if self.playback.queue.is_empty() {
-            c.text(
-                "The player queue appears here",
-                [18., top, w - 18., top + 36.],
-                11.,
-                false,
-                self.muted,
-                1,
-            );
-        }
-        for (n, track) in self
-            .playback
-            .queue
-            .iter()
-            .skip(self.queue_offset)
-            .take(rows)
-            .cloned()
-            .enumerate()
-        {
-            let y = top + n as f32 * 38.;
-            let r = [16., y, w - 16., y + 35.];
-            if track.selected {
-                c.round(r, 9., self.ink, 20, false, false);
-            }
-            self.rounded_cover(c, &track.thumb, [20., y + 3., 48., y + 31.], 6.);
-            c.text(
-                &track.title,
-                [58., y, w - 24., y + 20.],
-                11.,
-                true,
-                self.ink,
-                0,
-            );
-            c.text(
-                &track.artist,
-                [58., y + 20., w - 24., y + 34.],
-                9.,
-                false,
-                self.muted,
-                0,
-            );
-            self.buttons.push(Button {
-                rect: r,
-                action: Action::Track(track.video_id),
-            });
-        }
-        if self.playback.queue.len() > rows {
-            let height = rows as f32 * 38. - 5.;
-            let thumb = (height * rows as f32 / self.playback.queue.len() as f32).max(8.);
-            let offset = (height - thumb) * self.queue_offset as f32
-                / self.playback.queue.len().saturating_sub(rows).max(1) as f32;
-            c.round(
-                [w - 12., top + offset, w - 9., top + offset + thumb],
-                1.5,
-                self.ink,
-                100,
-                false,
-                false,
-            );
-        }
+    pub(super) unsafe fn compact_queue(&mut self, _c: &Canvas, _w: f32, _top: f32, _rows: usize) {
+        // Queue/playlist UI is retired; the browser remains playback authority.
     }
     pub(super) unsafe fn cover(&self, c: &Canvas, url: &str, r: [f32; 4], alpha: f32) {
         if let Some(image) = self.cover_image(url) {
@@ -592,6 +542,9 @@ impl State {
         text: &str,
         enabled: bool,
     ) {
+        if action == Action::Queue {
+            return;
+        }
         if action == Action::Queue
             || action == Action::Toggle
             || action == Action::Next
@@ -694,7 +647,6 @@ mod tests {
         assert!(scale >= 0.5 && !queue);
         assert!(layout_plan("coverflow", 240., 180., false).is_some());
         assert!(layout_plan("disc", 300., 200., false).is_some());
-        assert!(layout_plan("sky", 280., 300., false).is_some());
     }
     #[test]
     fn tiny_layout_preserves_readable_content_and_clear_header_targets() {

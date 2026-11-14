@@ -32,43 +32,47 @@ pub fn material_weight(normal: f32, tangent: f32, dpi: f32) -> f32 {
     };
     fade(normal, 140.) * fade(tangent, 80.)
 }
-/// One bevel model for both member HWNDs and the uncovered concave bridge.
-pub fn rim_light(panes: &[Pane], x: f32, y: f32, d: f32, dpi: f32) -> f32 {
-    let band = 2.5 * dpi;
-    if d < -band {
-        return 0.;
-    }
-    let nx = distance(panes, x + 0.5, y) - distance(panes, x - 0.5, y);
-    let ny = distance(panes, x, y + 0.5) - distance(panes, x, y - 0.5);
-    let length = nx.hypot(ny).max(0.001);
-    (0.09 + 0.28 * ((-nx * 0.6 - ny * 0.8) / length).max(0.))
-        * (1. + d.min(0.) / band).clamp(0., 1.)
-}
+pub use contour::with_outline;
 /// Integrate edge coverage in physical pixels, shared by the member and bridge
 /// surfaces. Integrating the same circular contour prevents a jagged rim at
 /// fractional DPI and at the transition between member and bridge.
+#[cfg(test)]
 pub fn coverage(panes: &[Pane], x: f32, y: f32) -> f32 {
-    let d = distance(panes, x, y);
-    if d < -1. {
+    if covered_core(panes, x, y) {
         return 1.;
     }
-    if d > 1. {
-        return 0.;
-    }
-    let mut inside = 0;
-    for sy in 0..8 {
-        for sx in 0..8 {
-            let px = x + (sx as f32 + 0.5) / 8. - 0.5;
-            let py = y + (sy as f32 + 0.5) / 8. - 0.5;
-            inside += (distance(panes, px, py) <= 0.) as u32;
+    let d = distance(panes, x, y);
+    coverage_with_distance(panes, x, y, d)
+}
+/// Conservative rectangular strips and rounded cores inside members, away from
+/// snapping tolerance. Their union is fully covered without evaluating the outline.
+#[inline]
+pub fn covered_core(panes: &[Pane], x: f32, y: f32) -> bool {
+    covered_core_within(panes, x, y, 0.)
+}
+#[inline]
+pub fn covered_core_within(panes: &[Pane], x: f32, y: f32, min_margin_dip: f32) -> bool {
+    panes.iter().any(|p| {
+        let [l, t, r, b] = p.rect;
+        let margin = min_margin_dip.max(4.) * p.dpi;
+        if x < l + margin || x >= r - margin || y < t + margin || y >= b - margin {
+            return false;
         }
-    }
-    inside as f32 / 64.
+        let inset = p.radius + margin;
+        (x >= l + inset && x < r - inset)
+            || (y >= t + inset && y < b - inset)
+            || p.distance(x, y) <= -margin
+    })
+}
+#[cfg(test)]
+#[inline]
+pub fn coverage_with_distance(panes: &[Pane], x: f32, y: f32, d: f32) -> f32 {
+    contour::coverage_with_distance(panes, x, y, d)
 }
 /// Accept the small overlap of translucent HWND margins, but not a visible gap.
-pub fn touching_edges(end:f32,start:f32,scale:f32)->bool {
-    let overlap=end-start;
-    overlap>=-1.5*scale && overlap<=8.*scale
+pub fn touching_edges(end: f32, start: f32, scale: f32) -> bool {
+    let overlap = end - start;
+    overlap >= -1.5 * scale && overlap <= 8. * scale
 }
 pub fn adjacent(a: &Pane, b: &Pane) -> bool {
     if a.id == b.id || a.topmost != b.topmost {
@@ -77,9 +81,9 @@ pub fn adjacent(a: &Pane, b: &Pane) -> bool {
     let scale = a.dpi.max(b.dpi);
     let [al, at, ar, ab] = a.rect;
     let [bl, bt, br, bb] = b.rect;
-    ((touching_edges(ar,bl,scale) || touching_edges(br,al,scale))
+    ((touching_edges(ar, bl, scale) || touching_edges(br, al, scale))
         && overlap(at, ab, bt, bb) >= 48. * scale)
-        || ((touching_edges(ab,bt,scale) || touching_edges(bb,at,scale))
+        || ((touching_edges(ab, bt, scale) || touching_edges(bb, at, scale))
             && overlap(al, ar, bl, br) >= 48. * scale)
 }
 /// Partition overlapping HWND margins. Each translucent background is painted
@@ -128,6 +132,7 @@ pub fn components(panes: &[Pane]) -> Vec<Vec<Pane>> {
 mod contour;
 /// Distance to one rounded outline of the rectangle union. Collinear boundary
 /// segments merge before rounding, so aligned joins have no corner at all.
+#[cfg(test)]
 pub fn distance(panes: &[Pane], x: f32, y: f32) -> f32 {
     contour::distance(panes, x, y)
 }
@@ -229,15 +234,52 @@ pub fn snap_move(moving: &Pane, others: &[Pane]) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coverage_fast_path_matches_exact_contour_at_fractional_scales() {
+        for scale in [1., 1.25, 1.5, 2.] {
+            let panes = [
+                pane(1, [0., 0., 160. * scale, 180. * scale]),
+                pane(2, [0.8 * scale, 180.5 * scale, 300. * scale, 360. * scale]),
+            ]
+            .map(|p| Pane {
+                radius: 34. * scale,
+                dpi: scale,
+                ..p
+            });
+            for y in (0..(360. * scale) as i32).step_by(3) {
+                for x in (0..(300. * scale) as i32).step_by(3) {
+                    let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+                    assert_eq!(
+                        coverage(&panes, x, y),
+                        coverage_with_distance(&panes, x, y, distance(&panes, x, y))
+                    );
+                }
+            }
+        }
+    }
     use super::*;
     #[test]
     fn saved_clock_music_overlap_is_a_direct_material_neighbor() {
-        let a=Pane{id:1,rect:[1406.,763.,2041.,1356.],radius:59.5,dpi:1.75,topmost:false};
-        let b=Pane{id:2,rect:[2033.,763.,3076.,1356.],..a};
-        assert!(adjacent(&a,&b));assert!(adjacent(&b,&a));
-        assert!(touching_edges(a.rect[2],b.rect[0],1.75));
-        let gap=Pane{rect:[2048.,763.,3091.,1356.],..b};
-        assert!(!adjacent(&a,&gap),"do not fuse across visible gaps");
+        let a = Pane {
+            id: 1,
+            rect: [1406., 763., 2041., 1356.],
+            radius: 59.5,
+            dpi: 1.75,
+            topmost: false,
+        };
+        let b = Pane {
+            id: 2,
+            rect: [2033., 763., 3076., 1356.],
+            ..a
+        };
+        assert!(adjacent(&a, &b));
+        assert!(adjacent(&b, &a));
+        assert!(touching_edges(a.rect[2], b.rect[0], 1.75));
+        let gap = Pane {
+            rect: [2048., 763., 3091., 1356.],
+            ..b
+        };
+        assert!(!adjacent(&a, &gap), "do not fuse across visible gaps");
     }
     fn pane(id: usize, r: [f32; 4]) -> Pane {
         Pane {

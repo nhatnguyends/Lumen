@@ -3,7 +3,8 @@ import type { BrowserMusicState } from './musicBrowser'
 export interface PlayerPageState extends BrowserMusicState {
   videoId: string
   canSeek: boolean
-  signedIn: boolean
+  signedIn: boolean | null
+  authKnown?: boolean
   playlistId: string
 }
 
@@ -15,29 +16,50 @@ export const MUSIC_PAGE_STATE = `(() => {
   const video = document.querySelector('video');
   const meta = navigator.mediaSession?.metadata;
   const ad = !!document.querySelector('.ad-showing');
-  const rows = [...document.querySelectorAll('ytmusic-player-queue-item')];
+  const api = document.getElementById?.('movie_player');
+  const activeId = api?.getVideoData?.()?.video_id || bar?.data?.videoId || '';
+  const panel = document.querySelector('ytmusic-player-queue ytmusic-playlist-panel-renderer, ytmusic-player-queue');
+  const rows = [...(panel || document).querySelectorAll('ytmusic-player-queue-item')]
+    .filter(row => !row.closest?.('#counterpart-renderer, [slot="counterpart"]'));
+  const contents = panel?.data?.contents || panel?.data?.playlistPanelRenderer?.contents;
+  const unwrap = item => {
+    const w = item?.playlistPanelVideoWrapperRenderer;
+    if (!w) return item?.playlistPanelVideoRenderer || item;
+    const primary = w.primaryRenderer?.playlistPanelVideoRenderer;
+    const alts = (w.counterpart || []).map(c => c?.counterpartRenderer?.playlistPanelVideoRenderer).filter(Boolean);
+    return alts.find(c => (activeId && c.videoId === activeId) || (!primary?.selected && c.selected === true)) || primary;
+  };
+  const items = Array.isArray(contents) && contents.some(x => x?.playlistPanelVideoRenderer || x?.playlistPanelVideoWrapperRenderer)
+    ? contents.map(x => ({data: unwrap(x)})) : rows;
   const runs = v => v?.runs?.map(r => r.text || '').join('') || v?.simpleText || '';
-  const queue = rows.slice(0, 60).flatMap(row => {
+  const queue = items.slice(0, 60).flatMap(row => {
     const d = row.data?.playlistPanelVideoRenderer || row.data || {};
-    const link = row.querySelector('a[href*="watch?v="]');
+    const link = row.querySelector?.('a[href*="watch?v="]');
     const id = d.videoId || (link ? new URL(link.href).searchParams.get('v') : '');
     if (!/^[\\w-]{11}$/.test(id || '')) return [];
-    const thumb = d.thumbnail?.thumbnails?.at(-1)?.url || row.querySelector('img')?.src || '';
-    return [{videoId:id,title:runs(d.title) || text(row.querySelector('.song-title, #video-title')) || text(link),
-      artist:runs(d.shortBylineText) || text(row.querySelector('.byline')),thumb,duration:0,
-      url:'https://music.youtube.com/watch?v='+id, selected:row.hasAttribute('selected') || d.selected === true}];
+    const thumb = d.thumbnail?.thumbnails?.at(-1)?.url || row.querySelector?.('img')?.src || '';
+    return [{videoId:id,title:runs(d.title) || text(row.querySelector?.('.song-title, #video-title')) || text(link),
+      artist:runs(d.shortBylineText) || text(row.querySelector?.('.byline')),thumb,duration:0,
+      url:'https://music.youtube.com/watch?v='+id, selected:row.hasAttribute?.('selected') || d.selected === true}];
   });
-  const title = meta?.title || text(bar?.querySelector('.title'));
+  const videoId = activeId || queue.find(t => t.selected)?.videoId || new URL(location.href).searchParams.get('v') || '';
+  const current = queue.find(t => t.videoId === videoId);
+  for (const item of queue) item.selected = item.videoId === videoId;
+  const title = current?.title || text(bar?.querySelector('.title')) || meta?.title;
+  const loggedIn = window.ytcfg?.get?.('LOGGED_IN') ?? window.ytcfg?.data_?.LOGGED_IN;
+  const avatar = !!document.querySelector('ytmusic-user-menu-renderer #avatar, ytmusic-user-menu-renderer #avatar-btn, ytmusic-nav-bar #avatar, ytmusic-nav-bar #avatar-btn, ytmusic-nav-bar #avatar-button');
+  const signIn = !!document.querySelector('ytmusic-nav-bar a[href*="accounts.google.com"], ytmusic-nav-bar a[href*="ServiceLogin"]');
+  const signedIn = typeof loggedIn === 'boolean' ? loggedIn : avatar ? true : signIn ? false : null;
   const duration = Number.isFinite(video?.duration) ? video.duration : 0;
   return { available:!!video && video.readyState >= 2 && !!title, playing:!!video && !video.paused && !video.ended,
-    title, artist:meta?.artist || text(bar?.querySelector('.byline a')),
-    album:meta?.album || '', art:meta?.artwork?.at(-1)?.src || bar?.querySelector('img')?.src || null,
+    title, artist:current?.artist || text(bar?.querySelector('.byline a')) || meta?.artist,
+    album:meta?.album || '', art:current?.thumb || bar?.querySelector('img')?.src || meta?.artwork?.at(-1)?.src || null,
     position:video?.currentTime || 0,duration,canSeek:!ad && duration > 0,
     canNext:!ad && !!bar?.querySelector('.next-button:not([disabled])'),
     canPrevious:!ad && !!bar?.querySelector('.previous-button:not([disabled])'),
-    videoId:new URL(location.href).searchParams.get('v') || '',
+    videoId,
     playlistId:new URL(location.href).searchParams.get('list') || '',
-    signedIn:!!document.querySelector('ytmusic-nav-bar #avatar-btn, ytmusic-nav-bar #avatar-button, ytmusic-nav-bar button[aria-label*="Account"]'),
+    signedIn,
     queue,error:null};
 })()`
 

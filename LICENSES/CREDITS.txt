@@ -1,0 +1,82 @@
+# Lumen — credits and acknowledgements
+
+Created by **Nhat Ng**. Copyright © 2026 Nhat Ng.
+
+Lumen's original source code is available under the **MIT License**. See
+[`LICENSE.txt`](LICENSE.txt). Dependencies and assets retain their own licenses;
+Lumen's MIT license does not replace their terms or ownership.
+
+Thank you to the developers, maintainers and contributors whose open-source
+work makes Lumen possible. Your work powers its native windows, glass rendering,
+icons, image decoding, configuration, updates and optional music integration.
+
+## Native app and rendering
+
+| Project | Used for | License declared by the dependency |
+| --- | --- | --- |
+| [Rust](https://www.rust-lang.org/) and its contributors | Native host and standard library | MIT OR Apache-2.0; component notices apply |
+| [windows-rs / windows-sys](https://github.com/microsoft/windows-rs) and Microsoft contributors | Windows API bindings | MIT OR Apache-2.0 |
+| [resvg / usvg / svgtypes](https://github.com/linebender/resvg) and contributors | SVG parsing and rendering | Apache-2.0 OR MIT |
+| [tiny-skia](https://github.com/RazrFalcon/tiny-skia) and contributors | Antialiased vector rasterization | BSD-3-Clause |
+| [image](https://github.com/image-rs/image) and contributors | Image loading and decoding | MIT OR Apache-2.0 |
+| [Serde](https://github.com/serde-rs/serde) and [serde_json](https://github.com/serde-rs/json) contributors | Configuration and JSON messages | MIT OR Apache-2.0 |
+| [RustCrypto / sha2](https://github.com/RustCrypto/hashes) contributors | Update integrity verification | MIT OR Apache-2.0 |
+| [zip-rs](https://github.com/zip-rs/zip2) contributors | Portable update archive reading | MIT |
+
+Thanks also to every transitive dependency's authors. The generated inventory
+lists exact resolved versions and their upstream notices, including components
+such as image codecs, compression, Unicode data and build dependencies.
+
+## Icons
+
+- **Lucide Icons and contributors** — Lucide icons, ISC license.
+- **Cole Bemis and Feather contributors** — Feather-derived icons, MIT license.
+
+Thank you for the clear, consistent icon language used throughout Lumen.
+Embedded Music and Control Center SVGs retain their existing upstream notices.
+Toolbar SVGs include adaptations to stroke width and sizing. Full Lucide/Feather
+notices are included in the license collection; see [Lucide](https://lucide.dev/)
+and [Feather](https://feathericons.com/).
+
+## Music runtime and development tools
+
+- **Node.js contributors and the OpenJS community** — the optional Music adapter
+  uses Node.js. Its MIT license and bundled third-party notices are included with
+  the exact Node runtime shipped in each portable build.
+- **Niels Martignène and Koffi contributors** — [Koffi](https://koffi.dev/), MIT,
+  for the optional Music adapter's native window integration.
+- **VoidZero, Vite, Rolldown and their contributors** — MIT-licensed build and
+  bundling tools. Their bundled third-party notices remain included.
+- **Microsoft, TypeScript and DefinitelyTyped contributors** — TypeScript is
+  Apache-2.0; the Node type declarations use MIT. These are development tools.
+- **Python Software Foundation and Python contributors** — the source and
+  optional Python launchers use an installed Python interpreter. Python itself
+  is not bundled with Lumen. See [Python's license](https://docs.python.org/3/license.html).
+
+## Full notices and inventory
+
+The repository's `LICENSES/` directory and portable ZIPs contain the collected
+license/copyright/notice files and `THIRD-PARTY-NOTICES.md`. Exact versions are
+generated from Cargo metadata and the installed npm packages matching the lock
+file. The inventory deliberately includes build dependencies and resolved
+target-specific packages; it is not a claim that every entry runs at runtime.
+
+Generate an updated collection with:
+
+```text
+python scripts/third_party.py --output LICENSES
+```
+
+Portable builds regenerate the collection so new dependencies receive notices
+alongside the existing ones. This acknowledgement is additional to, not a
+replacement for, their complete license texts.
+
+## External content
+
+Windows, Chrome, Edge, YouTube Music, application icons, music artwork, installed
+fonts and user wallpapers remain the property of their respective owners.
+Installed browsers, Python, Windows fonts, user wallpapers and music artwork are
+not redistributed as Lumen-owned assets. Project names identify dependencies or
+integrations and do not imply endorsement by their developers.
+
+Full dependency inventory: THIRD-PARTY-NOTICES.txt in this folder.

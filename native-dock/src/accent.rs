@@ -96,6 +96,29 @@ pub fn dominant(pixels: &[u8]) -> u32 {
 pub fn light(color: u32) -> bool {
     crate::contrast::luminance(color) >= 0.48
 }
+/// Boost HSV saturation/value without clipping RGB channels or changing hue.
+pub fn vivid(color: u32) -> u32 {
+    let c = [
+        (color & 255) as f32 / 255.,
+        ((color >> 8) & 255) as f32 / 255.,
+        ((color >> 16) & 255) as f32 / 255.,
+    ];
+    let max = c.iter().copied().fold(0f32, f32::max);
+    let min = c.iter().copied().fold(1f32, f32::min);
+    let delta = max - min;
+    let value = (max * 3.).min(0.88);
+    let saturation = if max > 0. {
+        (delta / max * 3.).min(1.)
+    } else {
+        0.
+    };
+    let channel = |v: f32| {
+        let hue_component = if delta > 0. { (v - min) / delta } else { 0. };
+        ((value * (1. - saturation) + value * saturation * hue_component) * 255.).round() as u32
+    };
+    channel(c[0]) | (channel(c[1]) << 8) | (channel(c[2]) << 16)
+}
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn interaction(color: u32) -> u32 {
     let light = light(color);
     pack([0, 8, 16].map(|shift| {

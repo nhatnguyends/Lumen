@@ -5,18 +5,44 @@ use super::{
 };
 use std::{cell::RefCell, collections::HashMap};
 #[derive(Default)]
-pub(super) struct Icons(RefCell<HashMap<(Kind, u32, u32), Image>>, RefCell<HashMap<(u32,u32),Image>>);
+pub(super) struct Icons(
+    RefCell<HashMap<(Kind, u32, u32), Image>>,
+    RefCell<HashMap<(u32, u32), Image>>,
+);
 impl Icons {
-    pub unsafe fn pencil(&self,c:&Canvas,dpi:f32,r:[f32;4],color:u32){
-        let px=(14.*dpi*2.).ceil() as u32;let mut cache=self.1.borrow_mut();
-        if !cache.contains_key(&(color,px)) {
-            let svg=format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 5 5M4 15 16 3a3.54 3.54 0 0 1 5 5L9 20l-6 1z"/></svg>"##,color&255,(color>>8)&255,(color>>16)&255);
-            if let Ok(tree)=resvg::usvg::Tree::from_str(&svg,&resvg::usvg::Options::default()){if let Some(mut pix)=resvg::tiny_skia::Pixmap::new(px,px){resvg::render(&tree,resvg::tiny_skia::Transform::from_scale(px as f32/24.,px as f32/24.),&mut pix.as_mut());if let Some(im)=Image::from_rgba(px,px,pix.data().to_vec()){if cache.len()>12{cache.clear();}cache.insert((color,px),im);}}}
+    pub unsafe fn pencil(&self, c: &Canvas, dpi: f32, r: [f32; 4], color: u32) {
+        let px = (14. * dpi * 2.).ceil() as u32;
+        let mut cache = self.1.borrow_mut();
+        if !cache.contains_key(&(color, px)) {
+            let svg = format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 5 5M4 15 16 3a3.54 3.54 0 0 1 5 5L9 20l-6 1z"/></svg>"##,
+                color & 255,
+                (color >> 8) & 255,
+                (color >> 16) & 255
+            );
+            if let Ok(tree) = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()) {
+                if let Some(mut pix) = resvg::tiny_skia::Pixmap::new(px, px) {
+                    resvg::render(
+                        &tree,
+                        resvg::tiny_skia::Transform::from_scale(px as f32 / 24., px as f32 / 24.),
+                        &mut pix.as_mut(),
+                    );
+                    if let Some(im) = Image::from_rgba(px, px, pix.data().to_vec()) {
+                        if cache.len() > 12 {
+                            cache.clear();
+                        }
+                        cache.insert((color, px), im);
+                    }
+                }
+            }
         }
-        if let Some(im)=cache.get(&(color,px)){c.image(im,r);}
+        if let Some(im) = cache.get(&(color, px)) {
+            c.image(im, r);
+        }
     }
     pub fn clear(&self) {
-        self.0.borrow_mut().clear();self.1.borrow_mut().clear();
+        self.0.borrow_mut().clear();
+        self.1.borrow_mut().clear();
     }
     pub unsafe fn draw(
         &self,
@@ -60,7 +86,7 @@ impl Icons {
 }
 fn raster(kind: Kind, color: u32, px: u32) -> Option<Vec<u8>> {
     let svg = match kind {
-        Kind::Display => include_str!("../assets/monitor.svg"),
+        Kind::Display | Kind::Source => include_str!("../assets/monitor.svg"),
         Kind::Hdr => include_str!("../assets/sun.svg"),
         Kind::Audio => include_str!("../assets/headphones.svg"),
         Kind::Volume => include_str!("../assets/volume-2.svg"),

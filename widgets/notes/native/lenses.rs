@@ -64,9 +64,9 @@ fn pixels(diameter: u32, scale: f32, color: u32, style: u8) -> Vec<u8> {
             let radial = distance / radius;
             let facing = (-nx * 0.52 - ny * 0.85).max(0.);
             let strength = if pressed {
-                0.74
+                0.50
             } else if hover {
-                1.18
+                1.48
             } else {
                 1.
             };
@@ -81,11 +81,29 @@ fn pixels(diameter: u32, scale: f32, color: u32, style: u8) -> Vec<u8> {
             };
             // A luminous translucent body; only the lower shoulder carries
             // shade, so the lens stays bright on both milk and dark glass.
-            over([0.94, 0.97, 1.], if light { 0.24 } else { 0.12 });
+            over(
+                [0.94, 0.97, 1.],
+                if light { 0.24 } else { 0.12 }
+                    + if hover && !pressed {
+                        if light { 0.13 } else { 0.11 }
+                    } else {
+                        0.
+                    },
+            );
             over(tint, if active { 0.10 } else { 0.012 });
+            if pressed {
+                over([0.; 3], if light { 0.16 } else { 0.24 });
+            }
             over(
                 [0.; 3],
-                (ny * 0.7 + nx * 0.18).max(0.) * if light { 0.045 } else { 0.035 },
+                (ny * 0.7 + nx * 0.18).max(0.)
+                    * if pressed {
+                        0.12
+                    } else if light {
+                        0.045
+                    } else {
+                        0.035
+                    },
             );
             // Broad reflection rolls over the curved upper shoulder, rather than
             // filling the whole circle at the same opacity.
@@ -108,6 +126,9 @@ fn pixels(diameter: u32, scale: f32, color: u32, style: u8) -> Vec<u8> {
                 [0.91, 0.97, 1.],
                 rim * (0.10 + 0.46 * facing.powf(1.4)) * strength,
             );
+            if hover && !pressed {
+                over([1.; 3], rim * if light { 0.24 } else { 0.18 });
+            }
             let opacity = coverage * if enabled { 1. } else { 0.46 };
             let i = ((y * diameter + x) * 4) as usize;
             for ch in 0..3 {

@@ -10,7 +10,7 @@ impl Chrome {
         self.w < 240. || self.h < 220.
     }
     pub fn search_icon(self) -> bool {
-        self.tiny() && !self.search_open
+        (self.tiny() || self.w < 298.) && !self.search_open
     }
     pub fn large(self) -> bool {
         crate::settings_ui::widget_title_visible(self.w, self.h)
@@ -24,7 +24,11 @@ impl Chrome {
     }
     pub fn search(self) -> [f32; 4] {
         if self.search_icon() {
-            return [44., 12., 72., 40.];
+            if self.tiny() {
+                return [44., 12., 72., 40.];
+            }
+            let y = if self.large() { 48. } else { 18. };
+            return [66., y, 98., y + 32.];
         }
         if self.tiny() {
             return [12., 50., self.w - 12., 78.];
@@ -41,7 +45,7 @@ impl Chrome {
         ]
     }
     pub fn content_top(self) -> f32 {
-        if self.search_icon() {
+        if self.tiny() && self.search_icon() {
             52.
         } else {
             self.search()[3] + if self.tiny() { 8. } else { 16. }

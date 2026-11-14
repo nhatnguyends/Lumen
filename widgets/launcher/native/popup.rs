@@ -14,8 +14,10 @@ pub(super) enum Action {
     Folder,
     System(bool),
     Open(String),
+    EmptyRecycleBin(String),
     Rename(String),
     Icon(String),
+    ResetIcon(String),
     Groups(String),
     Ungroup(String),
     Remove(String),
@@ -37,6 +39,9 @@ pub(super) struct Popup {
     rows: Vec<Row>,
     pub hover: Option<usize>,
     pub pressed: Option<usize>,
+    hover_tweens: Vec<crate::motion::Tween>,
+    open_alpha: crate::motion::Tween,
+    open_scale: crate::motion::Tween,
     scroll: usize,
     slots: usize,
     pub edit: HWND,
@@ -73,6 +78,21 @@ impl Popup {
     fn inside(&self, p: [f32; 2]) -> bool {
         p[0] >= self.rect[0] && p[0] <= self.rect[2] && p[1] >= self.rect[1] && p[1] <= self.rect[3]
     }
+    fn retarget_hover(&mut self, now: f64) {
+        const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.];
+        for (i, tween) in self.hover_tweens.iter_mut().enumerate() {
+            let active = self.hover == Some(i) || self.pressed == Some(i);
+            tween.target(if active { 1. } else { 0. }, now, 180., EASE);
+        }
+    }
+    fn row_hover(&self, index: usize, now: f64) -> f32 {
+        self.hover_tweens.get(index).map_or(0., |t| t.sample(now))
+    }
+    pub(super) fn moving(&self, now: f64) -> bool {
+        self.open_alpha.moving(now)
+            || self.open_scale.moving(now)
+            || self.hover_tweens.iter().any(|t| t.moving(now))
+    }
 }
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
@@ -96,6 +116,33 @@ unsafe extern "system" fn edit_proc(
     result
 }
 impl App {
+    pub(super) unsafe fn sync_desktop_items(&mut self, hwnd: HWND) {
+        if self.moving_window || self.tile_drag.is_some() { return; }
+        let changed = if self.dock.sync_desktop {
+            let fresh = self.desktop_watch.is_none();
+            let watch = self.desktop_watch.get_or_insert_with(crate::desktop_sync::Watch::new);
+            (fresh || watch.changed()) && watch.sync(&mut self.dock)
+        } else {
+            self.desktop_watch = None;
+            let count = self.dock.items.len();
+            self.dock.items.retain(|i| !i.id.starts_with("desktop-sync:"));
+            count != self.dock.items.len()
+        };
+        if changed {
+            self.search_cache.get_mut().take();
+            let ids: std::collections::HashSet<_> = self.dock.items.iter().map(|i| i.id.clone()).collect();
+            self.icons.retain(|id, _| ids.contains(id));
+            self.scaled_icons.retain(|id, _| ids.contains(id));
+            self.tile_cache.retain(|id, _| ids.contains(id));
+            self.icon_shadows.retain(|id, _| ids.contains(id));
+            self.labels.retain(|id, _| ids.contains(id));
+            self.label_shadows.retain(|id, _| ids.contains(id));
+            self.hover = None;
+            self.popup = None;
+            self.save();
+            self.arm_motion(hwnd);
+        }
+    }
     pub(super) unsafe fn open_popup(&mut self, hwnd: HWND, kind: Kind, anchor: [f32; 2]) {
         self.popup = None;
         self.cancel_pointer(hwnd);
@@ -130,12 +177,24 @@ impl App {
                     }
                     .into();
                     push("Open", Action::Open(id.clone()), 1, true, false);
+                    if item.target.eq_ignore_ascii_case("shell:RecycleBinFolder") {
+                        push(
+                            "Empty Recycle Bin",
+                            Action::EmptyRecycleBin(id.clone()),
+                            5,
+                            true,
+                            true,
+                        );
+                    }
                     if item.catalog {
                         push("Pin to dock", Action::Pin(id.clone()), 0, true, false);
                     }
                     if !item.catalog {
                         push("Rename", Action::Rename(id.clone()), 2, true, false);
                         push("Change icon...", Action::Icon(id.clone()), 3, true, false);
+                        if item.icon.as_deref().is_some_and(|name| name.starts_with("native-custom-")) {
+                            push("Reset icon", Action::ResetIcon(id.clone()), 3, true, false);
+                        }
                         push(
                             "Group with...",
                             Action::Groups(id.clone()),
@@ -176,6 +235,12 @@ impl App {
         };
         let x = anchor[0].clamp(16., (w as f32 - width - 16.).max(16.));
         let y = (anchor[1] - height - 8.).clamp(16., (h as f32 - height - 16.).max(16.));
+        let hover_tweens = vec![crate::motion::Tween::fixed(0.); rows.len()];
+        let now = self.now();
+        let mut open_alpha = crate::motion::Tween::fixed(0.);
+        let mut open_scale = crate::motion::Tween::fixed(0.95);
+        open_alpha.target(1., now, 160., [0.2, 0.9, 0.2, 1.]);
+        open_scale.target(1., now, 160., [0.2, 0.9, 0.2, 1.]);
         let mut popup = Popup {
             rect: [x, y, x + width, y + height],
             kind: kind.clone(),
@@ -184,6 +249,9 @@ impl App {
             rows,
             hover: None,
             pressed: None,
+            hover_tweens,
+            open_alpha,
+            open_scale,
             scroll: 0,
             slots,
             edit: null_mut(),
@@ -225,6 +293,7 @@ impl App {
         self.arm_motion(hwnd);
     }
     pub(super) unsafe fn popup_down(&mut self, hwnd: HWND, p: [f32; 2]) -> bool {
+        let now = self.now();
         let Some(popup) = &mut self.popup else {
             return false;
         };
@@ -242,9 +311,12 @@ impl App {
             popup.pressed = popup.hit(p);
             SetCapture(hwnd);
         }
+        popup.retarget_hover(now);
+        self.arm_motion(hwnd);
         true
     }
     pub(super) unsafe fn popup_up(&mut self, hwnd: HWND, p: [f32; 2]) -> bool {
+        let now = self.now();
         let Some(popup) = &mut self.popup else {
             return false;
         };
@@ -254,27 +326,43 @@ impl App {
         } else {
             popup.hit(p)
         };
+        popup.retarget_hover(now);
         if GetCapture() == hwnd {
             ReleaseCapture();
         }
         if pressed.is_some() && pressed == over {
             let action = popup.rows[pressed.unwrap()].action.clone();
             self.popup_action(hwnd, action);
+        } else {
+            self.arm_motion(hwnd);
         }
         true
     }
     pub(super) unsafe fn popup_move(&mut self, hwnd: HWND, p: [f32; 2]) -> bool {
+        let now = self.now();
         let Some(popup) = &mut self.popup else {
             return false;
         };
         let hover = popup.hit(p);
         if hover != popup.hover {
             popup.hover = hover;
+            popup.retarget_hover(now);
             self.arm_motion(hwnd);
         }
         true
     }
+    pub(super) unsafe fn popup_leave(&mut self, hwnd: HWND) {
+        let now = self.now();
+        if let Some(popup) = &mut self.popup {
+            if popup.hover.is_some() {
+                popup.hover = None;
+                popup.retarget_hover(now);
+                self.arm_motion(hwnd);
+            }
+        }
+    }
     pub(super) unsafe fn popup_wheel(&mut self, hwnd: HWND, delta: i32) -> bool {
+        let now = self.now();
         let Some(popup) = &mut self.popup else {
             return false;
         };
@@ -284,10 +372,12 @@ impl App {
             popup.scroll = popup.scroll.saturating_sub(1);
         }
         popup.hover = None;
+        popup.retarget_hover(now);
         self.arm_motion(hwnd);
         true
     }
     pub(super) unsafe fn popup_key(&mut self, hwnd: HWND, key: u32) -> bool {
+        let now = self.now();
         let Some(popup) = &mut self.popup else {
             return false;
         };
@@ -315,6 +405,7 @@ impl App {
                 old.saturating_sub(1)
             };
             popup.hover = Some(next);
+            popup.retarget_hover(now);
             if next < popup.scroll {
                 popup.scroll = next;
             } else if next >= popup.scroll + popup.slots {
@@ -353,9 +444,30 @@ impl App {
                     self.launch(hwnd, i);
                 }
             }
+            Action::EmptyRecycleBin(id) => {
+                let res = SHEmptyRecycleBinW(hwnd, null(), 0);
+                if res == S_OK {
+                    self.icons.remove(&id);
+                    self.scaled_icons.remove(&id);
+                    self.tile_cache.remove(&id);
+                    self.icon_shadows.remove(&id);
+                    self.status = "Emptied Recycle Bin".into();
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
             Action::Rename(id) => self.open_popup(hwnd, Kind::Rename(id), anchor),
             Action::Groups(id) => self.begin_group_selection(hwnd, &id),
             Action::Icon(id) => self.change_icon(hwnd, &id),
+            Action::ResetIcon(id) => {
+                if let Some(item) = self.dock.items.iter_mut().find(|i| i.id == id) {
+                    item.icon = None;
+                }
+                self.icons.remove(&id);
+                self.scaled_icons.remove(&id);
+                self.tile_cache.remove(&id);
+                self.icon_shadows.remove(&id);
+                self.save();
+            }
             Action::Remove(id) => {
                 if let Some(i) = self.dock.items.iter().position(|i| i.id == id) {
                     self.context_command(hwnd, CMD_REMOVE, Some(i));
@@ -432,10 +544,21 @@ impl App {
         let Some(popup) = &self.popup else {
             return;
         };
-        let r = popup.rect;
+        let now = self.paint_time;
+        let open_a = popup.open_alpha.sample(now).clamp(0., 1.);
+        if open_a <= 0.001 {
+            return;
+        }
+        let open_s = popup.open_scale.sample(now);
+        let raw = popup.rect;
+        let cx = (raw[0] + raw[2]) * 0.5;
+        let cy = (raw[1] + raw[3]) * 0.5;
+        let hw = (raw[2] - raw[0]) * 0.5 * open_s;
+        let hh = (raw[3] - raw[1]) * 0.5 * open_s;
+        let r = [cx - hw, cy - hh, cx + hw, cy + hh];
         let light = crate::contrast::luminance(self.search_ink) < 0.5;
         let canvas = Canvas::new(dc, self.dpi);
-        canvas.soft_shadow(r, 18., 64., 10., 4.);
+        canvas.soft_shadow(r, 18., 64. * open_a, 10., 4.);
         canvas.round(
             r,
             18.,
@@ -444,12 +567,12 @@ impl App {
             } else {
                 rgb(29, 27, 40)
             },
-            248,
+            (248. * open_a).round() as u8,
             false,
             false,
         );
         canvas.coating(r, 18.);
-        canvas.round(r, 18., 0xffffff, 32, true, false);
+        canvas.round(r, 18., 0xffffff, (32. * open_a).round() as u8, true, false);
         let text = if light {
             rgb(33, 31, 45)
         } else {
@@ -476,6 +599,7 @@ impl App {
             muted,
             0,
         );
+        let now = self.paint_time;
         let rename = !popup.edit.is_null();
         for index in popup.scroll..(popup.scroll + popup.slots).min(popup.rows.len()) {
             let row = &popup.rows[index];
@@ -484,15 +608,19 @@ impl App {
             } else {
                 r[1] + 60. + (index - popup.scroll) as f32 * 32.
             };
-            if popup.hover == Some(index) || popup.pressed == Some(index) {
-                canvas.round(
-                    [r[0] + 8., y, r[2] - 8., y + 30.],
-                    9.,
-                    text,
-                    18,
-                    false,
-                    false,
-                );
+            let hover = popup.row_hover(index, now);
+            if hover > 0.001 {
+                let alpha = (hover * if popup.pressed == Some(index) { 26. } else { 18. }).round() as u8;
+                if alpha > 0 {
+                    canvas.round(
+                        [r[0] + 8., y, r[2] - 8., y + 30.],
+                        9.,
+                        text,
+                        alpha,
+                        false,
+                        false,
+                    );
+                }
             }
             if row.danger {
                 canvas.line(

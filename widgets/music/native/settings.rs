@@ -9,6 +9,9 @@ impl State {
     }
     pub(super) fn settings_rows(&self) -> Vec<Row> {
         vec![
+            Row::section("Account"),
+            Row::accent_button(204, if self.playback.signed_in { "Sign out of YouTube Music" } else { "Sign in to YouTube Music" }, 0x0000ff),
+            Row::note(if self.playback.signed_in { "Sign out clears the session only in Music's dedicated browser profile." } else { "Sign in in the browser, close it, then press Play to reconnect." }),
             Row::section("Background"),
             Row::toggle(101, "Frosted glass", "Blend Music with the wallpaper", self.config.frosted_glass),
             Row::slider(102, "Glass tint", self.config.tint, 0., 100., "%"),
@@ -19,16 +22,13 @@ impl State {
             Row::section("Layout"),
             Row::choices(201, "Music design", &self.config.design, vec![
                 Choice::new("coverflow", "Coverflow", Some(0x6c4952)),
-                Choice::new("lumen", "Compact", None),
-                Choice::new("sleeve", "Sleeve", Some(0x4b3349)),
+                Choice::new("compact", "Compact", Some(0x4b3349)),
                 Choice::new("turntable", "Turntable", Some(0x8eabbd)),
                 Choice::new("orbit", "Orbit", Some(0xd7d5d2)),
                 Choice::new("disc", "Disc", Some(0xf0eeed)),
-                Choice::new("sky", "Sky", Some(0xc28c18)),
             ]),
-            Row::toggle(202, "Show queue", "Scroll the loaded player queue inside Music", self.config.queue),
 
-            Row::note("Themes scale down in place before switching to the pocket player. Minimum size: 168 × 104 DIP. Queue collapses first when space is tight."),
+            Row::note("Themes scale down in place before switching to the pocket player. Minimum size: 168 × 104 DIP. Playback follows the web player."),
         ]
     }
     pub(super) unsafe fn ensure_settings(&mut self) -> bool {
@@ -65,6 +65,10 @@ impl State {
     }
     pub(super) fn apply_setting(&mut self, change: Change) -> bool {
         match (change.id, change.value) {
+            (204, Value::Action) => {
+                self.send(serde_json::json!({"action": if self.playback.signed_in { "signout" } else { "signin" }}));
+                return false;
+            }
             (101, Value::Bool(value)) => {
                 self.config.frosted_glass = value;
                 if !value {
@@ -79,10 +83,22 @@ impl State {
             }
             (104, Value::Number(value)) if value.is_finite() => {
                 self.config.blur = value.clamp(0., 40.);
-                self.blur_dirty = true;
+                if let Some(glass) = &mut self.local_glass {
+                    unsafe {
+                        glass.set_blur(self.config.blur, self.dpi);
+                    }
+                } else {
+                    self.blur_dirty = true;
+                }
+                self.background = None;
+                self.overlay = None;
+                self.settings_dirty = true;
+                return true;
             }
             (105, Value::Number(value)) if value.is_finite() => {
-                self.config.opacity = value.clamp(0., 100.)
+                self.config.opacity = value.clamp(0., 100.);
+                self.settings_dirty = true;
+                return true;
             }
             (106, Value::Choice(value)) if crate::surface::valid(&value) => {
                 self.config.palette = crate::surface::normalize(&value).unwrap_or(value)

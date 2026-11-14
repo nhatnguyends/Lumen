@@ -125,7 +125,7 @@ pub fn blend<'a>(
     for (pane, window, material) in sources {
         // Signed distance is negative inside. Outside, extend the edge color
         // smoothly into the neighboring pane; both sides evaluate one field.
-        let weight = (-pane.distance(x, y).max(0.) / (48. * pane.dpi)).exp();
+        let weight = (-pane.distance(x, y).max(0.) / (96. * pane.dpi)).exp();
         let sample = material.sample(window, x, y);
         for c in 0..3 {
             rgb[c] += sample[c] * weight;
