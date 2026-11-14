@@ -61,19 +61,19 @@ pub struct Dock {
     pub pinned_widgets: Vec<String>,
 }
 fn default_pinned_widgets() -> Vec<String> {
-    vec!["music".into(), "notes".into(), "calendar".into()]
+    vec!["calendar".into(), "notes".into(), "music".into()]
 }
 impl Default for Dock {
     fn default() -> Self {
         Self {
             version: 1,
             items: vec![],
-            columns: 8,
+            columns: 10,
             light: false,
             floating: false,
             position: None,
-            size: None,
-            blur: 13.0,
+            size: Some([683, 446]),
+            blur: 11.0,
             frosted: true,
             tint: 0.0,
             frost_strength: 100.0,
@@ -81,8 +81,8 @@ impl Default for Dock {
             icon_size: 48,
             show_labels: true,
             show_search: true,
-            sync_desktop: false,
-            theme: crate::accent::THEME.into(),
+            sync_desktop: true,
+            theme: "custom:#3A4C76".into(),
             pinned_widgets: default_pinned_widgets(),
         }
     }

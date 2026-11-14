@@ -117,18 +117,18 @@ impl Default for Config {
             version: 1,
             theme: "lumen".into(),
             week_starts_on: 1,
-            open: false,
+            open: true,
             floating: false,
             frosted: true,
             opacity: 100.,
-            tint: 18.,
+            tint: 0.,
             frost_strength: 100.,
-            blur: 13.,
+            blur: 8.,
             palette: "wallpaper-auto".into(),
             lumen_surface: "glass".into(),
             mist_weekly: true,
             position: None,
-            size: [420, 460],
+            size: [345, 446],
         }
     }
 }

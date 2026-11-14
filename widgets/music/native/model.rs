@@ -33,15 +33,15 @@ impl Default for Config {
             version: 1,
             design: "coverflow".into(),
             position: None,
-            size: [560, 480],
+            size: [491, 479],
             floating: false,
-            open: false,
+            open: true,
             queue: false,
             opacity: 100.,
             tint: crate::model::Dock::default().tint,
             frosted_glass: true,
             frost_strength: 100.,
-            blur: 13.,
+            blur: 4.,
             palette: crate::accent::THEME.into(),
         }
     }

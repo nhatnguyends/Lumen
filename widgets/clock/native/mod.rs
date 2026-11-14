@@ -494,12 +494,15 @@ impl State {
             .background
             .as_ref()
             .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
-        if !reusable || key != self.key {
+        if !reusable || (!(self.moving && crate::motion::low_power()) && key != self.key) {
             let brush = CreateSolidBrush(self.surface_color());
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
             let wallpaper_available = self.glass.borrow().available();
-            if self.config.frosted_glass && wallpaper_available {
+            if self.config.frosted_glass
+                && wallpaper_available
+                && !(self.moving && crate::motion::low_power())
+            {
                 self.draw_frost(frame.dc, r.right, r.bottom);
             }
             let light = crate::accent::light(self.surface_color());
@@ -787,7 +790,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (s.config.frosted_glass || crate::glass::liquid_glass())
+            if (!s.moving || !crate::motion::low_power())
+                && (s.config.frosted_glass || crate::glass::liquid_glass())
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);

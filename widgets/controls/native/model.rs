@@ -89,15 +89,15 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
-            open: false,
+            open: true,
             position: None,
-            size: [420, 560],
-            design: "lumen".into(),
+            size: [160, 446],
+            design: "compact".into(),
             palette: "wallpaper-auto".into(),
             frosted: true,
-            tint: 18.,
+            tint: 0.,
             opacity: 100.,
-            blur: 23.,
+            blur: 10.,
             frost_strength: 100.,
             floating: false,
             controls: [Kind::Volume, Kind::Audio]

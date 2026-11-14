@@ -381,6 +381,7 @@ impl State {
                 FillRect(bg.dc, &r, brush);
                 DeleteObject(brush);
                 if !reuse_frost {
+                if !(self.moving && crate::motion::low_power()) {
                 if self.config.frosted_glass {
                     if self.local_glass.is_none() {
                         let mut glass = Glass::new(self.config.blur, self.dpi);
@@ -396,6 +397,7 @@ impl State {
                     );
                 } else {
                     self.glass.borrow().draw_blended(bg.dc, self.hwnd, w, h, 0);
+                }
                 }
                     if !self.moving {
                         let mut pixels = bg.snapshot();
@@ -997,7 +999,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (s.config.frosted_glass || crate::glass::liquid_glass())
+            if (!s.moving || !crate::motion::low_power())
+                && (s.config.frosted_glass || crate::glass::liquid_glass())
                 && crate::glass::move_paint_due(hwnd)
             {
                 s.background = None;

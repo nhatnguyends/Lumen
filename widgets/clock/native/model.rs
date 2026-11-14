@@ -61,20 +61,20 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
-            theme: "lumen".into(),
+            theme: "sunset".into(),
             time_zone: "local".into(),
-            hour12: false,
-            show_seconds: true,
+            hour12: true,
+            show_seconds: false,
             frosted_glass: true,
-            open: false,
+            open: true,
             floating: false,
             position: None,
-            size: [380, 380],
+            size: [267, 217],
             opacity: 100.,
-            tint: 18.,
+            tint: 39.,
             frost_strength: 100.,
-            blur: 13.,
-            palette: "theme".into(),
+            blur: 4.,
+            palette: "gradient:afterglow".into(),
             dynamic_animation: true,
             animation_mode: "clock".into(),
         }
@@ -430,7 +430,7 @@ mod tests {
             serde_json::from_str(r#"{"theme":"lumen","size":[160,160]}"#).unwrap();
         old.validate().unwrap();
         assert_eq!(old.size, [160, 160]);
-        assert_eq!(old.blur, 13.);
+        assert_eq!(old.blur, Config::default().blur);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

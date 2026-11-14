@@ -177,6 +177,7 @@ mod tests {
     fn content_cache_ignores_animation_milliseconds_but_tracks_visible_options() {
         let mut cfg = Config {
             theme: "sunset".into(),
+            show_seconds: true,
             ..Config::default()
         };
         let mut t = time(12, 34);

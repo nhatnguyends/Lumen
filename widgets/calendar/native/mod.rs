@@ -694,11 +694,17 @@ impl State {
             self.config.frost_strength,
             self.config.palette
         );
-        if self.key != key || self.backdrop.is_none() {
+        let backdrop_reusable = self
+            .backdrop
+            .as_ref()
+            .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
+        if !backdrop_reusable
+            || (!(self.drag.is_some() && crate::motion::low_power()) && self.key != key)
+        {
             let brush = CreateSolidBrush(base);
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
-            if self.config.frosted {
+            if self.config.frosted && !(self.drag.is_some() && crate::motion::low_power()) {
                 self.glass.borrow().draw_blended(
                     frame.dc,
                     self.hwnd,
@@ -999,7 +1005,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(shadow) = &mut s.shadow {
                     shadow.sync_with_radius(hwnd, dpi, opacity, radius);
                 }
-                InvalidateRect(hwnd, null(), 0);
+                let resize = s.drag.as_ref().is_some_and(|d| d.edge != HTCAPTION);
+                if resize || !crate::motion::low_power() {
+                    InvalidateRect(hwnd, null(), 0);
+                }
             } else {
                 let hover = s.hit(p);
                 if hover != s.hover {
@@ -1160,7 +1169,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (s.config.frosted || crate::glass::liquid_glass())
+            if (s.drag.is_none() || !crate::motion::low_power())
+                && (s.config.frosted || crate::glass::liquid_glass())
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);

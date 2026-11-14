@@ -1565,6 +1565,14 @@ mod tests {
             let other = make_window(10, 10, 16, 16);
             assert!(!hwnd.is_null() && !other.is_null());
             let mut glass = Glass::new(0., 1.);
+            struct Reset(bool);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    set_liquid_glass(self.0);
+                }
+            }
+            let _reset = Reset(liquid_glass());
+            set_liquid_glass(false);
             glass.width = 512;
             glass.height = 320;
             glass.natural = [512., 320.];
@@ -1710,6 +1718,7 @@ mod tests {
             }
         }
         let _reset = Reset(liquid_glass());
+        set_liquid_glass(false);
         let glass = Glass::new(0., 1.);
         let rev_before = glass.revision();
         set_liquid_glass(true);

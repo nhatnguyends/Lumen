@@ -491,6 +491,7 @@ impl App {
     unsafe fn finish_resize(&mut self, hwnd: HWND) {
         self.apply_resize();
         self.resize_drag = None;
+        self.background_key.clear();
         InvalidateRect(hwnd, null(), 0);
         ReleaseCapture();
         if hwnd == self.hwnd {
@@ -1248,17 +1249,20 @@ impl App {
             let brush = CreateSolidBrush(p.background);
             FillRect(dc, &client, brush);
             DeleteObject(brush);
-            self.glass.borrow().draw_blended(
-                dc,
-                hwnd,
-                client.right,
-                client.bottom,
-                if self.dock.frosted {
-                    (self.dock.frost_strength * 255. / 100.).round() as u8
-                } else {
-                    0
-                },
-            );
+            if !((self.moving_window || self.resize_drag.is_some()) && crate::motion::low_power())
+            {
+                self.glass.borrow().draw_blended(
+                    dc,
+                    hwnd,
+                    client.right,
+                    client.bottom,
+                    if self.dock.frosted {
+                        (self.dock.frost_strength * 255. / 100.).round() as u8
+                    } else {
+                        0
+                    },
+                );
+            }
             let tint = if self.dock.frosted {
                 self.dock.tint
             } else {
@@ -2340,7 +2344,9 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_MOVE => {
-            if (!app.moving_window || app.dock.frosted || crate::glass::liquid_glass())
+            if (!app.moving_window
+                || (!crate::motion::low_power()
+                    && (app.dock.frosted || crate::glass::liquid_glass())))
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);

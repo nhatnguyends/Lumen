@@ -198,16 +198,16 @@ impl Default for Board {
             version: 1,
             notes: vec![],
             position: None,
-            size: [720, 620],
-            open: false,
+            size: [371, 656],
+            open: true,
             floating: false,
             design: "lumen".into(),
             opacity: 100.,
-            tint: 18.,
+            tint: 8.,
             frosted: true,
             frost_strength: 100.,
-            blur: None,
-            palette: crate::accent::THEME.into(),
+            blur: Some(8.),
+            palette: "custom:#5B848B".into(),
         }
     }
 }

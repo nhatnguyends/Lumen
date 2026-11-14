@@ -1407,7 +1407,8 @@ impl State {
             .background
             .as_ref()
             .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
-        let bg_reused = cached && self.background_key == key;
+        let bg_reused = cached
+            && ((self.moving && crate::motion::low_power()) || self.background_key == key);
         let own_alpha = (self.board.opacity * 2.55) as u8;
         let group_op = crate::fusion::group_opacities(self.hwnd, own_alpha);
         let header_action_key = |a: Option<&Action>| match a {
@@ -1486,17 +1487,19 @@ impl State {
                     },
                 );
             } else {
-                source_glass.borrow().draw_blended(
-                    frame.dc,
-                    self.hwnd,
-                    r.right,
-                    r.bottom,
-                    if self.board.frosted {
-                        (self.board.frost_strength * 2.55) as u8
-                    } else {
-                        0
-                    },
-                );
+                if !(self.moving && crate::motion::low_power()) {
+                    source_glass.borrow().draw_blended(
+                        frame.dc,
+                        self.hwnd,
+                        r.right,
+                        r.bottom,
+                        if self.board.frosted {
+                            (self.board.frost_strength * 2.55) as u8
+                        } else {
+                            0
+                        },
+                    );
+                }
                 {
                     let c = Canvas::new(frame.dc, self.dpi);
                     let pane = [0., 0., w, h];
@@ -2473,7 +2476,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (s.board.frosted || crate::glass::liquid_glass())
+            if (!s.moving || !crate::motion::low_power())
+                && (s.board.frosted || crate::glass::liquid_glass())
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);

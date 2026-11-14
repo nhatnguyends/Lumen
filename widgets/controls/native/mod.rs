@@ -1306,7 +1306,17 @@ impl State {
             self.config.palette,
             (self.config.opacity * 2.55).round() as u8
         );
-        if self.backdrop.is_none() || self.fade_base.is_none() || self.key != key {
+        let backdrop_reusable = self
+            .backdrop
+            .as_ref()
+            .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi)
+            && self
+                .fade_base
+                .as_ref()
+                .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
+        if !backdrop_reusable
+            || (!(self.drag.is_some() && crate::motion::low_power()) && self.key != key)
+        {
             let design = self.config.design.as_str();
             let light = matches!(design, "cloud" | "soft-violet" | "liquid-pastel");
             let base = match design {
@@ -1318,7 +1328,7 @@ impl State {
             let brush = CreateSolidBrush(base);
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
-            if self.config.frosted {
+            if self.config.frosted && !(self.drag.is_some() && crate::motion::low_power()) {
                 self.glass.borrow().draw_blended(
                     frame.dc,
                     self.hwnd,
@@ -3610,7 +3620,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     r.bottom - r.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                InvalidateRect(hwnd, null(), 0);
+                if edge != HTCAPTION || !crate::motion::low_power() {
+                    InvalidateRect(hwnd, null(), 0);
+                }
             } else if let Some((i, prev_v)) = s.slider {
                 let z = s.size();
                 if let Some(rect) = s.slider_rect(i, z[0], z[1]) {
@@ -3686,6 +3698,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             if s.drag.take().is_some() {
                 s.key.clear();
                 s.bounds();
+                InvalidateRect(hwnd, null(), 0);
             }
             0
         }
@@ -3861,7 +3874,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (s.config.frosted || crate::glass::liquid_glass())
+            if (s.drag.is_none() || !crate::motion::low_power())
+                && (s.config.frosted || crate::glass::liquid_glass())
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);
