@@ -15,7 +15,6 @@ pub(super) enum Action {
     Labels,
     Search,
     Desktop,
-    PinWidget(usize),
     Quit,
     Close,
 }
@@ -35,6 +34,7 @@ pub(super) struct State {
     pub expanded: bool,
     pub hits: Vec<Hit>,
     pub dragging: Option<Action>,
+    pub scrollbar_drag: Option<f32>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -49,6 +49,7 @@ impl Default for State {
             expanded: false,
             hits: vec![],
             dragging: None,
+            scrollbar_drag: None,
         }
     }
 }
@@ -86,6 +87,7 @@ impl App {
         if !self.settings.hwnd.is_null() {
             ShowWindow(self.settings.hwnd, SW_SHOW);
             SetForegroundWindow(self.settings.hwnd);
+            SetFocus(self.settings.hwnd);
             return;
         }
         let class = wide("LumenNativeDockSettings");
@@ -143,8 +145,13 @@ impl App {
         DwmSetWindowAttribute(hwnd, 34, &none as *const _ as _, 4);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
+        SetFocus(hwnd);
         InvalidateRect(hwnd, null(), 0);
         self.paint_settings(hwnd);
+    }
+    fn settings_content_height(&self) -> i32 {
+        let extra = if self.settings.expanded { 162 } else { 0 };
+        494 + extra + 236 + 40
     }
     pub(super) unsafe fn settings_changed(&mut self, layout: bool, blur: bool) {
         if blur {
@@ -194,7 +201,7 @@ impl App {
         let scale = self.settings.dpi;
         let w = (rect.right as f32 / scale) as i32;
         let h = (rect.bottom as f32 / scale) as i32;
-        let max_scroll = (804 + if self.settings.expanded { 162 } else { 0 } - h + 18).max(0);
+        let max_scroll = (self.settings_content_height() - h + 18).max(0);
         let now = self.now();
         if self.settings.scroll_clock.is_some() {
             self.settings.smooth_scroll.bounds(max_scroll as f32, now);
@@ -682,35 +689,7 @@ impl App {
             hit([w - 76, y, w - 20, y + 40], action);
             line(y + 40);
         }
-        let mut footer_y = start + 236;
-        let manifests: Vec<(String, String)> = self
-            .packages
-            .manifests()
-            .iter()
-            .map(|m| (m.id.clone(), m.name.clone()))
-            .collect();
-        if !manifests.is_empty() {
-            tx("TOOLBAR WIDGETS", [26, footer_y, w - 26, footer_y + 18], 9.5, true, dim, 0);
-            footer_y += 24;
-            for (i, (id, name)) in manifests.iter().enumerate() {
-                let y = footer_y + i as i32 * 40;
-                let on = self.dock.pinned_widgets.iter().any(|p| p == id);
-                self.symbols.draw(
-                    dc,
-                    self.dpi,
-                    crate::symbols::widget_symbol(id),
-                    28.,
-                    y as f32 + 12.,
-                    16.,
-                    white,
-                );
-                tx(name, [52, y, w - 80, y + 40], 11.5, false, white, 0);
-                toggle(y, on);
-                hit([w - 76, y, w - 20, y + 40], Action::PinWidget(i));
-                line(y + 40);
-            }
-            footer_y += manifests.len() as i32 * 40 + 24;
-        }
+        let footer_y = start + 236;
         tx(
             "Lumen · Native dock",
             [27, footer_y, w - 110, footer_y + 27],
@@ -797,19 +776,6 @@ impl App {
             Action::Desktop => {
                 self.dock.sync_desktop = !self.dock.sync_desktop;
                 self.sync_desktop_items(self.hwnd);
-            }
-            Action::PinWidget(index) => {
-                if let Some(id) = self.packages.manifests().get(index).map(|m| m.id.clone()) {
-                    if let Some(pos) = self.dock.pinned_widgets.iter().position(|p| p == &id) {
-                        self.dock.pinned_widgets.remove(pos);
-                    } else {
-                        self.dock.pinned_widgets.push(id);
-                    }
-                    self.layout_edit(self.hwnd);
-                    self.refresh_manager();
-                    self.save();
-                    layout = true;
-                }
             }
             Action::Quit => {
                 PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
@@ -930,9 +896,34 @@ unsafe extern "system" fn settings_proc(
             0
         }
         WM_LBUTTONDOWN => {
+            SetFocus(hwnd);
             let (x, y) = xy(lparam);
             let x = (x as f32 / app.settings.dpi) as i32;
             let y = (y as f32 / app.settings.dpi) as i32;
+            let (w, h) = client_dips(hwnd, app.settings.dpi);
+            let content = app.settings_content_height();
+            if content > h - 14 && x >= w - 16 && y >= 70 && y <= h - 20 {
+                let track = (h - 90).max(30) as f32;
+                let thumb = (track * (h - 60) as f32 / content as f32).max(35.);
+                let max = (content - h + 18).max(1) as f32;
+                let bar_y = 70. + (track - thumb) * app.settings.scroll as f32 / max;
+                let grab = if (y as f32) >= bar_y && (y as f32) <= bar_y + thumb {
+                    y as f32 - bar_y
+                } else {
+                    thumb * 0.5
+                };
+                app.settings.scrollbar_drag = Some(grab);
+                let scroll = (((y as f32 - grab - 70.) / (track - thumb).max(1.)).clamp(0., 1.) * max)
+                    .round() as i32;
+                app.settings.scroll = scroll;
+                app.settings.smooth_scroll.max = max;
+                app.settings.smooth_scroll.snap(scroll as f32);
+                app.settings.scroll_clock = None;
+                KillTimer(hwnd, 1);
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
             let action = app
                 .settings
                 .hits
@@ -961,6 +952,26 @@ unsafe extern "system" fn settings_proc(
                 app.move_resize(hwnd, lparam);
                 return 0;
             }
+            if let Some(grab) = app.settings.scrollbar_drag {
+                let (_, y) = xy(lparam);
+                let y = y as f32 / app.settings.dpi;
+                let (_, h) = client_dips(hwnd, app.settings.dpi);
+                let content = app.settings_content_height();
+                if content > h - 14 {
+                    let track = (h - 90).max(30) as f32;
+                    let thumb = (track * (h - 60) as f32 / content as f32).max(35.);
+                    let max = (content - h + 18).max(1) as f32;
+                    let scroll = (((y - grab - 70.) / (track - thumb).max(1.)).clamp(0., 1.) * max)
+                        .round() as i32;
+                    if scroll != app.settings.scroll {
+                        app.settings.scroll = scroll;
+                        app.settings.smooth_scroll.max = max;
+                        app.settings.smooth_scroll.snap(scroll as f32);
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                return 0;
+            }
             if let Some(action) = app.settings.dragging {
                 let (x, _) = xy(lparam);
                 let x = (x as f32 / app.settings.dpi) as i32;
@@ -972,6 +983,9 @@ unsafe extern "system" fn settings_proc(
             if app.resize_drag.is_some() {
                 app.finish_resize(hwnd);
             }
+            if app.settings.scrollbar_drag.take().is_some() {
+                ReleaseCapture();
+            }
             if app.settings.dragging.take().is_some() {
                 ReleaseCapture();
                 app.settings_changed(false, true);
@@ -981,12 +995,13 @@ unsafe extern "system" fn settings_proc(
         }
         WM_CAPTURECHANGED => {
             app.resize_drag = None;
+            app.settings.scrollbar_drag = None;
             0
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) as u16 as i16) as f32 / 120.;
             let (_, h) = client_dips(hwnd, app.settings.dpi);
-            let content = 844 + if app.settings.expanded { 162 } else { 0 };
+            let content = app.settings_content_height();
             let max = (content - h + 18).max(0) as f32;
             let now = app.now();
             app.settings.smooth_scroll.bounds(max, now);

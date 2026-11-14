@@ -5,7 +5,7 @@ import shutil
 import zipfile
 ROOT=Path(__file__).resolve().parents[1]
 SKIP={'.git','target','node_modules','__pycache__','bin','obj','config','.scratch'}
-TOP=['.gitignore','AGENTS.md','README.md','SECURITY.md','PACKAGE-DISTRIBUTION.md','design.md',
+TOP=['.gitignore','AGENTS.md','README.md',
      'package.json','package-lock.json','run_lumen.py','run_lumen.pyw','run_native_dock.py',
      'run_native_clock.py','Launch Lumen.pyw','run.cmd','startup_windows.py','test_startup_windows.py','CREDITS.md','LICENSE.txt']
 
