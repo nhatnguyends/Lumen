@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 pub type Point = [f32; 2];
-static LOW_POWER: AtomicBool = AtomicBool::new(true);
+static LOW_POWER: AtomicBool = AtomicBool::new(false);
 pub fn set_low_power(enabled: bool) {
     LOW_POWER.store(enabled, Ordering::Relaxed);
 }
