@@ -46,8 +46,10 @@ impl App {
             .iter()
             .position(|index| self.dock.items[*index].id == id)
             .unwrap_or(0);
-        let anchor = (self.selected / self.columns(hwnd)) as f32 * self.row_height() as f32;
-        let rows = self.visible(hwnd).len().div_ceil(self.columns(hwnd));
+        let gl = self.grid_layout(hwnd);
+        let anchor =
+            gl.cells.get(self.selected).map_or(0, |&(_, r)| r) as f32 * self.row_height() as f32;
+        let rows = gl.rows;
         let max = (self.grid_top() as f32 + rows as f32 * self.row_height() as f32
             - (self.dimensions(hwnd).1 - 14) as f32
             + 28.)

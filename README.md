@@ -65,11 +65,21 @@ YouTube Music playback runs natively in Rust against an owned Chrome or Edge pro
 
 ## Widgets
 
-Open the native tray menu to show the widget manager. Every widget has an On/Off
-switch and independent settings. Appearance, size and position are remembered.
+Open the native tray menu to show the widget manager. General Settings organizes
+visual appearance controls (**Background**: blur size, frosted glass and liquid
+glass) at the top and groups remaining options under **Misc**. Every widget has
+an On/Off switch and independent settings. Appearance, size and position are
+remembered, kept inside the active monitor work area, and automatically rescale
+live when display resolution or DPI scaling changes.
 Widgets snap and fuse smoothly when moved or resized adjacent to one another; a
 shared drag-to-unfuse threshold (`16` DIP) prevents accidental separation on brief
-clicks when dragging a widget or grabbing a fused border to resize.
+clicks when dragging a widget or grabbing a fused border to resize, and overlapping
+another widget onto an already fused group leaves the existing fused group intact.
+When multi-monitor duplication is enabled, each selected display runs independent
+widget windows scaled to its own native DPI with isolated hover/click states,
+per-monitor fusion and per-display saved position and size, while keeping notes,
+App Dock item order and groups, Control Center items and per-widget settings
+synchronized two-way from a shared source.
 Packages live in `widgets/<id>/native/`; see [package development](widgets/README.md).
 
 App Dock preserves live cursor hover highlights during 120Hz scrolling, keeps
@@ -77,7 +87,10 @@ the right-clicked tile visibly selected while its context menu is open, dismisse
 context menus cleanly on any outside click, offers a **Copy** command for real
 files, folders and shortcuts (omitted for virtual shell locations such as Recycle
 Bin or This PC and Store apps), and animates launched icons with a curved 200%
-zoom-and-fade burst.
+zoom-and-fade burst. Icon groups that span multiple lines share a single unified
+rounded background contour, prefer staying horizontal with the fewest rows while
+packing cleanly into rectangular blocks, and extract/trim Windows icons cleanly
+for consistent sizing across systems.
 
 Control Center groups displays, audio outputs and microphones into one control
 per family. Device names lead each row; newly connected devices appear in the

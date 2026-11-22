@@ -16,6 +16,156 @@ pub fn distance(x: f32, y: f32, w: f32, h: f32, r: f32, inset: f32) -> f32 {
     };
     outside + qx.max(qy).min(0.) - r
 }
+pub(crate) struct PolySegment {
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub ta: [f32; 2],
+    pub tb: [f32; 2],
+    pub outward: [f32; 2],
+    pub horiz: bool,
+}
+pub(crate) struct PolyCorner {
+    pub v: [f32; 2],
+    pub c: [f32; 2],
+    pub r: f32,
+    pub convex: bool,
+    pub sx: f32,
+    pub sy: f32,
+}
+pub(crate) struct PolySdf {
+    pub bounds: [f32; 4],
+    pub max_radius: f32,
+    pub segments: Vec<PolySegment>,
+    pub corners: Vec<PolyCorner>,
+}
+impl PolySdf {
+    pub(crate) fn new(verts: &[[f32; 2]], radius: f32) -> Self {
+        let n = verts.len();
+        let mut bounds = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut corners = Vec::with_capacity(n);
+        let mut max_radius = 0.0f32;
+        for i in 0..n {
+            let v = verts[i];
+            bounds[0] = bounds[0].min(v[0]);
+            bounds[1] = bounds[1].min(v[1]);
+            bounds[2] = bounds[2].max(v[0]);
+            bounds[3] = bounds[3].max(v[1]);
+            let prev = verts[(i + n - 1) % n];
+            let next = verts[(i + 1) % n];
+            let l_in = (v[0] - prev[0]).hypot(v[1] - prev[1]).max(1e-4);
+            let l_out = (next[0] - v[0]).hypot(next[1] - v[1]).max(1e-4);
+            let d_in = [(v[0] - prev[0]) / l_in, (v[1] - prev[1]) / l_in];
+            let d_out = [(next[0] - v[0]) / l_out, (next[1] - v[1]) / l_out];
+            let r = radius.min(l_in * 0.5).min(l_out * 0.5).max(0.1);
+            max_radius = max_radius.max(r);
+            let cross = d_in[0] * d_out[1] - d_in[1] * d_out[0];
+            let c = [v[0] - d_in[0] * r + d_out[0] * r, v[1] - d_in[1] * r + d_out[1] * r];
+            corners.push(PolyCorner {
+                v,
+                c,
+                r,
+                convex: cross > 0.0,
+                sx: if v[0] >= c[0] { 1.0 } else { -1.0 },
+                sy: if v[1] >= c[1] { 1.0 } else { -1.0 },
+            });
+        }
+        let mut segments = Vec::with_capacity(n);
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let a = verts[i];
+            let b = verts[j];
+            let len = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-4);
+            let dir = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+            let ra = corners[i].r;
+            let rb = corners[j].r;
+            let ta = [a[0] + dir[0] * ra, a[1] + dir[1] * ra];
+            let tb = [b[0] - dir[0] * rb, b[1] - dir[1] * rb];
+            let horiz = (b[1] - a[1]).abs() < (b[0] - a[0]).abs();
+            segments.push(PolySegment {
+                a,
+                b,
+                ta,
+                tb,
+                outward: [dir[1], -dir[0]],
+                horiz,
+            });
+        }
+        Self {
+            bounds,
+            max_radius,
+            segments,
+            corners,
+        }
+    }
+    pub(crate) fn interior_x_spans(&self, py: f32, out: &mut Vec<f32>) {
+        out.clear();
+        for seg in &self.segments {
+            if !seg.horiz && ((seg.a[1] > py) != (seg.b[1] > py)) {
+                out.push(seg.a[0]);
+            }
+        }
+        out.sort_by(|a, b| a.total_cmp(b));
+    }
+    pub(crate) fn signed_distance(&self, px: f32, py: f32) -> (f32, f32, f32) {
+        let mut inside = false;
+        for seg in &self.segments {
+            if !seg.horiz && ((seg.a[1] > py) != (seg.b[1] > py)) && px < seg.a[0] {
+                inside = !inside;
+            }
+        }
+        for c in &self.corners {
+            let x0 = c.c[0].min(c.v[0]);
+            let x1 = c.c[0].max(c.v[0]);
+            let y0 = c.c[1].min(c.v[1]);
+            let y1 = c.c[1].max(c.v[1]);
+            if px >= x0 && px <= x1 && py >= y0 && py <= y1 {
+                let d2 = (px - c.c[0]) * (px - c.c[0]) + (py - c.c[1]) * (py - c.c[1]);
+                inside = if c.convex { d2 <= c.r * c.r } else { d2 >= c.r * c.r };
+                break;
+            }
+        }
+        let mut best_d = f32::INFINITY;
+        let mut best_n = [0.0f32, -1.0f32];
+        for seg in &self.segments {
+            let dx = seg.tb[0] - seg.ta[0];
+            let dy = seg.tb[1] - seg.ta[1];
+            let l2 = dx * dx + dy * dy;
+            let (qx, qy) = if l2 <= 1e-6 {
+                (seg.ta[0], seg.ta[1])
+            } else {
+                let t = (((px - seg.ta[0]) * dx + (py - seg.ta[1]) * dy) / l2).clamp(0.0, 1.0);
+                (seg.ta[0] + dx * t, seg.ta[1] + dy * t)
+            };
+            let d = (px - qx).hypot(py - qy);
+            if d < best_d {
+                best_d = d;
+                best_n = seg.outward;
+            }
+        }
+        for c in &self.corners {
+            let vx = px - c.c[0];
+            let vy = py - c.c[1];
+            if vx * c.sx >= 0.0 && vy * c.sy >= 0.0 {
+                let dist_c = vx.hypot(vy);
+                let d = (dist_c - c.r).abs();
+                if d < best_d {
+                    best_d = d;
+                    if dist_c > 1e-4 {
+                        let sign = if c.convex { 1.0 } else { -1.0 };
+                        best_n = [(vx / dist_c) * sign, (vy / dist_c) * sign];
+                    } else {
+                        let s = std::f32::consts::FRAC_1_SQRT_2 * if c.convex { 1.0 } else { -1.0 };
+                        best_n = [c.sx * s, c.sy * s];
+                    }
+                }
+            }
+        }
+        if best_d == f32::INFINITY {
+            best_d = 0.0;
+        }
+        (if inside { -best_d } else { best_d }, best_n[0], best_n[1])
+    }
+}
 struct Rim {
     index: usize,
     sample: [f32; 2],
@@ -1314,6 +1464,181 @@ impl Buffer {
             work_pixels, 32_768, render_rows,
         );
     }
+    /// Restore a multi-row connected group card seamlessly from the owned backing.
+    pub unsafe fn restore_glass_group(
+        &self,
+        dc: HDC,
+        spans: &[[f32; 4]],
+        radius: f32,
+        allow_liquid: bool,
+    ) {
+        if spans.is_empty() {
+            return;
+        }
+        if spans.len() == 1 {
+            self.restore_glass_card_impl(dc, spans[0], radius, allow_liquid);
+            return;
+        }
+        let verts_dip = crate::render::ortho_group_polygon(spans);
+        if verts_dip.len() < 4 {
+            return;
+        }
+        let verts: Vec<[f32; 2]> = verts_dip
+            .iter()
+            .map(|p| [p[0] * self.dpi, p[1] * self.dpi])
+            .collect();
+        if verts.len() == 4 {
+            let mut rect = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+            for v in &verts_dip {
+                rect[0] = rect[0].min(v[0]);
+                rect[1] = rect[1].min(v[1]);
+                rect[2] = rect[2].max(v[0]);
+                rect[3] = rect[3].max(v[1]);
+            }
+            self.restore_glass_card_impl(dc, rect, radius, allow_liquid);
+            return;
+        }
+        crate::render::flush(dc);
+        let mut dib: DIBSECTION = zeroed();
+        if GetObjectW(
+            GetCurrentObject(dc, OBJ_BITMAP as u32),
+            size_of::<DIBSECTION>() as i32,
+            &mut dib as *mut _ as _,
+        ) == 0
+            || dib.dsBm.bmBits.is_null()
+        {
+            return;
+        }
+        let mut clip: RECT = zeroed();
+        GetClipBox(dc, &mut clip);
+        let width = dib.dsBm.bmWidth.min(self.width);
+        let height = dib.dsBm.bmHeight.abs().min(self.height);
+        let dest = std::slice::from_raw_parts_mut(
+            dib.dsBm.bmBits as *mut u8,
+            (dib.dsBm.bmWidth * dib.dsBm.bmHeight.abs() * 4) as usize,
+        );
+        let source = std::slice::from_raw_parts(self.bits, (self.width * self.height * 4) as usize);
+        let sdf = PolySdf::new(&verts, radius * self.dpi);
+        let [left, top, right, bottom] = sdf.bounds;
+        let min_span = spans
+            .iter()
+            .map(|s| ((s[2] - s[0]).min(s[3] - s[1])) * self.dpi)
+            .fold(f32::INFINITY, f32::min)
+            .max(1.0);
+        let liquid = allow_liquid && crate::glass::liquid_glass() && min_span >= 16.0;
+        let rim = (20.0 * self.dpi).clamp(8.0, min_span * 0.42);
+        let bend = 10.0 * self.dpi;
+        let ca_strength = 3.5 * self.dpi;
+        let corner_pad = sdf.max_radius.max(rim) + 2.0;
+        let y_start = (top.floor() as i32).max(0).max(clip.top);
+        let y_end = (bottom.ceil() as i32).min(height).min(clip.bottom);
+        let x_start = (left.floor() as i32).max(0).max(clip.left);
+        let x_end = (right.ceil() as i32).min(width).min(clip.right);
+        if y_start >= y_end || x_start >= x_end {
+            return;
+        }
+        let horiz_ys: Vec<f32> = sdf.segments.iter().filter(|s| s.horiz).map(|s| s.a[1]).collect();
+        let dest_stride = dib.dsBm.bmWidth;
+        let src_stride = self.width;
+        let source_h = self.height as usize;
+        let dpi = self.dpi;
+        let blend_span = |dest: &mut [u8], y: i32, x0: i32, x1: i32| {
+            let fy = y as f32 + 0.5;
+            let src_row = y * src_stride;
+            for x in x0..x1 {
+                let fx = x as f32 + 0.5;
+                let (d, nx, ny) = sdf.signed_distance(fx, fy);
+                let alpha = ((0.5 - d).clamp(0., 1.) * 255.).round() as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                let dst = (x * 4) as usize;
+                let pixel = if liquid && d > -rim && d <= 0.5 {
+                    crate::glass::refract_bgra_card_pixel(
+                        source,
+                        src_stride as usize,
+                        source_h,
+                        x as f32,
+                        y as f32,
+                        d,
+                        nx,
+                        ny,
+                        rim,
+                        bend,
+                        ca_strength,
+                        dpi,
+                    )
+                } else {
+                    let src = ((src_row + x) * 4) as usize;
+                    [source[src], source[src + 1], source[src + 2]]
+                };
+                if alpha == 255 {
+                    dest[dst] = pixel[0];
+                    dest[dst + 1] = pixel[1];
+                    dest[dst + 2] = pixel[2];
+                    dest[dst + 3] = 255;
+                } else {
+                    let inv = 255 - alpha;
+                    for c in 0..3 {
+                        dest[dst + c] =
+                            ((pixel[c] as u32 * alpha + dest[dst + c] as u32 * inv + 127) / 255)
+                                as u8;
+                    }
+                    dest[dst + 3] = ((255 * alpha + dest[dst + 3] as u32 * inv + 127) / 255) as u8;
+                }
+            }
+        };
+        let render_rows = |rows: Vec<(usize, &mut [u8])>| {
+            let mut xs = Vec::with_capacity(8);
+            for (y, dest) in rows {
+                let y = y as i32;
+                let fy = y as f32 + 0.5;
+                let near_horiz = horiz_ys.iter().any(|hy| (fy - *hy).abs() <= corner_pad);
+                if !near_horiz {
+                    sdf.interior_x_spans(fy, &mut xs);
+                    for pair in xs.chunks_exact(2) {
+                        let lx0 = (pair[0].floor() as i32 - 2).max(x_start);
+                        let lx1 = (pair[1].ceil() as i32 + 2).min(x_end);
+                        if lx0 >= lx1 {
+                            continue;
+                        }
+                        let ix0 = ((pair[0] + corner_pad).ceil() as i32).max(lx0);
+                        let ix1 = ((pair[1] - corner_pad).floor() as i32).min(lx1);
+                        if ix0 < ix1 {
+                            if lx0 < ix0 {
+                                blend_span(dest, y, lx0, ix0);
+                            }
+                            let dst_start = (ix0 * 4) as usize;
+                            let dst_end = (ix1 * 4) as usize;
+                            let src_start = ((y * src_stride + ix0) * 4) as usize;
+                            let src_end = ((y * src_stride + ix1) * 4) as usize;
+                            for (d, s) in dest[dst_start..dst_end]
+                                .chunks_exact_mut(4)
+                                .zip(source[src_start..src_end].chunks_exact(4))
+                            {
+                                d[0] = s[0];
+                                d[1] = s[1];
+                                d[2] = s[2];
+                                d[3] = 255;
+                            }
+                            if ix1 < lx1 {
+                                blend_span(dest, y, ix1, lx1);
+                            }
+                        } else {
+                            blend_span(dest, y, lx0, lx1);
+                        }
+                    }
+                } else {
+                    blend_span(dest, y, x_start, x_end);
+                }
+            }
+        };
+        let work_pixels = if liquid { ((x_end - x_start) * (y_end - y_start)) as usize } else { 0 };
+        crate::glass::with_pixel_rows_parallel(
+            dest, dest_stride as usize * 4, y_start as usize..y_end as usize,
+            work_pixels, 32_768, render_rows,
+        );
+    }
     /// Composite opaque chrome UNDER already drawn controls. Filling only the
     /// missing alpha preserves glyphs, icons, reflections and pressed states.
     pub unsafe fn retain_control_backing(
@@ -1491,18 +1816,20 @@ impl Buffer {
             GdiFlush();
             let len = self.width as usize * self.height as usize * 4;
             let pixels = std::slice::from_raw_parts(self.bits, len);
-            if opacity == 255 {
-                return crate::gpu::present_bgra(hwnd, self.width, self.height, pixels);
-            }
-            let a = opacity as u32;
-            let mut scaled = vec![0u8; len];
-            for (dst, src) in scaled.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
-                dst[0] = ((src[0] as u32 * a + 127) / 255) as u8;
-                dst[1] = ((src[1] as u32 * a + 127) / 255) as u8;
-                dst[2] = ((src[2] as u32 * a + 127) / 255) as u8;
-                dst[3] = ((src[3] as u32 * a + 127) / 255) as u8;
-            }
-            return crate::gpu::present_bgra(hwnd, self.width, self.height, &scaled);
+            let result = if opacity == 255 {
+                crate::gpu::present_bgra(hwnd, self.width, self.height, pixels)
+            } else {
+                let a = opacity as u32;
+                let mut scaled = vec![0u8; len];
+                for (dst, src) in scaled.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
+                    dst[0] = ((src[0] as u32 * a + 127) / 255) as u8;
+                    dst[1] = ((src[1] as u32 * a + 127) / 255) as u8;
+                    dst[2] = ((src[2] as u32 * a + 127) / 255) as u8;
+                    dst[3] = ((src[3] as u32 * a + 127) / 255) as u8;
+                }
+                crate::gpu::present_bgra(hwnd, self.width, self.height, &scaled)
+            };
+            return result;
         }
         let origin = POINT { x: 0, y: 0 };
         #[cfg(test)]

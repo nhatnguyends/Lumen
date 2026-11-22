@@ -538,7 +538,6 @@ impl Editor {
             note.images = images.to_vec();
         }
     }
-    #[cfg(test)]
     pub(super) fn input_hwnd(&self) -> HWND {
         self.state.borrow().edit
     }

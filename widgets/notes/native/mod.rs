@@ -133,6 +133,7 @@ struct State {
     scrollbar_visible: bool,
     smoke: bool,
     dirty: bool,
+    sync_peers: bool,
     dirty_since: Option<std::time::Instant>,
     status: String,
     ink: Option<u32>,
@@ -273,6 +274,7 @@ impl Host {
             scrollbar_visible: false,
             smoke,
             dirty: false,
+            sync_peers: false,
             dirty_since: None,
             status: String::new(),
             ink: None,
@@ -333,10 +335,15 @@ impl Host {
         }
         SetWindowTextW(hwnd, wide("Lumen · Sticky Notes").as_ptr());
         windows_sys::Win32::UI::Shell::DragAcceptFiles(hwnd, 1);
+        let (live_dpi, _) = crate::geometry::clamp_window_to_work(
+            hwnd,
+            [model::MIN_SIZE, model::MIN_SIZE],
+            dpi,
+        );
         {
             let mut state = s.borrow_mut();
             state.hwnd = hwnd;
-            state.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
+            state.dpi = live_dpi;
             // Keep the actual restored geometry for the next normal save.
             state.bounds();
             state.shadow = WindowShadow::new(hwnd);
@@ -354,7 +361,10 @@ impl Host {
         if s.shadow.is_none() {
             s.shadow = WindowShadow::new(s.hwnd);
         }
-        s.board.open = true;
+        let is_dup = crate::multi_monitor::is_duplicate(s.hwnd);
+        if !is_dup {
+            s.board.open = true;
+        }
         ShowWindow(
             s.hwnd,
             if crate::desktop_layer::contains(s.hwnd) {
@@ -368,7 +378,9 @@ impl Host {
             SetForegroundWindow(s.hwnd);
         }
         s.paint();
-        s.schedule();
+        if !is_dup {
+            s.schedule_bounds_only();
+        }
     }
     /// Entry points for the shared widget manager; preserve notes and bounds.
     pub fn hwnd(&self) -> HWND {
@@ -461,7 +473,7 @@ impl State {
             e.floating(false);
         }
     }
-    unsafe fn schedule(&mut self) {
+    unsafe fn schedule_bounds_only(&mut self) {
         if self.smoke {
             return;
         }
@@ -470,16 +482,37 @@ impl State {
         let remaining = 1200u128.saturating_sub(since.elapsed().as_millis());
         SetTimer(self.hwnd, SAVE, (remaining.min(260).max(1)) as u32, None);
     }
+    unsafe fn schedule(&mut self) {
+        if self.smoke {
+            return;
+        }
+        self.sync_peers = true;
+        self.schedule_bounds_only();
+    }
     unsafe fn flush(&mut self) -> bool {
         KillTimer(self.hwnd, SAVE);
         if self.smoke || !self.dirty {
             return true;
         }
-        match self.board.save(&self.root) {
+        let res = if crate::multi_monitor::is_duplicate(self.hwnd) {
+            let mut shared = self.board.clone();
+            if let Ok(disk) = model::Board::load(&self.root) {
+                shared.position = disk.position;
+                shared.size = disk.size;
+                shared.open = disk.open;
+            }
+            shared.save(&self.root)
+        } else {
+            self.board.save(&self.root)
+        };
+        match res {
             Ok(()) => {
                 self.dirty = false;
                 self.dirty_since = None;
                 self.status.clear();
+                if std::mem::take(&mut self.sync_peers) {
+                    crate::multi_monitor::notify_peers("notes", self.hwnd);
+                }
                 true
             }
             Err(e) => {
@@ -489,6 +522,66 @@ impl State {
                 false
             }
         }
+    }
+    unsafe fn reload_from_shared(&mut self) {
+        let Ok(mut loaded) = model::Board::load(&self.root) else {
+            return;
+        };
+        loaded.position = self.board.position;
+        loaded.size = self.board.size;
+        loaded.open = self.board.open;
+        let focus = GetFocus();
+        if self.editor.as_ref().is_some_and(|e| focus != e.input_hwnd())
+            && self.board.notes != loaded.notes
+        {
+            self.finish_editor();
+        }
+        if let Some(pid) = &self.palette_note {
+            if !loaded.notes.iter().any(|n| &n.id == pid) {
+                self.palette_note = None;
+            }
+        }
+        if let Some((nid, idx)) = &self.selected_image {
+            let valid = loaded
+                .notes
+                .iter()
+                .find(|n| &n.id == nid)
+                .is_some_and(|n| *idx < n.images.len());
+            if !valid {
+                self.selected_image = None;
+            }
+        }
+        let blur_changed =
+            loaded.blur != self.board.blur || loaded.frosted != self.board.frosted;
+        let floating_changed = loaded.floating != self.board.floating;
+        self.board = loaded;
+        self.card_cache.clear();
+        self.text_cache.clear();
+        self.layout_cache = None;
+        self.background_key.clear();
+        self.header_base_key.clear();
+        self.bg_ink = None;
+        self.overlay = None;
+        self.background = None;
+        self.header_base = None;
+        self.list_base = None;
+        self.rich_raster = None;
+        if blur_changed {
+            self.update_local_blur();
+        }
+        if floating_changed {
+            self.apply_floating();
+        }
+        if self.settings.is_some() {
+            let color = self.surface_color();
+            let light = crate::accent::light(color);
+            let rows = settings::rows(&self.board);
+            if let Some(host) = &mut self.settings {
+                host.set_rows(rows);
+                host.set_surface(color, light);
+            }
+        }
+        InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn consume(&mut self) {
         let events = std::mem::take(&mut *self.events.borrow_mut());
@@ -804,6 +897,9 @@ impl State {
         }
     }
     unsafe fn bounds(&mut self) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+            return;
+        }
         let mut r: RECT = zeroed();
         GetWindowRect(self.hwnd, &mut r);
         self.board.position = Some([r.left, r.top]);
@@ -811,17 +907,20 @@ impl State {
             ((r.right - r.left) as f32 / self.dpi).round() as i32,
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
-        self.schedule();
+        self.schedule_bounds_only();
     }
     unsafe fn hide(&mut self) {
+        let was_visible = IsWindowVisible(self.hwnd) != 0;
         self.finish_editor();
         self.palette_note = None;
         if let Some(settings) = &mut self.settings {
             settings.hide();
         }
-        self.board.open = false;
-        self.schedule();
-        self.flush();
+        if !crate::multi_monitor::is_duplicate(self.hwnd) {
+            self.board.open = false;
+            self.schedule_bounds_only();
+            self.flush();
+        }
         ShowWindow(self.hwnd, SW_HIDE);
         KillTimer(self.hwnd, ANIMATE);
         let offset = self.scroll.value(self.now());
@@ -840,6 +939,9 @@ impl State {
         self.background_key.clear();
         self.header_base_key.clear();
         self.bg_ink = None;
+        if was_visible && !self.smoke {
+            crate::multi_monitor::request_hide_widget("notes");
+        }
     }
     fn color(note: &model::Note) -> u32 {
         match note.color.as_str() {
@@ -2779,6 +2881,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             s.settings_changed();
             0
         }
+        m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
+            s.reload_from_shared();
+            0
+        }
         REDRAW => {
             InvalidateRect(hwnd, null(), 0);
             0
@@ -2867,15 +2973,45 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             }
             s.background_key.clear();
             s.overlay = None;
+            let prev_dpi = s.dpi;
+            let live_dpi = crate::geometry::window_dpi(hwnd);
+            let pre_dpi_changed = (prev_dpi - live_dpi).abs() > 0.005;
+            s.dpi = live_dpi;
+            drop(s);
+            let (dpi, clamped) = crate::geometry::clamp_window_to_work(
+                hwnd,
+                [model::MIN_SIZE, model::MIN_SIZE],
+                prev_dpi,
+            );
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                if pre_dpi_changed || (s.dpi - dpi).abs() > 0.005 || clamped {
+                    s.dpi = dpi;
+                    s.frame = None;
+                    s.background = None;
+                    s.header_base = None;
+                    s.list_base = None;
+                    s.background_key.clear();
+                    s.update_local_blur();
+                    s.bounds();
+                }
+                if let Some(host) = &mut s.settings {
+                    host.refit();
+                }
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_DPICHANGED => {
-            s.dpi = (w as u16) as f32 / 96.;
+            let new_dpi = ((w as u16) as f32 / 96.).max(1.);
+            s.dpi = new_dpi;
             s.update_local_blur();
             s.background_key.clear();
+            let r = crate::geometry::clamp_dpi_rect(
+                *(l as *const RECT),
+                [model::MIN_SIZE, model::MIN_SIZE],
+                new_dpi,
+            );
             drop(s);
-            let r = &*(l as *const RECT);
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -2885,6 +3021,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                s.bounds();
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -3622,8 +3761,11 @@ mod tests {
                 model::now()
             ));
             std::fs::create_dir_all(&root).unwrap();
-            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
-            glass.borrow_mut().refresh();
+            let wall_path = root.join("fixture-wall.png");
+            image::RgbaImage::from_pixel(64, 64, image::Rgba([24, 34, 52, 255]))
+                .save(&wall_path)
+                .unwrap();
+            let glass = Rc::new(RefCell::new(Glass::fixture_tiled_file(&wall_path, 13., 1.)));
             let mut host = Host::create(&root, glass, true, true).unwrap();
             host.show();
             {

@@ -301,6 +301,7 @@ impl App {
             SendMessageW(edit, windows_sys::Win32::UI::Controls::EM_SETSEL, 0, -1);
         }
         self.arm_motion(hwnd);
+        InvalidateRect(hwnd, null(), 0);
     }
     pub(super) unsafe fn close_popup(&mut self, hwnd: HWND) -> bool {
         if self.popup.take().is_some() {
@@ -514,6 +515,7 @@ impl App {
             }
         }
         self.arm_motion(hwnd);
+        InvalidateRect(hwnd, null(), 0);
     }
     unsafe fn change_icon(&mut self, hwnd: HWND, id: &str) {
         let mut buffer = vec![0u16; 32768];

@@ -32,8 +32,9 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     mem::{size_of, zeroed},
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::{null, null_mut},
+    rc::Rc,
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -59,6 +60,9 @@ const WIDGET_REDRAW: u32 = WM_APP + 4;
 const MOTION_FRAME: u32 = WM_APP + 7;
 const WALLPAPER_READY: u32 = WM_APP + 20;
 const STARTUP_WIDGET: u32 = WM_APP + 21;
+const DISPLAY_SYNC: u32 = WM_APP + 22;
+const FORWARD_TOGGLE: u32 = WM_APP + 24;
+const FORWARD_OPEN_SETTINGS: u32 = WM_APP + 25;
 const SEARCH_ID: usize = 100;
 const PIN_TIMER: usize = 1;
 const SMOKE_TIMER: usize = 2;
@@ -115,6 +119,20 @@ fn palette(light: bool) -> Palette {
     }
 }
 
+struct SecondaryDock {
+    hwnd: HWND,
+    state: Box<RefCell<App>>,
+}
+impl Drop for SecondaryDock {
+    fn drop(&mut self) {
+        unsafe {
+            crate::multi_monitor::unregister_duplicate(self.hwnd);
+            if !self.hwnd.is_null() && IsWindow(self.hwnd) != 0 {
+                DestroyWindow(self.hwnd);
+            }
+        }
+    }
+}
 enum Icon {
     Image(render::Image),
     Shell(HICON),
@@ -190,6 +208,11 @@ struct App {
     glass: std::rc::Rc<RefCell<Glass>>,
     packages: crate::widget_packages::Registry,
     general: Option<crate::general::Host>,
+    display_watcher: HWND,
+    display_sig: Vec<([i32; 4], [i32; 4], u32)>,
+    is_duplicate: bool,
+    primary_hwnd: HWND,
+    duplicate_docks: HashMap<String, SecondaryDock>,
     started: std::time::Instant,
     cpu_start: u64,
 }
@@ -275,12 +298,27 @@ impl App {
         self.general.as_mut()
     }
     unsafe fn show_general(&mut self) {
+        self.show_general_on(self.hwnd);
+    }
+    unsafe fn show_general_on(&mut self, anchor: HWND) {
+        if self.is_duplicate {
+            if !self.primary_hwnd.is_null() {
+                PostMessageW(
+                    self.primary_hwnd,
+                    crate::widget_packages::manager_message(),
+                    self.hwnd as usize,
+                    0,
+                );
+            }
+            return;
+        }
         if self.ensure_general().is_none() {
             return;
         }
         self.refresh_manager();
+        crate::multi_monitor::sync_visibility();
         if let Some(host) = &mut self.general {
-            host.show();
+            host.show_near(anchor);
         }
     }
     unsafe fn manage(&mut self, action: crate::general::Action) -> Result<(), String> {
@@ -288,6 +326,11 @@ impl App {
         match &action {
             RefreshGlass => {
                 self.notify_wallpaper_changed(self.hwnd);
+            }
+            SyncMultiMonitor => {
+                crate::multi_monitor::refresh_displays();
+                InvalidateRect(self.hwnd, null(), 0);
+                self.packages.refresh();
             }
             RestartUpdate => {
                 crate::update::restart(&self.root)?;
@@ -303,6 +346,7 @@ impl App {
                 }
                 self.layout_edit(self.hwnd);
                 self.settings_changed(true, false);
+                self.sync_duplicate_appearance();
                 self.save();
             }
             Show(id) | Settings(id) => {
@@ -347,6 +391,7 @@ impl App {
             }
         }
         self.refresh_manager();
+        crate::multi_monitor::sync_visibility();
         if let Some(host) = &mut self.general {
             if matches!(&action, Settings(_)) {
                 host.hide();
@@ -371,12 +416,31 @@ impl App {
         Ok(())
     }
     unsafe fn show_package(&mut self, id: &str) {
+        if self.is_duplicate {
+            if !self.primary_hwnd.is_null() {
+                PostMessageW(
+                    self.primary_hwnd,
+                    crate::widget_packages::show_message(id),
+                    0,
+                    0,
+                );
+            }
+            return;
+        }
         if let Err(error) = self.manage(crate::general::Action::Show(id.into())) {
             eprintln!("widget-package: {error}");
             self.status = error;
         }
     }
     unsafe fn toggle_package(&mut self, id: &str) {
+        if self.is_duplicate {
+            if !self.primary_hwnd.is_null() {
+                if let Some(idx) = self.packages.manifests().iter().position(|m| m.id == id) {
+                    PostMessageW(self.primary_hwnd, FORWARD_TOGGLE, idx, 0);
+                }
+            }
+            return;
+        }
         let visible = if id == "launcher" {
             IsWindowVisible(self.hwnd) != 0
         } else {
@@ -527,14 +591,18 @@ impl App {
         InvalidateRect(hwnd, null(), 0);
         ReleaseCapture();
         if hwnd == self.hwnd {
-            let mut r: RECT = zeroed();
-            GetWindowRect(hwnd, &mut r);
-            self.dock.position = Some([r.left, r.top]);
-            self.dock.size = Some([
-                ((r.right - r.left) as f32 / self.dpi).round() as i32,
-                ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
-            ]);
-            self.save();
+            if self.is_duplicate {
+                crate::multi_monitor::record_duplicate_bounds(hwnd, self.dpi);
+            } else {
+                let mut r: RECT = zeroed();
+                GetWindowRect(hwnd, &mut r);
+                self.dock.position = Some([r.left, r.top]);
+                self.dock.size = Some([
+                    ((r.right - r.left) as f32 / self.dpi).round() as i32,
+                    ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
+                ]);
+                self.save_bounds();
+            }
         }
     }
     fn placeholder_opacity(&self) -> u8 {
@@ -543,10 +611,39 @@ impl App {
     fn px(&self, n: i32) -> i32 {
         (n as f32 * self.dpi).round() as i32
     }
-    fn save(&mut self) {
+    fn save_bounds(&mut self) {
+        if self.is_duplicate || self.smoke {
+            return;
+        }
         self.search_cache.get_mut().take();
         if let Err(error) = self.dock.save(&self.root) {
             self.status = format!("Save failed: {error}");
+        }
+    }
+    fn save(&mut self) {
+        if self.smoke {
+            return;
+        }
+        self.search_cache.get_mut().take();
+        let result = if self.is_duplicate {
+            // Duplicate docks share data, groups, ordering, and appearance, but
+            // must preserve the primary monitor's saved position and size on disk.
+            let mut shared = self.dock.clone();
+            if let Ok(disk) = Dock::load(&self.root) {
+                shared.position = disk.position;
+                shared.size = disk.size;
+            }
+            shared.save(&self.root)
+        } else {
+            self.dock.save(&self.root)
+        };
+        match result {
+            Ok(()) => unsafe {
+                crate::multi_monitor::notify_peers("launcher", self.hwnd);
+            },
+            Err(error) => {
+                self.status = format!("Save failed: {error}");
+            }
         }
     }
     fn visible(&self, hwnd: HWND) -> Vec<usize> {
@@ -581,6 +678,34 @@ impl App {
     unsafe fn page_rows(&self, hwnd: HWND) -> usize {
         ((self.dimensions(hwnd).1 - self.grid_top() - 16) / self.row_height()).max(1) as usize
     }
+    pub(super) unsafe fn grid_layout_for(
+        &self,
+        visible: &[usize],
+        columns: usize,
+        has_add: bool,
+    ) -> crate::geometry::DockGridLayout {
+        let show_groups = self.query.trim().is_empty();
+        let groups: Vec<Option<&str>> = visible
+            .iter()
+            .map(|&idx| {
+                if show_groups {
+                    self.dock.items[idx]
+                        .group
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        crate::geometry::pack_dock_grid(&groups, has_add, columns)
+    }
+    pub(super) unsafe fn grid_layout(&self, hwnd: HWND) -> crate::geometry::DockGridLayout {
+        let visible = self.visible(hwnd);
+        let columns = self.columns(hwnd);
+        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+        self.grid_layout_for(&visible, columns, has_add)
+    }
     unsafe fn hit(&self, hwnd: HWND, x: i32, y: i32) -> Option<usize> {
         let (width, height) = self.dimensions(hwnd);
         if x < 16
@@ -595,14 +720,14 @@ impl App {
         let cell = (width - 26) / columns as i32;
         let col = ((x - 16) / cell) as usize;
         let content_y = y as f32 - self.grid_top() as f32 + self.scroll.value(self.now());
-        if content_y < 0. {
+        if content_y < 0. || col >= columns {
             return None;
         }
         let row = (content_y / self.row_height() as f32) as usize;
-        let index = row * columns + col;
-        (col < columns
-            && index < self.visible(hwnd).len() + usize::from(self.query.trim().is_empty()))
-        .then_some(index)
+        let visible = self.visible(hwnd);
+        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+        let layout = self.grid_layout_for(&visible, columns, has_add);
+        layout.cells.iter().position(|&(c, r)| c == col && r == row)
     }
     fn toolbar_items(&self) -> Vec<Option<String>> {
         let mut items = vec![None];
@@ -682,7 +807,10 @@ impl App {
                         self.icons.insert(item.id.clone(), icon);
                         return;
                     }
-                    legacy_icon = Some(icon);
+                    legacy_icon = Some(match icon {
+                        Icon::Image(img) => Icon::Image(img.trim_padded_icon()),
+                        other => other,
+                    });
                 }
             }
         }
@@ -705,31 +833,32 @@ impl App {
                 .and_then(|e| e.to_str()),
             Some("exe" | "bat" | "cmd" | "com" | "msi" | "scr")
         );
-        let mut image = if is_shortcut {
-            system_image_list_icon(&key).or_else(|| shell_item_image(&key, 0x04 | 0x01))
-        } else if key.starts_with("shell:") {
-            shell_item_image(&key, 0x04 | 0x01).or_else(|| system_image_list_icon(&key))
+        let mut image = if is_shortcut || key.starts_with("shell:") {
+            pick_better_icon(
+                shell_item_image(&key, 0x04 | 0x01),
+                system_image_list_icon(&key),
+            )
         } else if is_exe {
-            private_extract_icon(&key)
-                .or_else(|| shell_item_image(&key, 0x04 | 0x01))
-                .or_else(|| system_image_list_icon(&key))
+            pick_better_icon(
+                private_extract_icon(&key),
+                shell_item_image(&key, 0x04 | 0x01),
+            )
+            .or_else(|| system_image_list_icon(&key))
         } else {
             let img = shell_item_image(&key, 0x01);
             if img.as_ref().is_some_and(|i| {
-                let [mx, my] = i.max_opaque_extent();
-                mx > 64 || my > 64
+                let [x0, y0, x1, y1] = i.effective_icon_bounds();
+                x1.saturating_sub(x0) > 64 || y1.saturating_sub(y0) > 64
             }) {
                 img
             } else {
-                system_image_list_icon(&key).or(img)
+                pick_better_icon(system_image_list_icon(&key), img)
             }
         };
-        let low_res = image
-            .as_ref()
-            .is_none_or(|img| {
-                let [mx, my] = img.max_opaque_extent();
-                mx <= 64 && my <= 64
-            });
+        let low_res = image.as_ref().is_none_or(|img| {
+            let [x0, y0, x1, y1] = img.effective_icon_bounds();
+            x1.saturating_sub(x0) <= 64 && y1.saturating_sub(y0) <= 64
+        });
         if low_res && !item.target.is_empty() && item.target != key {
             let target_lower = item.target.to_ascii_lowercase();
             let target_is_exe = matches!(
@@ -744,14 +873,8 @@ impl App {
             } else {
                 shell_item_image(&item.target, 0x04 | 0x01)
             };
-            if let Some(candidate) = better {
-                let [cx, cy] = candidate.max_opaque_extent();
-                let [ox, oy] = image
-                    .as_ref()
-                    .map_or([0, 0], |img| img.max_opaque_extent());
-                if cx.max(cy) > ox.max(oy) {
-                    image = Some(candidate);
-                }
+            if better.is_some() {
+                image = pick_better_icon(image, better);
             }
         }
         if let Some(image) = image {
@@ -790,7 +913,7 @@ impl App {
         let icon = if !info.hIcon.is_null() {
             if let Some(image) = render::Image::from_icon(info.hIcon) {
                 DestroyIcon(info.hIcon);
-                Icon::Image(image)
+                Icon::Image(image.trim_padded_icon())
             } else {
                 Icon::Shell(info.hIcon)
             }
@@ -811,10 +934,343 @@ impl App {
         let color = self.glass.borrow().wallpaper_accent();
         self.set_accent(color);
         self.background_key.clear();
+        self.sync_duplicate_appearance();
         InvalidateRect(hwnd, null(), 0);
         if !self.settings.hwnd.is_null() {
             InvalidateRect(self.settings.hwnd, null(), 0);
         }
+    }
+    unsafe fn sync_duplicate_appearance(&mut self) {
+        if self.is_duplicate {
+            return;
+        }
+        let dock = self.dock.clone();
+        let accent = self.accent_color;
+        let floating = self.dock.floating;
+        let inspect = self.inspect;
+        for dup in self.duplicate_docks.values() {
+            let d_hwnd = dup.hwnd;
+            if d_hwnd.is_null() || IsWindow(d_hwnd) == 0 {
+                continue;
+            }
+            if let Ok(mut d) = dup.state.try_borrow_mut() {
+                d.dock.theme = dock.theme.clone();
+                d.dock.light = dock.light;
+                d.dock.opacity = dock.opacity;
+                d.dock.frosted = dock.frosted;
+                d.dock.tint = dock.tint;
+                d.dock.frost_strength = dock.frost_strength;
+                d.dock.pinned_widgets = dock.pinned_widgets.clone();
+                d.dock.show_search = dock.show_search;
+                d.dock.show_labels = dock.show_labels;
+                d.dock.columns = dock.columns;
+                d.dock.icon_size = dock.icon_size;
+                d.dock.floating = floating;
+                d.accent_color = accent;
+                d.background_key.clear();
+                d.frame = None;
+                d.background = None;
+                d.list_base = None;
+                d.overlay = None;
+                d.search_frost = None;
+                d.search_text = None;
+                d.add_tile = None;
+                d.tile_cache.clear();
+                d.layout_edit(d_hwnd);
+                d.rebuild_style(d_hwnd);
+            }
+            apply_window_mode(d_hwnd, floating, inspect);
+            InvalidateRect(d_hwnd, null(), 0);
+        }
+    }
+    unsafe fn reload_from_shared(&mut self, hwnd: HWND) {
+        let Ok(mut loaded) = Dock::load(&self.root) else {
+            return;
+        };
+        loaded.position = self.dock.position;
+        loaded.size = self.dock.size;
+        let floating_changed = loaded.floating != self.dock.floating;
+        let old_pinned: HashMap<String, (String, Option<String>, Option<String>)> = self
+            .dock
+            .items
+            .iter()
+            .filter(|i| !i.catalog)
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    (i.name.clone(), i.icon.clone(), i.icon_source.clone()),
+                )
+            })
+            .collect();
+        let new_pinned: HashMap<String, (String, Option<String>, Option<String>)> = loaded
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    (i.name.clone(), i.icon.clone(), i.icon_source.clone()),
+                )
+            })
+            .collect();
+        for (id, meta) in &old_pinned {
+            if new_pinned.get(id) != Some(meta) {
+                if let Some(Icon::Shell(handle)) = self.icons.remove(id) {
+                    if !handle.is_null() {
+                        DestroyIcon(handle);
+                    }
+                }
+                self.scaled_icons.remove(id);
+                self.icon_shadows.remove(id);
+                self.labels.remove(id);
+                self.label_shadows.remove(id);
+            }
+        }
+        let catalog: Vec<Item> = self
+            .dock
+            .items
+            .iter()
+            .filter(|i| i.catalog)
+            .cloned()
+            .collect();
+        if !catalog.is_empty() {
+            let existing_names: std::collections::HashSet<String> =
+                loaded.items.iter().map(|i| i.name.to_lowercase()).collect();
+            let existing_targets: std::collections::HashSet<String> =
+                loaded.items.iter().map(|i| i.target.to_lowercase()).collect();
+            loaded.items.extend(catalog.into_iter().filter(|i| {
+                !existing_names.contains(&i.name.to_lowercase())
+                    && !existing_targets.contains(&i.target.to_lowercase())
+            }));
+        }
+        if !loaded.sync_desktop {
+            self.desktop_watch = None;
+        }
+        self.dock = loaded;
+        if self.dock.theme == crate::accent::THEME {
+            self.dock.light = crate::accent::light(self.accent_color);
+        }
+        self.search_cache.get_mut().take();
+        self.tile_cache.clear();
+        self.background_key.clear();
+        self.list_base_key.clear();
+        self.frame = None;
+        self.background = None;
+        self.list_base = None;
+        self.overlay = None;
+        self.search_frost = None;
+        self.search_text = None;
+        self.add_tile = None;
+        if let Some(sel) = &mut self.group_selection {
+            sel.checked
+                .retain(|id| self.dock.items.iter().any(|i| !i.catalog && i.id == *id));
+            if sel.checked.is_empty() {
+                self.group_selection = None;
+            }
+        }
+        self.layout_edit(hwnd);
+        self.rebuild_style(hwnd);
+        if floating_changed {
+            apply_window_mode(hwnd, self.dock.floating, self.inspect);
+        }
+        if !self.settings.hwnd.is_null() && IsWindowVisible(self.settings.hwnd) != 0 {
+            self.settings.content_cache = None;
+            InvalidateRect(self.settings.hwnd, null(), 0);
+        }
+        InvalidateRect(hwnd, null(), 0);
+    }
+    unsafe fn sync_multi_monitor(&mut self, hwnd: HWND) {
+        if self.is_duplicate {
+            return;
+        }
+        let mut changed = self
+            .packages
+            .sync_duplicates(self.glass.clone(), self.inspect, self.smoke);
+        let visible = IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0;
+        if !crate::multi_monitor::is_enabled() || !visible {
+            if !self.duplicate_docks.is_empty() {
+                self.duplicate_docks.clear();
+                changed = true;
+            }
+        } else {
+            let targets = crate::multi_monitor::target_displays_for(hwnd);
+            let desired_ids: std::collections::HashSet<String> = targets
+                .iter()
+                .filter(|d| d.work.is_some())
+                .map(|d| d.id.clone())
+                .collect();
+            let before = self.duplicate_docks.len();
+            self.duplicate_docks
+                .retain(|disp_id, d| desired_ids.contains(disp_id) && IsWindow(d.hwnd) != 0);
+            if self.duplicate_docks.len() != before {
+                changed = true;
+            }
+            for disp in targets {
+                if self.duplicate_docks.contains_key(&disp.id) {
+                    continue;
+                }
+                let Some(dst_work) = disp.work else {
+                    continue;
+                };
+                let dst_dpi = crate::multi_monitor::display_dpi(dst_work);
+                let rect = crate::multi_monitor::compute_duplicate_rect(
+                    "launcher",
+                    &disp.id,
+                    hwnd,
+                    dst_work,
+                    dst_dpi,
+                    crate::geometry::DOCK_MIN,
+                );
+                match App::create_secondary(
+                    hwnd,
+                    &self.root,
+                    self.glass.clone(),
+                    self.dock.clone(),
+                    self.accent_color,
+                    rect,
+                    dst_dpi,
+                    self.inspect,
+                    self.smoke,
+                ) {
+                    Ok(dup) => {
+                        crate::multi_monitor::register_duplicate(dup.hwnd, "launcher", &disp.id);
+                        self.duplicate_docks.insert(disp.id, dup);
+                        changed = true;
+                    }
+                    Err(e) => {
+                        crate::logger::error(
+                            "launcher",
+                            format!("failed to start duplicate dock on {}: {e}", disp.id),
+                        );
+                    }
+                }
+            }
+        }
+        if changed {
+            crate::fusion::refresh();
+        }
+    }
+    unsafe fn create_secondary(
+        primary_hwnd: HWND,
+        root: &Path,
+        glass: Rc<RefCell<Glass>>,
+        dock: Dock,
+        accent_color: u32,
+        rect: [i32; 4],
+        dst_dpi: f32,
+        inspect: bool,
+        smoke: bool,
+    ) -> Result<SecondaryDock, String> {
+        let floating = dock.floating;
+        let state = Box::new(RefCell::new(App {
+            frame: None,
+            window_shadow: None,
+            tray: None,
+            taskbar_created: 0,
+            background: None,
+            list_base: None,
+            list_base_key: String::new(),
+            pointer: [-1000.; 2],
+            paint_time: 0.,
+            toolbar_pressed: None,
+            add_pressed: false,
+            bar_drag: None,
+            background_key: String::new(),
+            moving_window: false,
+            accent_color,
+            overlay: None,
+            search_frost: None,
+            search_text: None,
+            symbols: crate::symbols::Symbols::default(),
+            motion: crate::motion::Motion::default(),
+            tile_drag: None,
+            suppress_click_until: 0.,
+            last_open: None,
+            open_busy_until: 0.,
+            pending_launch: None,
+            caret_on: true,
+            hwnd: null_mut(),
+            settings: settings::State::default(),
+            popup: None,
+            group_selection: None,
+            clear_pressed: false,
+            catalog_rx: None,
+            catalog_loaded: 0.,
+            search_cache: RefCell::new(None),
+            search_ink: rgb(248, 250, 253),
+            search_muted: rgb(193, 202, 215),
+            resize_drag: None,
+            pending_resize: None,
+            pending_startup: std::collections::VecDeque::new(),
+            glass,
+            packages: crate::widget_packages::Registry::discover(root),
+            general: None,
+            display_watcher: null_mut(),
+            display_sig: Vec::new(),
+            is_duplicate: true,
+            primary_hwnd,
+            duplicate_docks: HashMap::new(),
+            root: root.to_path_buf(),
+            desktop_watch: None,
+            dock,
+            edit: null_mut(),
+            search_font: null_mut(),
+            search_brush: null_mut(),
+            query: String::new(),
+            selected: 0,
+            scroll: Default::default(),
+            frame_queued: false,
+            hover: None,
+            icons: HashMap::new(),
+            scaled_icons: HashMap::new(),
+            icon_shadows: HashMap::new(),
+            label_shadows: HashMap::new(),
+            labels: HashMap::new(),
+            tile_cache: HashMap::new(),
+            add_tile: None,
+            profile_counts: [0; 4],
+            label_budget: 2,
+            icon_budget: 8,
+            cache_pending: false,
+            status: String::new(),
+            status_ticks: 0,
+            dpi: dst_dpi,
+            smoke,
+            inspect,
+            keyboard_selection: false,
+            started: std::time::Instant::now(),
+            cpu_start: 0,
+        }));
+        let hwnd = CreateWindowExW(
+            crate::gpu::window_ex_style() | WS_EX_TOOLWINDOW,
+            wide("LumenNativeDockWindow").as_ptr(),
+            wide(TITLE).as_ptr(),
+            WS_POPUP | WS_CLIPCHILDREN,
+            rect[0],
+            rect[1],
+            (rect[2] - rect[0]).max(1),
+            (rect[3] - rect[1]).max(1),
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            &*state as *const RefCell<App> as _,
+        );
+        if hwnd.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        crate::fusion::register_widget(hwnd);
+        let (live_dpi, _) =
+            crate::geometry::clamp_window_to_work(hwnd, crate::geometry::DOCK_MIN, dst_dpi);
+        {
+            let mut d = state.borrow_mut();
+            d.dpi = live_dpi;
+            d.layout_edit(hwnd);
+            d.rebuild_style(hwnd);
+        }
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        apply_window_mode(hwnd, floating, inspect);
+        UpdateWindow(hwnd);
+        state.borrow_mut().paint(hwnd);
+        Ok(SecondaryDock { hwnd, state })
     }
     unsafe fn open_item(&mut self, hwnd: HWND, index: usize) {
         let Some(item) = self.dock.items.get(index) else {
@@ -838,6 +1294,8 @@ impl App {
         } else {
             format!("Opened {}", item.name)
         };
+        self.status_ticks = 0;
+        self.arm_motion(hwnd);
         InvalidateRect(hwnd, null(), 0);
     }
     unsafe fn add_files(&mut self, hwnd: HWND) {
@@ -1088,8 +1546,12 @@ impl App {
             0x28 => self.selected = (self.selected + columns).min(visible.len().saturating_sub(1)),
             _ => return,
         }
-        let y =
-            self.grid_top() as f32 + (self.selected / columns) as f32 * self.row_height() as f32;
+        let selected_row = self
+            .grid_layout(hwnd)
+            .cells
+            .get(self.selected)
+            .map_or(0, |&(_, r)| r);
+        let y = self.grid_top() as f32 + selected_row as f32 * self.row_height() as f32;
         let offset = self.scroll.target();
         let bottom = self.dimensions(hwnd).1 as f32 - 40.;
         if y - offset < self.grid_top() as f32 {
@@ -1671,11 +2133,8 @@ impl App {
         render::flush(dc);
         }
         let header_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-        let content_count = self.visible(hwnd).len()
-            + usize::from(self.query.trim().is_empty() && self.group_selection.is_none());
-        let needs_fade = self.grid_top()
-            + content_count.div_ceil(self.columns(hwnd)) as i32 * self.row_height()
-            > h - 14;
+        let needs_fade =
+            self.grid_top() + self.grid_layout(hwnd).rows as i32 * self.row_height() > h - 14;
         let base = if needs_fade || !header_key.is_empty() {
             let base = self
                 .list_base
@@ -1920,6 +2379,28 @@ unsafe fn shell_item_image(key: &str, flags: u32) -> Option<render::Image> {
     image
 }
 
+fn icon_rank(img: &render::Image) -> (bool, u32, u32) {
+    let [x0, y0, x1, y1] = img.effective_icon_bounds();
+    let extent = x1.saturating_sub(x0).max(y1.saturating_sub(y0));
+    let [pw, ph] = img.pixel_size();
+    (!img.is_jumbo_packed_small(), extent, pw.max(ph))
+}
+
+fn pick_better_icon(a: Option<render::Image>, b: Option<render::Image>) -> Option<render::Image> {
+    match (a, b) {
+        (Some(ia), Some(ib)) => {
+            if icon_rank(&ib) > icon_rank(&ia) {
+                Some(ib)
+            } else {
+                Some(ia)
+            }
+        }
+        (Some(ia), None) => Some(ia),
+        (None, Some(ib)) => Some(ib),
+        (None, None) => None,
+    }
+}
+
 unsafe fn system_image_list_icon(key: &str) -> Option<render::Image> {
     let mut info: SHFILEINFOW = zeroed();
     let ok = if key.starts_with("shell:") {
@@ -1980,8 +2461,12 @@ unsafe fn system_image_list_icon(key: &str) -> Option<render::Image> {
         let image = render::Image::from_icon(hicon);
         DestroyIcon(hicon);
         if let Some(image) = image {
-            let [mx, my] = image.max_opaque_extent();
-            if min_extent > 0 && mx <= min_extent && my <= min_extent {
+            let [x0, y0, x1, y1] = image.effective_icon_bounds();
+            let mx = x1.saturating_sub(x0);
+            let my = y1.saturating_sub(y0);
+            if image.is_jumbo_packed_small()
+                || (min_extent > 0 && mx <= min_extent && my <= min_extent)
+            {
                 continue;
             }
             return Some(image.trim_padded_icon());
@@ -2142,6 +2627,128 @@ unsafe extern "system" fn search_proc(
     result
 }
 
+unsafe extern "system" fn display_watcher_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_NCCREATE {
+        let create = &*(lparam as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+        return 1;
+    }
+    if matches!(message, WM_DISPLAYCHANGE | WM_DPICHANGED)
+        || (message == WM_SETTINGCHANGE && (wparam == 47 || lparam != 0))
+    {
+        let dock = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HWND;
+        if !dock.is_null() {
+            PostMessageW(dock, DISPLAY_SYNC, 0, 0);
+        }
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+unsafe fn create_display_watcher(dock_hwnd: HWND) -> HWND {
+    let cls = wide("LumenDisplayWatcher");
+    let instance = GetModuleHandleW(null());
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(display_watcher_proc),
+        hInstance: instance,
+        lpszClassName: cls.as_ptr(),
+        ..zeroed()
+    };
+    RegisterClassW(&wc);
+    CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        cls.as_ptr(),
+        wide("Lumen Display Watcher").as_ptr(),
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        null_mut(),
+        null_mut(),
+        instance,
+        dock_hwnd as _,
+    )
+}
+
+unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
+    let Ok((prev_dpi, is_dup, settings_hwnd)) = (*pointer).try_borrow_mut().map(|mut app| {
+        let prev = app.dpi;
+        let next = crate::geometry::window_dpi(hwnd);
+        app.dpi = next;
+        (prev, app.is_duplicate, app.settings.hwnd)
+    }) else {
+        return;
+    };
+    if !is_dup {
+        crate::multi_monitor::refresh_displays();
+    }
+    let (dpi, clamped) =
+        crate::geometry::clamp_window_to_work(hwnd, crate::geometry::DOCK_MIN, prev_dpi);
+    let dup_hwnds: Vec<HWND> = if let Ok(mut app) = (*pointer).try_borrow_mut() {
+        if !is_dup {
+            app.display_sig = crate::geometry::display_topology_signature();
+        }
+        let dpi_changed = (prev_dpi - dpi).abs() > 0.005;
+        app.dpi = dpi;
+        if !is_dup {
+            let blur = app.glass.borrow().blur();
+            app.glass.borrow_mut().set_blur(blur, dpi);
+            app.glass.borrow_mut().refresh();
+        }
+        if dpi_changed || clamped {
+            app.frame = None;
+            app.background = None;
+            app.list_base = None;
+            app.overlay = None;
+            app.search_frost = None;
+            app.search_text = None;
+            app.add_tile = None;
+            app.tile_cache.clear();
+            app.labels.clear();
+            app.label_shadows.clear();
+            app.scaled_icons.clear();
+            app.icon_shadows.clear();
+            app.background_key.clear();
+            app.layout_edit(hwnd);
+            app.rebuild_style(hwnd);
+        } else {
+            app.background_key.clear();
+        }
+        let dups = if !is_dup {
+            if let Some(host) = &mut app.general {
+                host.refresh_displays();
+            }
+            app.packages.notify_display_change();
+            app.duplicate_docks.values().map(|d| d.hwnd).collect()
+        } else {
+            Vec::new()
+        };
+        InvalidateRect(hwnd, null(), 0);
+        dups
+    } else {
+        Vec::new()
+    };
+    for dhwnd in dup_hwnds {
+        if !dhwnd.is_null() && IsWindow(dhwnd) != 0 {
+            SendMessageW(dhwnd, WM_DISPLAYCHANGE, 0, 0);
+        }
+    }
+    if !is_dup {
+        if let Ok(mut app) = (*pointer).try_borrow_mut() {
+            app.sync_multi_monitor(hwnd);
+        }
+        crate::fusion::refresh();
+        if !settings_hwnd.is_null() && IsWindow(settings_hwnd) != 0 {
+            SendMessageW(settings_hwnd, WM_DISPLAYCHANGE, 0, 0);
+        }
+    }
+}
+
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     message: u32,
@@ -2187,11 +2794,22 @@ unsafe extern "system" fn wndproc(
     match message {
         WM_CREATE => {
             app.hwnd = hwnd;
-            app.dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
-            if std::env::args().any(|a| a == "--smoke-test") {
-                app.glass.borrow_mut().refresh();
+            let is_dup = app.is_duplicate;
+            if !is_dup {
+                crate::displays::configure(&app.root);
+                crate::multi_monitor::configure_root(&app.root, app.smoke);
+                crate::multi_monitor::set_host(hwnd);
+                crate::multi_monitor::register_widget(hwnd, "launcher");
+                app.display_sig = crate::geometry::display_topology_signature();
+                app.display_watcher = create_display_watcher(hwnd);
+                app.dpi = crate::geometry::window_dpi(hwnd);
+                if std::env::args().any(|a| a == "--smoke-test") {
+                    app.glass.borrow_mut().refresh();
+                } else {
+                    app.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
+                }
             } else {
-                app.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
+                app.dpi = crate::geometry::window_dpi(hwnd);
             }
             let accent = app.glass.borrow().wallpaper_accent();
             app.accent_color = accent;
@@ -2233,14 +2851,16 @@ unsafe extern "system" fn wndproc(
                 },
             );
             DragAcceptFiles(hwnd, 1);
-            if app.taskbar_created != 0 {
-                ChangeWindowMessageFilterEx(hwnd, app.taskbar_created, MSGFLT_ALLOW, null_mut());
-            }
-            ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, null_mut());
-            ChangeWindowMessageFilterEx(hwnd, 0x0049, MSGFLT_ALLOW, null_mut());
-            app.tray = crate::tray::Tray::new(hwnd, &app.root);
-            if app.tray.as_ref().is_some_and(|t| !t.is_registered()) {
-                SetTimer(hwnd, TRAY_RETRY_TIMER, 1500, None);
+            if !is_dup {
+                if app.taskbar_created != 0 {
+                    ChangeWindowMessageFilterEx(hwnd, app.taskbar_created, MSGFLT_ALLOW, null_mut());
+                }
+                ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, null_mut());
+                ChangeWindowMessageFilterEx(hwnd, 0x0049, MSGFLT_ALLOW, null_mut());
+                app.tray = crate::tray::Tray::new(hwnd, &app.root);
+                if app.tray.as_ref().is_some_and(|t| !t.is_registered()) {
+                    SetTimer(hwnd, TRAY_RETRY_TIMER, 1500, None);
+                }
             }
             let yes = 1u32;
             DwmSetWindowAttribute(hwnd, 11, &yes as *const _ as _, 4);
@@ -2250,26 +2870,28 @@ unsafe extern "system" fn wndproc(
             let corners = 1u32;
             DwmSetWindowAttribute(hwnd, 33, &corners as *const _ as _, 4);
             apply_window_mode(hwnd, app.dock.floating, app.inspect);
-            SetTimer(hwnd, PIN_TIMER, 1000, None);
-            if app.smoke {
-                SetTimer(hwnd, SMOKE_TIMER, 5000, None);
-            } else {
-                // One-shot update check ~5 minutes after startup or restart.
-                SetTimer(hwnd, UPDATE_CHECK_TIMER, 5 * 60 * 1000, None);
-                if let Some(version) = crate::update::take_applied_version(&app.root) {
-                    crate::logger::info("update", format!("applied update to v{version}"));
-                    app.status = format!("Updated to Lumen v{version}!");
-                    app.status_ticks = 0;
-                    if let Some(tray) = &mut app.tray {
-                        tray.notify(
-                            "Lumen Updated",
-                            &format!("Successfully updated to Lumen v{version}."),
-                        );
+            if !is_dup {
+                SetTimer(hwnd, PIN_TIMER, 1000, None);
+                if app.smoke {
+                    SetTimer(hwnd, SMOKE_TIMER, 5000, None);
+                } else {
+                    // One-shot update check ~5 minutes after startup or restart.
+                    SetTimer(hwnd, UPDATE_CHECK_TIMER, 5 * 60 * 1000, None);
+                    if let Some(version) = crate::update::take_applied_version(&app.root) {
+                        crate::logger::info("update", format!("applied update to v{version}"));
+                        app.status = format!("Updated to Lumen v{version}!");
+                        app.status_ticks = 0;
+                        if let Some(tray) = &mut app.tray {
+                            tray.notify(
+                                "Lumen Updated",
+                                &format!("Successfully updated to Lumen v{version}."),
+                            );
+                        }
+                        if let Some(host) = app.ensure_general() {
+                            host.announce_applied_update(&version);
+                        }
+                        InvalidateRect(hwnd, null(), 0);
                     }
-                    if let Some(host) = app.ensure_general() {
-                        host.announce_applied_update(&version);
-                    }
-                    InvalidateRect(hwnd, null(), 0);
                 }
             }
             0
@@ -2412,19 +3034,19 @@ unsafe extern "system" fn wndproc(
             SetBrushOrgEx(wparam as HDC, 0, 0, null_mut());
             app.search_brush as isize
         }
-        WM_DISPLAYCHANGE => {
-            app.background_key.clear();
-            InvalidateRect(hwnd, null(), 0);
-            if !app.settings.hwnd.is_null() {
-                InvalidateRect(app.settings.hwnd, null(), 0);
-            }
+        WM_DISPLAYCHANGE | DISPLAY_SYNC => {
+            drop(app);
+            sync_display_change(hwnd, pointer);
             0
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            let refreshed = app.glass.borrow_mut().refresh();
-            if refreshed {
-                app.notify_wallpaper_changed(hwnd);
+            if !app.is_duplicate {
+                let refreshed = app.glass.borrow_mut().refresh();
+                if refreshed {
+                    app.notify_wallpaper_changed(hwnd);
+                }
             }
+            drop(app);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_SIZE => {
@@ -2633,8 +3255,14 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_DPICHANGED => {
-            app.dpi = (wparam as u16) as f32 / 96.0;
-            let rect = &*(lparam as *const RECT);
+            let new_dpi = ((wparam as u16) as f32 / 96.0).max(1.0);
+            app.dpi = new_dpi;
+            let rect = crate::geometry::clamp_dpi_rect(
+                *(lparam as *const RECT),
+                crate::geometry::DOCK_MIN,
+                new_dpi,
+            );
+            drop(app);
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -2644,7 +3272,9 @@ unsafe extern "system" fn wndproc(
                 rect.bottom - rect.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            app.rebuild_style(hwnd);
+            if let Ok(mut app) = (*pointer).try_borrow_mut() {
+                app.rebuild_style(hwnd);
+            }
             0
         }
         WM_ENTERSIZEMOVE => {
@@ -2660,14 +3290,18 @@ unsafe extern "system" fn wndproc(
             if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
                 eprintln!("native-move freeze=false");
             }
-            let mut rect: RECT = zeroed();
-            GetWindowRect(hwnd, &mut rect);
-            app.dock.position = Some([rect.left, rect.top]);
-            app.dock.size = Some([
-                ((rect.right - rect.left) as f32 / app.dpi).round() as i32,
-                ((rect.bottom - rect.top) as f32 / app.dpi).round() as i32,
-            ]);
-            app.save();
+            if app.is_duplicate {
+                crate::multi_monitor::record_duplicate_bounds(hwnd, app.dpi);
+            } else {
+                let mut rect: RECT = zeroed();
+                GetWindowRect(hwnd, &mut rect);
+                app.dock.position = Some([rect.left, rect.top]);
+                app.dock.size = Some([
+                    ((rect.right - rect.left) as f32 / app.dpi).round() as i32,
+                    ((rect.bottom - rect.top) as f32 / app.dpi).round() as i32,
+                ]);
+                app.save_bounds();
+            }
             app.background_key.clear();
             InvalidateRect(hwnd, null(), 0);
             0
@@ -2846,12 +3480,31 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
-        WM_RBUTTONDOWN if app.popup.is_some() => {
-            let (x, y) = xy(lparam);
-            let p = [x as f32 / app.dpi, y as f32 / app.dpi];
-            if app.popup.as_ref().is_some_and(|popup| !popup.inside(p)) {
-                app.close_popup(hwnd);
+        WM_RBUTTONDOWN => {
+            if app.popup.is_some() {
+                let (x, y) = xy(lparam);
+                let p = [x as f32 / app.dpi, y as f32 / app.dpi];
+                if app.popup.as_ref().is_some_and(|popup| !popup.inside(p)) {
+                    app.close_popup(hwnd);
+                }
             }
+            0
+        }
+        WM_RBUTTONUP => {
+            if app.group_selection.is_some() {
+                return 0;
+            }
+            let (x, y) = xy(lparam);
+            let client_p = [x as f32 / app.dpi, y as f32 / app.dpi];
+            if app.popup.as_ref().is_some_and(|p| p.inside(client_p)) {
+                return 0;
+            }
+            let item = app
+                .hit(hwnd, client_p[0] as i32, client_p[1] as i32)
+                .and_then(|pos| app.visible(hwnd).get(pos).copied());
+            let mut screen = POINT { x, y };
+            ClientToScreen(hwnd, &mut screen);
+            app.context_menu(hwnd, screen.x, screen.y, item);
             0
         }
         WM_CONTEXTMENU => {
@@ -2896,7 +3549,9 @@ unsafe extern "system" fn wndproc(
             }
             DragFinish(drop);
             app.status = format!("Added {added} item(s)");
+            app.status_ticks = 0;
             app.save();
+            app.arm_motion(hwnd);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -2917,7 +3572,7 @@ unsafe extern "system" fn wndproc(
             0
         }
         WALLPAPER_READY => {
-            if app.glass.borrow_mut().finish_async() {
+            if !app.is_duplicate && app.glass.borrow_mut().finish_async() {
                 let accent = app.glass.borrow().wallpaper_accent();
                 app.accent_color = accent;
                 if app.dock.theme == crate::accent::THEME {
@@ -2925,6 +3580,7 @@ unsafe extern "system" fn wndproc(
                     app.rebuild_style(hwnd);
                 }
                 app.background_key.clear();
+                app.sync_duplicate_appearance();
                 app.packages.refresh();
                 if let Some(host) = &mut app.general {
                     host.refresh();
@@ -3053,7 +3709,21 @@ unsafe extern "system" fn wndproc(
                 if app.status_ticks >= 3 {
                     app.status.clear();
                     app.status_ticks = 0;
+                    app.arm_motion(hwnd);
                     InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            for dup in app.duplicate_docks.values() {
+                if let Ok(mut d) = dup.state.try_borrow_mut() {
+                    if !d.status.is_empty() {
+                        d.status_ticks += 1;
+                        if d.status_ticks >= 3 {
+                            d.status.clear();
+                            d.status_ticks = 0;
+                            d.arm_motion(dup.hwnd);
+                            InvalidateRect(dup.hwnd, null(), 0);
+                        }
+                    }
                 }
             }
             let refreshed = app.glass.borrow_mut().refresh();
@@ -3062,6 +3732,15 @@ unsafe extern "system" fn wndproc(
             }
             if !app.dock.floating && !app.inspect {
                 pin_to_desktop(hwnd);
+                for dup in app.duplicate_docks.values() {
+                    pin_to_desktop(dup.hwnd);
+                }
+            }
+            crate::multi_monitor::sync_visibility();
+            let sig = crate::geometry::display_topology_signature();
+            if sig != app.display_sig {
+                drop(app);
+                sync_display_change(hwnd, pointer);
             }
             0
         }
@@ -3083,6 +3762,10 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_CLOSE => {
+            if app.is_duplicate {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
             app.tile_drag = None;
             if let Some(host) = &mut app.general {
                 host.hide();
@@ -3100,7 +3783,7 @@ unsafe extern "system" fn wndproc(
                     ((rect.right - rect.left) as f32 / app.dpi).round() as i32,
                     ((rect.bottom - rect.top) as f32 / app.dpi).round() as i32,
                 ]);
-                app.save();
+                app.save_bounds();
             }
             // Drop mutable borrow before destruction, so WM_DESTROY can borrow.
             drop(app);
@@ -3108,6 +3791,20 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_DESTROY => {
+            if app.is_duplicate {
+                for id in [MOTION_TIMER, LAUNCH_TIMER, CARET_TIMER] {
+                    KillTimer(hwnd, id);
+                }
+                return 0;
+            }
+            crate::multi_monitor::unregister_widget(hwnd);
+            if !app.display_watcher.is_null() && IsWindow(app.display_watcher) != 0 {
+                DestroyWindow(app.display_watcher);
+                app.display_watcher = null_mut();
+            }
+            app.duplicate_docks.clear();
+            app.general.take();
+            app.packages.shutdown();
             report_metrics(app.started.elapsed().as_secs_f64(), app.cpu_start);
             crate::logger::info("app", format!("shutdown complete (pid={})", std::process::id()));
             KillTimer(hwnd, PIN_TIMER);
@@ -3127,10 +3824,59 @@ unsafe extern "system" fn wndproc(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
+        m if m == crate::multi_monitor::SYNC_MESSAGE => {
+            if !app.is_duplicate {
+                app.sync_multi_monitor(hwnd);
+            }
+            0
+        }
+        m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
+            app.reload_from_shared(hwnd);
+            0
+        }
+        m if m == crate::multi_monitor::HIDE_WIDGET_MESSAGE => {
+            if !app.is_duplicate {
+                for id in crate::multi_monitor::take_pending_hides() {
+                    if let Err(error) = app.manage(crate::general::Action::Hide(id)) {
+                        app.status = error;
+                    }
+                }
+            }
+            0
+        }
+        FORWARD_TOGGLE => {
+            if !app.is_duplicate {
+                if let Some(id) = app
+                    .packages
+                    .manifests()
+                    .get(wparam)
+                    .map(|m| m.id.clone())
+                {
+                    app.toggle_package(&id);
+                }
+            }
+            0
+        }
+        FORWARD_OPEN_SETTINGS => {
+            if !app.is_duplicate {
+                let anchor = if wparam != 0 && IsWindow(wparam as HWND) != 0 {
+                    wparam as HWND
+                } else {
+                    hwnd
+                };
+                app.open_settings_on(hwnd, anchor);
+            }
+            0
+        }
         _ => {
             if message >= 0xc000 {
                 if message == crate::widget_packages::manager_message() {
-                    app.show_general();
+                    let anchor = if wparam != 0 && IsWindow(wparam as HWND) != 0 {
+                        wparam as HWND
+                    } else {
+                        hwnd
+                    };
+                    app.show_general_on(anchor);
                     return 0;
                 }
                 if let Some(id) = app.packages.message_package(message).map(str::to_owned) {
@@ -3354,6 +4100,11 @@ pub fn run() -> Result<(), String> {
             glass: std::rc::Rc::new(RefCell::new(Glass::new(crate::glass::global_blur(), dpi))),
             packages: crate::widget_packages::Registry::discover(&root),
             general: None,
+            display_watcher: null_mut(),
+            display_sig: Vec::new(),
+            is_duplicate: false,
+            primary_hwnd: null_mut(),
+            duplicate_docks: HashMap::new(),
             root,
             desktop_watch: None,
             dock,
@@ -3404,13 +4155,22 @@ pub fn run() -> Result<(), String> {
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(monitor, &mut info);
-        rect.left = rect.left.clamp(
-            info.rcWork.left,
-            (info.rcWork.right - width).max(info.rcWork.left),
+        let min_px = crate::geometry::DOCK_MIN.map(|v| (v as f32 * dpi).round() as i32);
+        let clamped = crate::geometry::clamp_rect_to_work(
+            [rect.left, rect.top, rect.right, rect.bottom],
+            [
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
+            ],
+            min_px,
         );
-        rect.top = rect.top.clamp(
-            info.rcWork.top,
-            (info.rcWork.bottom - height).max(info.rcWork.top),
+        let (left, top, width, height) = (
+            clamped[0],
+            clamped[1],
+            clamped[2] - clamped[0],
+            clamped[3] - clamped[1],
         );
         let hwnd = CreateWindowExW(
             crate::gpu::window_ex_style()
@@ -3422,8 +4182,8 @@ pub fn run() -> Result<(), String> {
             class.as_ptr(),
             wide(TITLE).as_ptr(),
             WS_POPUP | WS_CLIPCHILDREN,
-            rect.left,
-            rect.top,
+            left,
+            top,
             width,
             height,
             null_mut(),
@@ -3434,6 +4194,13 @@ pub fn run() -> Result<(), String> {
         if hwnd.is_null() {
             CloseHandle(mutex);
             return Err(std::io::Error::last_os_error().to_string());
+        }
+        let (live_dpi, _) =
+            crate::geometry::clamp_window_to_work(hwnd, crate::geometry::DOCK_MIN, dpi);
+        if (app.borrow().dpi - live_dpi).abs() > 0.005 {
+            let mut a = app.borrow_mut();
+            a.dpi = live_dpi;
+            a.rebuild_style(hwnd);
         }
         crate::fusion::init(app.borrow().glass.clone());
         ShowWindow(
@@ -3487,6 +4254,7 @@ pub fn run() -> Result<(), String> {
         } else if crate::motion::low_power() {
             crate::glass::trim_working_set();
         }
+        crate::multi_monitor::request_sync();
         if std::env::args().any(|a| a == "--manage-widgets") {
             app.borrow_mut().show_general();
         }
@@ -3513,13 +4281,24 @@ pub fn run() -> Result<(), String> {
                 break;
             }
             // Route keys received by our own search field; no system-wide input.
-            let edit = app.borrow().edit;
-            if message.hwnd == edit
-                && message.message == WM_KEYDOWN
-                && matches!(message.wParam as u32, 0x0D | 0x1B | 0x26 | 0x28)
-            {
-                SendMessageW(hwnd, KEY_FROM_SEARCH, message.wParam, 0);
-                continue;
+            let search_target = {
+                let a = app.borrow();
+                if message.hwnd == a.edit {
+                    Some(hwnd)
+                } else {
+                    a.duplicate_docks
+                        .values()
+                        .find(|d| d.state.try_borrow().is_ok_and(|s| s.edit == message.hwnd))
+                        .map(|d| d.hwnd)
+                }
+            };
+            if let Some(target_hwnd) = search_target {
+                if message.message == WM_KEYDOWN
+                    && matches!(message.wParam as u32, 0x0D | 0x1B | 0x26 | 0x28)
+                {
+                    SendMessageW(target_hwnd, KEY_FROM_SEARCH, message.wParam, 0);
+                    continue;
+                }
             }
             if crate::notes::translate(&message) {
                 continue;
@@ -3548,6 +4327,8 @@ pub fn run() -> Result<(), String> {
         }
         crate::motion::clear_pending_vsync();
         reset_quit_requested();
+        app.borrow_mut().duplicate_docks.clear();
+        crate::multi_monitor::shutdown();
         crate::fusion::shutdown();
         CloseHandle(mutex);
         app.borrow_mut().general.take();

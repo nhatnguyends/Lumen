@@ -299,7 +299,7 @@ pub unsafe fn register_widget(hwnd: HWND) {
 }
 unsafe fn read_member(hwnd: HWND, radius: f32) -> Member {
     let r = window_rect(hwnd);
-    let dpi = (GetDpiForWindow(hwnd) as f32 / 96.).max(1.);
+    let dpi = crate::geometry::window_dpi(hwnd).max(1.);
     let inset = 4. * dpi;
     Member {
         pane: Pane {
@@ -2607,7 +2607,18 @@ mod tests {
             let widget_glass = Glass::fixture_tiled_file(&wave_path, 14.0, 1.0);
             init(Rc::new(RefCell::new(Glass::fixture_tiled_file(&wave_path, 14.0, 1.0))));
             let instance = GetModuleHandleW(null());
-            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            let probe = RECT {
+                left: -(cw as i32) * 10,
+                top: -(ch as i32) * 20,
+                right: -(cw as i32) * 9,
+                bottom: -(ch as i32) * 19,
+            };
+            let mon = MonitorFromRect(&probe, MONITOR_DEFAULTTONEAREST);
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(mon, &mut mi);
+            let ox = mi.rcMonitor.left - (cw as i32) * 10;
+            let oy = mi.rcMonitor.top - (ch as i32) * 20;
 
             // L-junction cluster with deliberate 2px edge step between Clock (x=40) and Notes (x=42):
             // Clock [40..300, 40..230] (pane [44..296, 44..226]) — warm sunset orange chrome
@@ -2985,7 +2996,18 @@ mod tests {
                 &diag_path, 14.0, 1.0,
             ))));
             let instance = GetModuleHandleW(null());
-            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            let probe = RECT {
+                left: -(cw as i32) * 10,
+                top: -(ch as i32) * 20,
+                right: -(cw as i32) * 9,
+                bottom: -(ch as i32) * 19,
+            };
+            let mon = MonitorFromRect(&probe, MONITOR_DEFAULTTONEAREST);
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(mon, &mut mi);
+            let ox = mi.rcMonitor.left - (cw as i32) * 10;
+            let oy = mi.rcMonitor.top - (ch as i32) * 20;
             let specs = [
                 ([ox + 40, oy + 40, 260, 190], [230.0f32, 160.0, 120.0]),
                 ([ox + 42, oy + 222, 180, 160], [110.0f32, 150.0, 210.0]),
@@ -3236,7 +3258,18 @@ mod tests {
                 &wall_path, 14.0, 1.0,
             ))));
             let instance = GetModuleHandleW(null());
-            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            let probe = RECT {
+                left: -(cw as i32) * 10,
+                top: -(ch as i32) * 20,
+                right: -(cw as i32) * 9,
+                bottom: -(ch as i32) * 19,
+            };
+            let mon = MonitorFromRect(&probe, MONITOR_DEFAULTTONEAREST);
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(mon, &mut mi);
+            let ox = mi.rcMonitor.left - (cw as i32) * 10;
+            let oy = mi.rcMonitor.top - (ch as i32) * 20;
             // Left: 0% tint (Control Center style); Right: 26% warm tint (Clock style),
             // shorter vertically to form a concave L-junction corner at (236, 196).
             let specs = [
@@ -3471,7 +3504,18 @@ mod tests {
                 &wall_path, 14.0, 1.0,
             ))));
             let instance = GetModuleHandleW(null());
-            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            let probe = RECT {
+                left: -(cw as i32) * 10,
+                top: -(ch as i32) * 20,
+                right: -(cw as i32) * 9,
+                bottom: -(ch as i32) * 19,
+            };
+            let mon = MonitorFromRect(&probe, MONITOR_DEFAULTTONEAREST);
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(mon, &mut mi);
+            let ox = mi.rcMonitor.left - (cw as i32) * 10;
+            let oy = mi.rcMonitor.top - (ch as i32) * 20;
             // Left: 65% 2D gradient orange/lavender tint (Controls style);
             // Right: wide (1120px, so gw > 64) 0% tint pane (Dock style).
             let specs = [

@@ -22,6 +22,7 @@ pub enum Action {
     Settings(String),
     Pin(String, bool),
     RefreshGlass,
+    SyncMultiMonitor,
     RestartUpdate,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,6 +39,8 @@ struct Config {
     frosted_glass: bool,
     blur: f32,
     position: Option<[i32; 2]>,
+    multi_monitor: bool,
+    duplicate_displays: Vec<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -53,6 +56,8 @@ impl Default for Config {
             frosted_glass: true,
             blur: 13.,
             position: None,
+            multi_monitor: false,
+            duplicate_displays: vec![],
         }
     }
 }
@@ -79,6 +84,9 @@ impl Config {
         crate::glass::set_liquid_glass(c.liquid_glass);
         crate::glass::set_frosted_glass(c.frosted_glass);
         crate::glass::set_global_blur(c.blur);
+        unsafe {
+            crate::multi_monitor::configure(c.multi_monitor, c.duplicate_displays.clone());
+        }
         Ok(c)
     }
     fn save(&self, root: &Path) -> Result<(), String> {
@@ -107,6 +115,7 @@ impl Config {
 }
 
 pub fn load_preferences(root: &Path) -> Result<(), String> {
+    crate::displays::configure(root);
     let config = Config::load(root)?;
     if crate::update::portable(root) && !std::env::args().any(|arg| arg == "--smoke-test") {
         crate::startup::set_enabled(root, config.start_with_windows)?;
@@ -125,6 +134,7 @@ pub struct Host {
     packages: Vec<crate::widget_packages::Manifest>,
     visibility: Vec<(String, bool)>,
     pinned: Vec<String>,
+    displays: Vec<crate::displays::DisplayInfo>,
     error: String,
     smoke: bool,
     update_rx: Option<std::sync::mpsc::Receiver<UpdateMessage>>,
@@ -149,6 +159,7 @@ impl Host {
             vec![],
             ACTION_MESSAGE,
         )?;
+        let displays = crate::displays::enumerate();
         let mut host = Self {
             ui,
             root: root.into(),
@@ -156,6 +167,7 @@ impl Host {
             packages: vec![],
             visibility: vec![],
             pinned: vec![],
+            displays,
             error: String::new(),
             smoke,
             update_rx: None,
@@ -192,7 +204,63 @@ impl Host {
             });
         }
         rows.extend([
-            Row::section("General"),
+            Row::section("Background"),
+            Row::toggle(
+                13,
+                "Liquid glass",
+                "Subtle edge refraction and chromatic shift on glass surfaces",
+                self.config.liquid_glass,
+            ),
+            Row::toggle(
+                16,
+                "Frosted glass",
+                "Blend widget backgrounds with the desktop wallpaper",
+                self.config.frosted_glass,
+            ),
+            Row::slider(17, "Blur size", self.config.blur, 0., 80., "px"),
+        ]);
+        rows.push(Row::section("Displays"));
+        rows.push(Row::toggle(
+            18,
+            "Duplicate widgets across displays",
+            "Mirror active widgets onto selected monitors",
+            self.config.multi_monitor,
+        ));
+        if self.config.multi_monitor {
+            for (i, d) in self.displays.iter().enumerate() {
+                if d.primary {
+                    rows.push(Row::note(format!(
+                        "{} · Main Display (source)",
+                        crate::displays::label(d)
+                    )));
+                } else if d.enabled && d.bounds.is_some() {
+                    rows.push(Row::toggle(
+                        2000 + i as u32,
+                        crate::displays::label(d),
+                        "Show duplicated widgets on this display",
+                        self.config.duplicate_displays.iter().any(|id| id == &d.id),
+                    ));
+                } else {
+                    rows.push(Row::note(format!(
+                        "{} · Off / disconnected",
+                        crate::displays::label(d)
+                    )));
+                }
+            }
+            if self
+                .displays
+                .iter()
+                .filter(|d| d.enabled && d.bounds.is_some())
+                .count()
+                < 2
+            {
+                rows.push(Row::note(
+                    "Connect or enable another display in Windows to duplicate widgets.",
+                ));
+            }
+        }
+        rows.extend([
+            Row::section("Misc"),
             Row::toggle(
                 6,
                 "Start with Windows",
@@ -217,19 +285,6 @@ impl Host {
                 "Reduce animation rate and blur effects for lower-spec PCs",
                 self.config.low_power,
             ),
-            Row::toggle(
-                13,
-                "Liquid glass",
-                "Subtle edge refraction and chromatic shift on glass surfaces",
-                self.config.liquid_glass,
-            ),
-            Row::toggle(
-                16,
-                "Frosted glass",
-                "Blend widget backgrounds with the desktop wallpaper",
-                self.config.frosted_glass,
-            ),
-            Row::slider(17, "Blur size", self.config.blur, 0., 80., "px"),
         ]);
         const UPDATE_ACCENT: u32 = 0xe5881e;
         rows.push(Row::section("Updates"));
@@ -291,8 +346,17 @@ impl Host {
         self.ui.set_rows(self.rows());
     }
     pub unsafe fn show(&mut self) {
+        self.show_near(std::ptr::null_mut());
+    }
+    pub unsafe fn show_near(&mut self, anchor: HWND) {
+        self.displays = crate::displays::enumerate();
         self.update_rows();
-        self.ui.show();
+        self.ui.show_near(anchor);
+    }
+    pub unsafe fn refresh_displays(&mut self) {
+        self.displays = crate::displays::enumerate();
+        self.update_rows();
+        self.ui.refit();
     }
     pub unsafe fn scroll_to_updates(&mut self) {
         self.update_rows();
@@ -435,6 +499,34 @@ impl Host {
                     crate::glass::set_global_blur(self.config.blur);
                     actions.push(Action::RefreshGlass);
                     dirty = true;
+                }
+                (18, Value::Bool(v)) => {
+                    self.config.multi_monitor = v;
+                    unsafe {
+                        self.displays = crate::displays::enumerate();
+                        crate::multi_monitor::configure(v, self.config.duplicate_displays.clone());
+                    }
+                    actions.push(Action::SyncMultiMonitor);
+                    dirty = true;
+                }
+                (id, Value::Bool(v)) if id >= 2000 => {
+                    if let Some(d) = self.displays.get((id - 2000) as usize) {
+                        if v {
+                            if !self.config.duplicate_displays.iter().any(|x| x == &d.id) {
+                                self.config.duplicate_displays.push(d.id.clone());
+                            }
+                        } else {
+                            self.config.duplicate_displays.retain(|x| x != &d.id);
+                        }
+                        unsafe {
+                            crate::multi_monitor::configure(
+                                self.config.multi_monitor,
+                                self.config.duplicate_displays.clone(),
+                            );
+                        }
+                        actions.push(Action::SyncMultiMonitor);
+                        dirty = true;
+                    }
                 }
                 (7, Value::Action) => self.start_update_check(),
                 (8, Value::Action) => actions.extend(self.trigger_update_now()),

@@ -162,6 +162,7 @@ struct ShadowSurface {
     image: Option<Image>,
 }
 thread_local! {static GROUPS:RefCell<HashMap<(u32,u32,u32,u32),Image>>=RefCell::new(HashMap::new());}
+thread_local! {static GROUP_POLYS:RefCell<HashMap<Vec<i32>,Image>>=RefCell::new(HashMap::new());}
 thread_local! {static HOVERS:RefCell<HashMap<(u32,u32,u32,u32,bool),Image>>=RefCell::new(HashMap::new());}
 thread_local! {static GLOW_SPRITE:RefCell<Option<Image>>=RefCell::new(None);}
 thread_local! {static SHADOWS:RefCell<HashMap<(u32,u32,u32,u32,u32),ShadowSurface>>=RefCell::new(HashMap::new());}
@@ -299,6 +300,7 @@ pub fn clear_caches() {
     crate::settings_ui::clear_cache();
     SHADOWS.with(|shadows| shadows.borrow_mut().clear());
     GROUPS.with(|groups| groups.borrow_mut().clear());
+    GROUP_POLYS.with(|groups| groups.borrow_mut().clear());
     HOVERS.with(|hovers| hovers.borrow_mut().clear());
     GLOW_SPRITE.with(|glow| *glow.borrow_mut() = None);
     REFLECTIONS.with(|cache| cache.borrow_mut().clear());
@@ -457,15 +459,21 @@ impl Image {
         Self::from_rgba(side, side, rgba)
     }
     pub fn opaque_bounds(&self) -> [u32; 4] {
+        self.bounds_above(8, 0)
+    }
+    fn bounds_above(&self, threshold: u8, margin: u32) -> [u32; 4] {
         let Some(pixels) = &self._pixels else {
             return [0, 0, self.width, self.height];
         };
+        if self.width <= margin * 2 || self.height <= margin * 2 {
+            return [0, 0, 0, 0];
+        }
         let (mut min_x, mut min_y) = (self.width, self.height);
         let (mut max_x, mut max_y) = (0u32, 0u32);
-        for y in 0..self.height {
-            for x in 0..self.width {
+        for y in margin..self.height - margin {
+            for x in margin..self.width - margin {
                 let a = pixels[((y * self.width + x) as usize) * 4 + 3];
-                if a > 8 {
+                if a > threshold {
                     min_x = min_x.min(x);
                     min_y = min_y.min(y);
                     max_x = max_x.max(x + 1);
@@ -479,29 +487,107 @@ impl Image {
             [min_x, min_y, max_x, max_y]
         }
     }
+    /// Detect real glyph bounds even when Windows packs a 16-64px icon inside
+    /// a 256x256 jumbo frame with a faint outer border.
+    pub fn effective_icon_bounds(&self) -> [u32; 4] {
+        let full = {
+            let b = self.bounds_above(20, 0);
+            if b[2] > b[0] && b[3] > b[1] {
+                b
+            } else {
+                self.bounds_above(8, 0)
+            }
+        };
+        let min_dim = self.width.min(self.height);
+        let full_max = full[2].saturating_sub(full[0]).max(full[3].saturating_sub(full[1]));
+        if let Some(pixels) = self._pixels.as_ref().filter(|_| {
+            self.width >= 128 && self.height >= 128 && full_max >= (min_dim * 85) / 100
+        }) {
+            let inner = self.bounds_above(20, 8);
+            let iw = inner[2].saturating_sub(inner[0]);
+            let ih = inner[3].saturating_sub(inner[1]);
+            let inner_max = iw.max(ih);
+            if iw > 0
+                && ih > 0
+                && inner_max <= (min_dim * 48) / 100
+                && inner[0] >= 12
+                && inner[1] >= 12
+                && inner[2] <= self.width - 12
+                && inner[3] <= self.height - 12
+            {
+                let mx0 = inner[0].saturating_sub(5).max(8);
+                let my0 = inner[1].saturating_sub(5).max(8);
+                let mx1 = (inner[2] + 5).min(self.width - 8);
+                let my1 = (inner[3] + 5).min(self.height - 8);
+                let mut outer_opaque = 0u64;
+                let mut outer_total = 0u64;
+                for y in 0..self.height {
+                    for x in 0..self.width {
+                        if x < mx0 || x >= mx1 || y < my0 || y >= my1 {
+                            outer_total += 1;
+                            if pixels[((y * self.width + x) as usize) * 4 + 3] > 20 {
+                                outer_opaque += 1;
+                            }
+                        }
+                    }
+                }
+                let mut moat_opaque = 0u64;
+                let mut moat_total = 0u64;
+                for y in my0..my1 {
+                    for x in mx0..mx1 {
+                        if x < inner[0].saturating_sub(1)
+                            || x >= inner[2] + 1
+                            || y < inner[1].saturating_sub(1)
+                            || y >= inner[3] + 1
+                        {
+                            moat_total += 1;
+                            if pixels[((y * self.width + x) as usize) * 4 + 3] > 20 {
+                                moat_opaque += 1;
+                            }
+                        }
+                    }
+                }
+                if outer_total > 0
+                    && outer_opaque * 100 < outer_total * 15
+                    && moat_total > 0
+                    && moat_opaque * 100 < moat_total * 5
+                {
+                    return inner;
+                }
+            }
+        }
+        full
+    }
+    pub fn is_jumbo_packed_small(&self) -> bool {
+        if self.width < 128 || self.height < 128 {
+            return false;
+        }
+        let [x0, y0, x1, y1] = self.effective_icon_bounds();
+        x1.saturating_sub(x0).max(y1.saturating_sub(y0)) <= 64
+    }
     pub fn max_opaque_extent(&self) -> [u32; 2] {
         let [x0, y0, x1, y1] = self.opaque_bounds();
         [x1.saturating_sub(x0), y1.saturating_sub(y0)]
     }
-    /// Crop excessive transparent padding when Windows packs a small 16-48px
+    /// Crop excessive transparent padding when Windows packs a smaller
     /// file/app glyph inside a 256x256 jumbo/shell canvas.
     pub fn trim_padded_icon(self) -> Self {
-        let [x0, y0, x1, y1] = self.opaque_bounds();
+        let [x0, y0, x1, y1] = self.effective_icon_bounds();
         let bw = x1.saturating_sub(x0);
         let bh = y1.saturating_sub(y0);
         let min_dim = self.width.min(self.height);
-        if bw == 0 || bh == 0 || min_dim == 0 || bw.max(bh) > (min_dim * 55) / 100 {
+        if bw == 0 || bh == 0 || min_dim == 0 || bw.max(bh) > (min_dim * 84) / 100 {
             return self;
         }
         let Some(pixels) = &self._pixels else {
             return self;
         };
-        let side = ((bw.max(bh) as f32) * 1.16).ceil().max(1.0) as u32;
+        let side = ((bw.max(bh) as f32) * 1.08).ceil().max(1.0) as u32;
         let cx = (x0 + x1) as i32 / 2;
         let cy = (y0 + y1) as i32 / 2;
         let sx0 = cx - side as i32 / 2;
         let sy0 = cy - side as i32 / 2;
-        let mut rgba = vec![0u8; (side as usize) * (side as usize) * 4];
+        let mut bgra = vec![0u8; (side as usize) * (side as usize) * 4];
         for dy in 0..side {
             let sy = sy0 + dy as i32;
             if sy < 0 || sy >= self.height as i32 {
@@ -514,10 +600,10 @@ impl Image {
                 }
                 let src = ((sy as u32 * self.width + sx as u32) as usize) * 4;
                 let dst = ((dy * side + dx) as usize) * 4;
-                rgba[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+                bgra[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
             }
         }
-        Self::from_rgba(side, side, rgba).unwrap_or(self)
+        Self::from_bgra(side, side, bgra).unwrap_or(self)
     }
     pub fn load(path: &Path) -> Option<Self> {
         let decoded = image::open(path).ok()?.into_rgba8();
@@ -647,6 +733,12 @@ impl Image {
         }
         for p in pixels.chunks_exact_mut(4) {
             p.swap(0, 2);
+        }
+        Self::from_bgra(width, height, pixels)
+    }
+    pub fn from_bgra(width: u32, height: u32, mut pixels: Vec<u8>) -> Option<Self> {
+        if pixels.len() != width as usize * height as usize * 4 {
+            return None;
         }
         unsafe {
             let mut image = null_mut();
@@ -1163,6 +1255,177 @@ impl Batch {
                 .is_some_and(|image| self.blit(image, [r[0] - p, r[1] - p, r[2] + p, r[3] + p], snapped))
         })
     }
+    pub fn group_poly_surface(&self, spans: &[[f32; 4]], radius: f32, snapped: bool) -> bool {
+        if spans.is_empty() {
+            return true;
+        }
+        if spans.len() == 1 {
+            return self.group_surface(spans[0], radius, snapped);
+        }
+        let _cost = Cost::new(3);
+        with_cached_group_poly(spans, radius, self.scale, |image, dest| self.blit(image, dest, snapped))
+    }
+}
+pub fn split_connected_group_spans(spans: &[[f32; 4]], min_overlap: f32) -> Vec<Vec<[f32; 4]>> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur = vec![spans[0]];
+    for s in &spans[1..] {
+        let prev = *cur.last().unwrap();
+        let overlap = prev[2].min(s[2]) - prev[0].max(s[0]);
+        if overlap >= min_overlap {
+            cur.push(*s);
+        } else {
+            out.push(cur);
+            cur = vec![*s];
+        }
+    }
+    out.push(cur);
+    out
+}
+pub fn ortho_group_polygon(spans: &[[f32; 4]]) -> Vec<[f32; 2]> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut raw = Vec::with_capacity(spans.len() * 4);
+    raw.push([spans[0][2], spans[0][1]]);
+    for k in 0..spans.len() - 1 {
+        let (rx, by) = (spans[k][2], spans[k][3]);
+        let (nrx, nty) = (spans[k + 1][2], spans[k + 1][1]);
+        if (nrx - rx).abs() >= 0.5 {
+            if nrx < rx {
+                raw.push([rx, by]);
+                raw.push([nrx, by]);
+            } else {
+                raw.push([rx, nty]);
+                raw.push([nrx, nty]);
+            }
+        }
+    }
+    let last = spans[spans.len() - 1];
+    raw.push([last[2], last[3]]);
+    raw.push([last[0], last[3]]);
+    for k in (0..spans.len() - 1).rev() {
+        let (nlx, nty) = (spans[k + 1][0], spans[k + 1][1]);
+        let (lx, by) = (spans[k][0], spans[k][3]);
+        if (nlx - lx).abs() >= 0.5 {
+            if nlx < lx {
+                raw.push([nlx, nty]);
+                raw.push([lx, nty]);
+            } else {
+                raw.push([nlx, by]);
+                raw.push([lx, by]);
+            }
+        }
+    }
+    raw.push([spans[0][0], spans[0][1]]);
+    let mut clean: Vec<[f32; 2]> = Vec::with_capacity(raw.len());
+    for pt in raw {
+        if clean
+            .last()
+            .is_none_or(|prev| (prev[0] - pt[0]).abs() > 0.01 || (prev[1] - pt[1]).abs() > 0.01)
+        {
+            clean.push(pt);
+        }
+    }
+    if clean.len() > 1 {
+        let first = clean[0];
+        let last_pt = *clean.last().unwrap();
+        if (first[0] - last_pt[0]).abs() <= 0.01 && (first[1] - last_pt[1]).abs() <= 0.01 {
+            clean.pop();
+        }
+    }
+    let mut changed = true;
+    while changed && clean.len() > 4 {
+        changed = false;
+        let mut i = 0;
+        while i < clean.len() && clean.len() > 4 {
+            let n = clean.len();
+            let prev = clean[(i + n - 1) % n];
+            let cur = clean[i];
+            let next = clean[(i + 1) % n];
+            let dx1 = cur[0] - prev[0];
+            let dy1 = cur[1] - prev[1];
+            let dx2 = next[0] - cur[0];
+            let dy2 = next[1] - cur[1];
+            if (dx1 * dy2 - dy1 * dx2).abs() <= 0.01 && (dx1 * dx2 + dy1 * dy2) >= 0.0 {
+                clean.remove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    clean
+}
+fn spans_bounds(spans: &[[f32; 4]]) -> [f32; 4] {
+    let mut b = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for s in spans {
+        b[0] = b[0].min(s[0]);
+        b[1] = b[1].min(s[1]);
+        b[2] = b[2].max(s[2]);
+        b[3] = b[3].max(s[3]);
+    }
+    b
+}
+fn with_cached_group_poly(
+    spans: &[[f32; 4]],
+    radius: f32,
+    scale: f32,
+    draw: impl FnOnce(&Image, [f32; 4]) -> bool,
+) -> bool {
+    let bounds = spans_bounds(spans);
+    let pad = (14. * scale).ceil() as u32;
+    let p = pad as f32 / scale;
+    let width = ((bounds[2] - bounds[0]) * scale).round().max(1.) as u32 + pad * 2;
+    let height = ((bounds[3] - bounds[1]) * scale).round().max(1.) as u32 + pad * 2;
+    let mut key = Vec::with_capacity(3 + spans.len() * 4);
+    key.push(spans.len() as i32);
+    key.push((radius * scale * 16.).round() as i32);
+    key.push((scale * 1000.).round() as i32);
+    let mut rel_spans = Vec::with_capacity(spans.len());
+    for s in spans {
+        let rel = [
+            s[0] - bounds[0] + p,
+            s[1] - bounds[1] + p,
+            s[2] - bounds[0] + p,
+            s[3] - bounds[1] + p,
+        ];
+        key.push(((s[0] - bounds[0]) * scale).round() as i32);
+        key.push(((s[1] - bounds[1]) * scale).round() as i32);
+        key.push(((s[2] - bounds[0]) * scale).round() as i32);
+        key.push(((s[3] - bounds[1]) * scale).round() as i32);
+        rel_spans.push(rel);
+    }
+    let rel_bounds = [p, p, p + (bounds[2] - bounds[0]), p + (bounds[3] - bounds[1])];
+    let rel_verts = ortho_group_polygon(&rel_spans);
+    if rel_verts.len() < 4 {
+        return false;
+    }
+    GROUP_POLYS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            if cache.len() >= 24 {
+                cache.clear();
+            }
+            if let Some(mut image) =
+                Image::from_rgba(width, height, vec![0; (width * height * 4) as usize])
+            {
+                unsafe {
+                    if let Some(canvas) = Canvas::on_image(&image, scale) {
+                        canvas.draw_group_poly_material(&rel_spans, &rel_verts, rel_bounds, radius);
+                    }
+                }
+                image.refresh_tint();
+                cache.insert(key.clone(), image);
+            }
+        }
+        cache.get(&key).is_some_and(|image| {
+            draw(image, [bounds[0] - p, bounds[1] - p, bounds[2] + p, bounds[3] + p])
+        })
+    })
 }
 impl Drop for Batch {
     fn drop(&mut self) {
@@ -1640,6 +1903,218 @@ impl Canvas {
         self.round(r, radius, 0xffffff, 15, false, false);
         self.coating(r, radius);
         self.reflection_edge(r, radius, 0.45);
+    }
+    pub fn group_poly_surface_live(&self, spans: &[[f32; 4]], radius: f32) {
+        if spans.is_empty() {
+            return;
+        }
+        if spans.len() == 1 {
+            self.group_surface_live(spans[0], radius, true);
+            return;
+        }
+        let _cost = Cost::new(3);
+        with_cached_group_poly(spans, radius, self.scale, |image, dest| {
+            self.image(image, dest);
+            true
+        });
+    }
+    fn soft_shadow_poly(
+        &self,
+        verts: &[[f32; 2]],
+        bounds: [f32; 4],
+        radius: f32,
+        amount: f32,
+        blur: f32,
+        dy: f32,
+    ) {
+        if amount < 0.01 || self.target.is_none() || verts.len() < 4 {
+            return;
+        }
+        let bw = ((bounds[2] - bounds[0]) * self.scale).round().max(1.) as u32;
+        let bh = ((bounds[3] - bounds[1]) * self.scale).round().max(1.) as u32;
+        let sigma = (blur * self.scale * 0.65).max(0.6);
+        let dx = dy * self.scale * 0.9;
+        let dy_px = dy * self.scale;
+        let pad = (sigma * 3. + dy_px.abs() + self.scale * 2.).ceil() as u32;
+        let pad_dip = pad as f32 / self.scale;
+        let width = bw + pad * 2;
+        let height = bh + pad * 2;
+        let scaled_verts: Vec<[f32; 2]> = verts
+            .iter()
+            .map(|v| [
+                (v[0] - bounds[0]) * self.scale + pad as f32,
+                (v[1] - bounds[1]) * self.scale + pad as f32,
+            ])
+            .collect();
+        let sdf = crate::compositor::PolySdf::new(&scaled_verts, radius * self.scale);
+        let mut pixels = vec![0u8; (width * height) as usize * 4];
+        for y in 0..height {
+            let py = y as f32 + 0.5;
+            for x in 0..width {
+                let px = x as f32 + 0.5;
+                let (original, _, _) = sdf.signed_distance(px, py);
+                let (shifted, _, _) = sdf.signed_distance(px - dx, py - dy_px);
+                let outside = (original / (1.5 * self.scale) + 0.5).clamp(0., 1.);
+                let alpha = 0.5 * (1. - (shifted / (sigma * 1.55)).tanh()) * outside;
+                pixels[((y * width + x) as usize) * 4 + 3] =
+                    (alpha * 255.).round().clamp(0., 255.) as u8;
+            }
+        }
+        if let Some(image) = Image::from_bgra(width, height, pixels) {
+            self.image_alpha(
+                &image,
+                [
+                    bounds[0] - pad_dip,
+                    bounds[1] - pad_dip,
+                    bounds[2] + pad_dip,
+                    bounds[3] + pad_dip,
+                ],
+                (amount / 255.).clamp(0., 1.),
+            );
+        }
+    }
+    fn draw_group_poly_material(
+        &self,
+        spans: &[[f32; 4]],
+        verts: &[[f32; 2]],
+        bounds: [f32; 4],
+        radius: f32,
+    ) {
+        self.soft_shadow_poly(verts, bounds, radius, 20., 4., 2.);
+        self.poly_round(verts, radius, 0xffffff, 15, false);
+        self.poly_coating(verts, bounds, radius);
+        self.poly_reflection_edge(spans, verts, bounds, radius, 0.45);
+    }
+    unsafe fn poly_path(&self, verts: &[[f32; 2]], radius: f32) -> Ptr {
+        let mut p = null_mut();
+        GdipCreatePath(0, &mut p);
+        let n = verts.len();
+        if n < 3 {
+            return p;
+        }
+        for i in 0..n {
+            let prev = verts[(i + n - 1) % n];
+            let v = verts[i];
+            let next = verts[(i + 1) % n];
+            let l_in = (v[0] - prev[0]).hypot(v[1] - prev[1]).max(1e-4);
+            let l_out = (next[0] - v[0]).hypot(next[1] - v[1]).max(1e-4);
+            let d_in = [(v[0] - prev[0]) / l_in, (v[1] - prev[1]) / l_in];
+            let d_out = [(next[0] - v[0]) / l_out, (next[1] - v[1]) / l_out];
+            let r_i = radius.min(l_in * 0.5).min(l_out * 0.5).max(0.1);
+            let cross = d_in[0] * d_out[1] - d_in[1] * d_out[0];
+            let cx = v[0] - d_in[0] * r_i + d_out[0] * r_i;
+            let cy = v[1] - d_in[1] * r_i + d_out[1] * r_i;
+            let start = (-d_out[1]).atan2(-d_out[0]).to_degrees();
+            let sweep = if cross > 0.0 { 90.0 } else { -90.0 };
+            let dia = 2.0 * r_i * self.scale;
+            GdipAddPathArc(
+                p,
+                (cx - r_i) * self.scale,
+                (cy - r_i) * self.scale,
+                dia,
+                dia,
+                start,
+                sweep,
+            );
+        }
+        GdipClosePathFigure(p);
+        p
+    }
+    pub fn poly_round(
+        &self,
+        verts: &[[f32; 2]],
+        radius: f32,
+        color: u32,
+        alpha: u8,
+        outline: bool,
+    ) {
+        if verts.len() < 3 {
+            return;
+        }
+        unsafe {
+            let p = self.poly_path(verts, radius);
+            if outline {
+                let pen = self.pen(color, alpha, 0.65);
+                GdipDrawPath(self.g, pen, p);
+                GdipDeletePen(pen);
+            } else {
+                let mut brush = null_mut();
+                GdipCreateSolidFill(argb(color, alpha), &mut brush);
+                GdipFillPath(self.g, brush, p);
+                GdipDeleteBrush(brush);
+            }
+            GdipDeletePath(p);
+        }
+    }
+    fn poly_coating(&self, verts: &[[f32; 2]], bounds: [f32; 4], radius: f32) {
+        if verts.len() < 3 {
+            return;
+        }
+        unsafe {
+            let path = self.poly_path(verts, radius);
+            let rect = Rect {
+                x: bounds[0] * self.scale,
+                y: bounds[1] * self.scale,
+                w: (bounds[2] - bounds[0]) * self.scale,
+                h: (bounds[3] - bounds[1]) * self.scale,
+            };
+            let mut brush = null_mut();
+            GdipCreateLineBrushFromRectWithAngle(
+                &rect, 0x0cffffff, 0x00ffffff, 55., 0, 0, &mut brush,
+            );
+            GdipFillPath(self.g, brush, path);
+            GdipDeleteBrush(brush);
+            GdipDeletePath(path);
+        }
+    }
+    fn poly_reflection_edge(
+        &self,
+        spans: &[[f32; 4]],
+        verts: &[[f32; 2]],
+        bounds: [f32; 4],
+        radius: f32,
+        amount: f32,
+    ) {
+        if spans.is_empty() || verts.len() < 3 {
+            return;
+        }
+        unsafe {
+            let edge = self.poly_path(verts, radius);
+            let tl = [spans[0][0] + radius * 0.35, spans[0][1] + radius * 0.35];
+            let last = spans[spans.len() - 1];
+            let br = [last[2] - radius * 0.25, last[3] - radius * 0.25];
+            let max_span = (bounds[2] - bounds[0]).max(bounds[3] - bounds[1]);
+            for (point, strength, span) in [(tl, 115., 0.85), (br, 55., 0.55)] {
+                let reach = (max_span * span).max(35.);
+                let circle = self.path(
+                    [
+                        point[0] - reach,
+                        point[1] - reach,
+                        point[0] + reach,
+                        point[1] + reach,
+                    ],
+                    reach,
+                );
+                let mut brush = null_mut();
+                GdipCreatePathGradientFromPath(circle, &mut brush);
+                GdipSetPathGradientCenterColor(brush, argb(0xffffff, (strength * amount) as u8));
+                let transparent = 0x00ffffff;
+                let mut count = 1;
+                GdipSetPathGradientSurroundColorsWithCount(brush, &transparent, &mut count);
+                let center = Point {
+                    x: point[0] * self.scale,
+                    y: point[1] * self.scale,
+                };
+                GdipSetPathGradientCenterPoint(brush, &center);
+                let mut pen = null_mut();
+                GdipCreatePen2(brush, 0.8 * self.scale, 2, &mut pen);
+                GdipDrawPath(self.g, pen, edge);
+                GdipDeletePen(pen);
+                GdipDeleteBrush(brush);
+                GdipDeletePath(circle);
+            }
+            GdipDeletePath(edge);
+        }
     }
     pub fn focus_shadow(&self, r: [f32; 4], radius: f32, amount: f32) {
         for i in (1..=6).rev() {
@@ -3164,5 +3639,121 @@ mod tests {
                 "expected GDI+ pixels in y = 10..40 after RestoreDC with active Batch"
             );
         }
+    }
+    #[test]
+    fn ortho_group_polygon_merges_l_shape_and_collapses_uniform_rows() {
+        let l_shape = ortho_group_polygon(&[
+            [16., 70., 700., 160.],
+            [16., 164., 260., 254.],
+        ]);
+        assert_eq!(
+            l_shape,
+            vec![
+                [700., 70.],
+                [700., 160.],
+                [260., 160.],
+                [260., 254.],
+                [16., 254.],
+                [16., 70.],
+            ]
+        );
+        let rect = ortho_group_polygon(&[
+            [16., 70., 700., 160.],
+            [16., 164., 700., 254.],
+        ]);
+        assert_eq!(
+            rect,
+            vec![
+                [700., 70.],
+                [700., 254.],
+                [16., 254.],
+                [16., 70.],
+            ]
+        );
+    }
+    #[test]
+    fn split_connected_group_spans_separates_non_overlapping_wraps() {
+        let wrapped = split_connected_group_spans(
+            &[
+                [560., 70., 740., 160.],
+                [16., 164., 196., 254.],
+            ],
+            30.0,
+        );
+        assert_eq!(wrapped.len(), 2);
+
+        let connected = split_connected_group_spans(
+            &[
+                [16., 70., 740., 160.],
+                [16., 164., 196., 254.],
+            ],
+            30.0,
+        );
+        assert_eq!(connected.len(), 1);
+        assert_eq!(connected[0].len(), 2);
+    }
+    #[test]
+    fn poly_group_material_and_glass_restore_render_cleanly_at_exact_radius() {
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = Runtime::start().unwrap();
+        unsafe {
+            let w = 420;
+            let h = 240;
+            let mut backing = crate::compositor::Buffer::plain(w, h, 1.).unwrap();
+            PatBlt(backing.dc, 0, 0, w, h, WHITENESS);
+            let target = crate::compositor::Buffer::plain(w, h, 1.).unwrap();
+            PatBlt(target.dc, 0, 0, w, h, BLACKNESS);
+            let spans = [
+                [20.0f32, 20.0, 380.0, 110.0],
+                [20.0f32, 114.0, 180.0, 204.0],
+            ];
+            backing.restore_glass_group(target.dc, &spans, 20.0, false);
+            let batch = Batch::new(target.dc, 1.);
+            assert!(batch.group_poly_surface(&spans, 20.0, true));
+            drop(batch);
+            let px = target.snapshot();
+            // Inside row 0 overhang [x=300, y=65] -> restored opaque backing + overlay.
+            assert!(px[(65 * w as usize + 300) * 4 + 3] > 200);
+            // Inside seamless bridge between row 0 and row 1 [x=100, y=112] -> opaque.
+            assert!(px[(112 * w as usize + 100) * 4 + 3] > 200);
+            // Concave exterior cutout below row 0 overhang [x=250, y=160] -> remains transparent.
+            assert_eq!(px[(160 * w as usize + 250) * 4 + 3], 0);
+            // Concave fillet corner near (180 + 4, 110 + 4) is outside; (180 - 6, 110 - 6) is inside.
+            assert!(px[(104 * w as usize + 174) * 4 + 3] > 200);
+            assert_eq!(px[(116 * w as usize + 186) * 4 + 3], 0);
+            let _ = &mut backing;
+        }
+    }
+    #[test]
+    fn trim_padded_icon_crops_hollow_jumbo_box_and_preserves_rgb_channels() {
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = Runtime::start().unwrap();
+        let size = 256u32;
+        let mut rgba = vec![0u8; (size * size * 4) as usize];
+        // Faint 2px hollow outer frame (common Windows SHIL_JUMBO artifact around small glyphs).
+        for y in 0..size {
+            for x in 0..size {
+                if x < 2 || x >= size - 2 || y < 2 || y >= size - 2 {
+                    let i = ((y * size + x) as usize) * 4;
+                    rgba[i..i + 4].copy_from_slice(&[180, 180, 180, 140]);
+                }
+            }
+        }
+        // Bright RED (R=240, G=30, B=20, A=255) 36x36 inner glyph in center [110..146].
+        for y in 110..146 {
+            for x in 110..146 {
+                let i = ((y * size + x) as usize) * 4;
+                rgba[i..i + 4].copy_from_slice(&[240, 30, 20, 255]);
+            }
+        }
+        let img = Image::from_rgba(size, size, rgba).unwrap();
+        assert!(img.is_jumbo_packed_small());
+        assert_eq!(img.effective_icon_bounds(), [110, 110, 146, 146]);
+        let trimmed = img.trim_padded_icon();
+        assert!(trimmed.width <= 44 && trimmed.height <= 44);
+        let center = ((trimmed.height / 2) * trimmed.width + (trimmed.width / 2)) as usize * 4;
+        let px = trimmed._pixels.as_ref().unwrap();
+        // Stored pixels are BGRA: B=20, G=30, R=240, A=255 (no R/B channel swap).
+        assert_eq!([px[center], px[center + 1], px[center + 2], px[center + 3]], [20, 30, 240, 255]);
     }
 }

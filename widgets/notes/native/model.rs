@@ -202,7 +202,7 @@ pub fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Note {
     pub id: String,

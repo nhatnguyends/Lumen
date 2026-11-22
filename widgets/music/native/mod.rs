@@ -219,12 +219,69 @@ impl State {
         self.accept_playback(next);
         self.smtc_active = true;
     }
-    fn save(&self) {
+    fn save_local(&self) {
         if !self.smoke {
             if let Err(e) = self.config.save(&self.root) {
                 eprintln!("native-music: {e}");
             }
         }
+    }
+    fn save(&self) {
+        if self.smoke {
+            return;
+        }
+        let res = if crate::multi_monitor::is_duplicate(self.hwnd) {
+            let mut shared = self.config.clone();
+            if let Ok(disk) = Config::load(&self.root) {
+                shared.position = disk.position;
+                shared.size = disk.size;
+                shared.open = disk.open;
+            }
+            shared.save(&self.root)
+        } else {
+            self.config.save(&self.root)
+        };
+        match res {
+            Ok(()) => unsafe { crate::multi_monitor::notify_peers("music", self.hwnd) },
+            Err(e) => eprintln!("native-music: {e}"),
+        }
+    }
+    unsafe fn reload_from_shared(&mut self) {
+        let Ok(mut loaded) = Config::load(&self.root) else {
+            return;
+        };
+        loaded.position = self.config.position;
+        loaded.size = self.config.size;
+        loaded.open = self.config.open;
+        let floating_changed = loaded.floating != self.config.floating;
+        let queue_changed = loaded.queue != self.config.queue;
+        let design_changed = loaded.design != self.config.design;
+        self.config = loaded;
+        if queue_changed {
+            self.queue_offset = 0;
+        }
+        if design_changed {
+            self.coverflow_anim = None;
+        }
+        self.local_glass = None;
+        self.blur_dirty = false;
+        self.frame = None;
+        self.background = None;
+        self.overlay = None;
+        self.frost = None;
+        self.card_cache.clear();
+        if floating_changed {
+            PostMessageW(self.hwnd, WM_APP + 82, 0, 0);
+        }
+        self.sync_settings();
+        if self.settings.is_some() {
+            let color = self.surface_color();
+            if let Some(host) = &mut self.settings {
+                host.set_surface(color, crate::accent::light(color));
+            }
+        }
+        self.sync_spin_timer();
+        InvalidateRect(self.hwnd, null(), 0);
     }
     fn send(&mut self, value: serde_json::Value) {
         let action = value["action"].as_str().unwrap_or("unknown").to_owned();
@@ -254,8 +311,11 @@ impl State {
     unsafe fn activate(&mut self, action: Action, x: f32) {
         match action {
             Action::Close => {
-                self.config.open = false;
-                self.save();
+                let was_visible = IsWindowVisible(self.hwnd) != 0;
+                if !crate::multi_monitor::is_duplicate(self.hwnd) {
+                    self.config.open = false;
+                    self.save_local();
+                }
                 ShowWindow(self.hwnd, SW_HIDE);
                 if let Some(s) = &mut self.shadow {
                     s.sync(self.hwnd, self.dpi, 0);
@@ -284,6 +344,9 @@ impl State {
                     SetTimer(self.hwnd, 91, 1500, None);
                 } else {
                     KillTimer(self.hwnd, 91);
+                }
+                if was_visible && !self.smoke {
+                    crate::multi_monitor::request_hide_widget("music");
                 }
             }
             Action::Settings => self.open_settings(),
@@ -339,6 +402,9 @@ impl State {
         InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn bounds(&mut self) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+            return;
+        }
         let mut r = zeroed();
         GetWindowRect(self.hwnd, &mut r);
         self.config.position = Some([r.left, r.top]);
@@ -346,7 +412,7 @@ impl State {
             ((r.right - r.left) as f32 / self.dpi).round() as i32,
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
-        self.save();
+        self.save_local();
     }
     unsafe fn poll(&mut self) {
         self.last_poll = Instant::now();
@@ -743,15 +809,23 @@ impl Host {
         let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
+        let (mut left, mut top, mut cw, mut ch) = (rect.left, rect.top, width, height);
         if GetMonitorInfoW(monitor, &mut info) != 0 {
-            rect.left = rect.left.clamp(
-                info.rcWork.left,
-                (info.rcWork.right - width).max(info.rcWork.left),
+            let min_px = model::MIN_SIZE.map(|v| (v as f32 * dpi).round() as i32);
+            let clamped = crate::geometry::clamp_rect_to_work(
+                [rect.left, rect.top, rect.right, rect.bottom],
+                [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ],
+                min_px,
             );
-            rect.top = rect.top.clamp(
-                info.rcWork.top,
-                (info.rcWork.bottom - height).max(info.rcWork.top),
-            );
+            left = clamped[0];
+            top = clamped[1];
+            cw = clamped[2] - clamped[0];
+            ch = clamped[3] - clamped[1];
         }
         let previous = if smoke {
             None
@@ -828,10 +902,10 @@ impl Host {
             class.as_ptr(),
             wide("Lumen · YouTube Music").as_ptr(),
             WS_POPUP | WS_THICKFRAME,
-            rect.left,
-            rect.top,
-            width,
-            height,
+            left,
+            top,
+            cw,
+            ch,
             null_mut(),
             null_mut(),
             instance,
@@ -840,7 +914,12 @@ impl Host {
         if hwnd.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        state.borrow_mut().hwnd = hwnd;
+        let (live_dpi, _) = crate::geometry::clamp_window_to_work(hwnd, model::MIN_SIZE, dpi);
+        {
+            let mut s = state.borrow_mut();
+            s.hwnd = hwnd;
+            s.dpi = live_dpi;
+        }
         if let Some(smtc) = &state.borrow().smtc {
             smtc.set_notify(hwnd, MUSIC_EVENT);
         }
@@ -858,8 +937,10 @@ impl Host {
     pub unsafe fn show(&mut self) {
         let (hwnd, floating, inspect) = {
             let mut s = self.state.borrow_mut();
-            s.config.open = true;
-            s.save();
+            if !crate::multi_monitor::is_duplicate(s.hwnd) {
+                s.config.open = true;
+                s.save_local();
+            }
             (s.hwnd, s.config.floating, s.inspect)
         };
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1130,6 +1211,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.settings_changed();
             0
         }
+        m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
+            s.reload_from_shared();
+            0
+        }
         m if m == MUSIC_EVENT => {
             s.poll();
             s.sync_spin_timer();
@@ -1380,12 +1465,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_DPICHANGED => {
-            s.dpi = (wp as u16) as f32 / 96.;
+            let new_dpi = ((wp as u16) as f32 / 96.).max(1.);
+            s.dpi = new_dpi;
             s.frame = None;
             s.background = None;
             s.overlay = None;
             s.local_glass = None;
-            let r = *(lp as *const RECT);
+            let r = crate::geometry::clamp_dpi_rect(*(lp as *const RECT), model::MIN_SIZE, new_dpi);
             // SetWindowPos synchronously reenters our size/min/max handlers.
             drop(s);
             SetWindowPos(
@@ -1406,8 +1492,39 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 changed |= glass.refresh();
             }
             if !s.moving && (changed || msg == WM_DISPLAYCHANGE) {
+                s.frame = None;
                 s.background = None;
                 s.overlay = None;
+            }
+            let prev_dpi = s.dpi;
+            let moving = s.moving;
+            let live_dpi = if !moving {
+                crate::geometry::window_dpi(hwnd)
+            } else {
+                prev_dpi
+            };
+            let pre_dpi_changed = !moving && (prev_dpi - live_dpi).abs() > 0.005;
+            if pre_dpi_changed {
+                s.dpi = live_dpi;
+            }
+            drop(s);
+            if !moving {
+                let (dpi, clamped) =
+                    crate::geometry::clamp_window_to_work(hwnd, model::MIN_SIZE, prev_dpi);
+                if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                    if pre_dpi_changed || (s.dpi - dpi).abs() > 0.005 || clamped {
+                        s.dpi = dpi;
+                        s.frame = None;
+                        s.background = None;
+                        s.overlay = None;
+                        s.frost = None;
+                        s.local_glass = None;
+                        s.card_cache.clear();
+                    }
+                    if let Some(host) = &mut s.settings {
+                        host.refit();
+                    }
+                }
             }
             InvalidateRect(hwnd, null(), 0);
             0

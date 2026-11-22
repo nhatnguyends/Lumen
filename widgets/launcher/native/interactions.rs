@@ -73,18 +73,32 @@ impl App {
     }
     pub(super) unsafe fn hover_tile(&mut self, hwnd: HWND, p: Point) {
         let hover = self.hit(hwnd, p[0] as i32, p[1] as i32);
-        if self.pointer == p && self.hover == hover {
+        let width = self.dimensions(hwnd).0;
+        let prev_toolbar = self.toolbar_hit(width, self.pointer);
+        let next_toolbar = self.toolbar_hit(width, p);
+        let prev_clear = !self.query.is_empty() && self.clear_hit(hwnd, self.pointer);
+        let next_clear = !self.query.is_empty() && self.clear_hit(hwnd, p);
+        if self.pointer == p
+            && self.hover == hover
+            && prev_toolbar == next_toolbar
+            && prev_clear == next_clear
+        {
             return;
         }
         let hover_changed = self.hover != hover;
+        let toolbar_changed = prev_toolbar != next_toolbar;
+        let clear_changed = prev_clear != next_clear;
         self.pointer = p;
         self.hover = hover;
         let now = self.now();
-        let toolbar_count = self.toolbar_items().len();
-        self.motion
-            .toolbar_hover_count(self.toolbar_hit(self.dimensions(hwnd).0, p), toolbar_count, now);
-        self.motion
-            .search_clear_hover(!self.query.is_empty() && self.clear_hit(hwnd, p), now);
+        if toolbar_changed {
+            let toolbar_count = self.toolbar_items().len();
+            self.motion
+                .toolbar_hover_count(next_toolbar, toolbar_count, now);
+        }
+        if clear_changed {
+            self.motion.search_clear_hover(next_clear, now);
+        }
         self.group_selection_move(hwnd, p);
         let visible = self.visible(hwnd);
         let id = self.hover.and_then(|pos| {
@@ -95,7 +109,12 @@ impl App {
         });
         self.motion.hover(id, p, self.now());
         self.arm_motion(hwnd);
-        if hover_changed || self.hover.is_some() {
+        if hover_changed
+            || self.hover.is_some()
+            || toolbar_changed
+            || next_toolbar.is_some()
+            || clear_changed
+        {
             InvalidateRect(hwnd, null(), 0);
         }
     }
@@ -111,9 +130,16 @@ impl App {
         self.motion.press(Some(id.clone()), self.now());
         let columns = self.columns(hwnd);
         let cell = (self.dimensions(hwnd).0 - 26) / columns as i32;
+        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+        let (col, sr) = self
+            .grid_layout_for(&visible, columns, has_add)
+            .cells
+            .get(pos)
+            .copied()
+            .unwrap_or((pos % columns, pos / columns));
         let origin = [
-            (16 + pos as i32 % columns as i32 * cell) as f32,
-            (self.grid_top() + (pos / columns) as i32 * self.row_height()) as f32
+            (16 + col as i32 * cell) as f32,
+            (self.grid_top() + sr as i32 * self.row_height()) as f32
                 - self.scroll.value(self.now()),
         ];
         let order = visible
@@ -138,7 +164,8 @@ impl App {
         let columns = self.columns(hwnd);
         let cell = (w - 26) / columns as i32;
         let row = self.row_height();
-        let mut bounds: HashMap<&str, [f32; 4]> = HashMap::new();
+        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+        let layout = self.grid_layout_for(&visible, columns, has_add);
         for (pos, i) in visible.iter().enumerate() {
             let item = &self.dock.items[*i];
             if item.id == dragged {
@@ -147,32 +174,29 @@ impl App {
             let Some(group) = item.group.as_deref() else {
                 continue;
             };
-            let x = (16 + (pos % columns) as i32 * cell) as f32;
-            let y = (self.grid_top() + (pos / columns) as i32 * row) as f32
-                - self.scroll.value(self.now());
-            let r = [x, y, x + cell as f32 - 6., y + row as f32 - 4.];
-            bounds
-                .entry(group)
-                .and_modify(|b| {
-                    b[0] = b[0].min(r[0]);
-                    b[1] = b[1].min(r[1]);
-                    b[2] = b[2].max(r[2]);
-                    b[3] = b[3].max(r[3]);
-                })
-                .or_insert(r);
+            let (col, sr) = layout
+                .cells
+                .get(pos)
+                .copied()
+                .unwrap_or((pos % columns, pos / columns));
+            let x = (16 + col as i32 * cell) as f32;
+            let y = (self.grid_top() + sr as i32 * row) as f32 - self.scroll.value(self.now());
+            if p[0] >= x - 3.
+                && p[0] <= x + cell as f32 - 3.
+                && p[1] >= y - 3.
+                && p[1] <= y + row as f32 - 1.
+            {
+                return Some(group.into());
+            }
         }
-        bounds
-            .into_iter()
-            .find(|(_, r)| {
-                p[0] >= r[0] - 3. && p[0] <= r[2] + 3. && p[1] >= r[1] - 3. && p[1] <= r[3] + 3.
-            })
-            .map(|(id, _)| id.into())
+        None
     }
     pub(super) unsafe fn pointer_move(&mut self, hwnd: HWND, p: Point) {
         let can_sort = self.query.trim().is_empty();
         if let Some(drag) = &mut self.tile_drag {
             if can_sort && drag.update(p) {
                 let id = drag.id.clone();
+                let drag_len = drag.preview.len();
                 let own = self
                     .dock
                     .items
@@ -193,18 +217,25 @@ impl App {
                 let row = self.row_height() as f32;
                 let top = self.grid_top() as f32;
                 let scroll = self.scroll.value(self.now());
+                let layout = self.grid_layout(hwnd);
+                let best = layout
+                    .cells
+                    .iter()
+                    .take(drag_len)
+                    .enumerate()
+                    .min_by(|(_, &(ca, ra)), (_, &(cb, rb))| {
+                        let d2 = |c: usize, r: usize| {
+                            let cx = 16. + c as f32 * cell + (cell - 6.) * 0.5;
+                            let cy = top + r as f32 * row - scroll + (row - 4.) * 0.5;
+                            (p[0] - cx).powi(2) + (p[1] - cy).powi(2)
+                        };
+                        d2(ca, ra).total_cmp(&d2(cb, rb))
+                    })
+                    .map(|(idx, _)| idx);
                 if let Some(drag) = &mut self.tile_drag {
                     drag.target_group = target.clone();
                     if target.is_none() || target == own {
-                        if let Some(index) = crate::motion::nearest_slot(
-                            drag.preview.len(),
-                            columns,
-                            cell,
-                            row,
-                            top,
-                            scroll,
-                            p,
-                        ) {
+                        if let Some(index) = best {
                             drag.reorder(index);
                         }
                     }
@@ -254,9 +285,16 @@ impl App {
                     .iter()
                     .position(|i| self.dock.items[*i].id == drag.id)
                 {
+                    let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+                    let (col, sr) = self
+                        .grid_layout_for(&visible, columns, has_add)
+                        .cells
+                        .get(pos)
+                        .copied()
+                        .unwrap_or((pos % columns, pos / columns));
                     let to = [
-                        (16 + (pos % columns) as i32 * cell) as f32,
-                        (self.grid_top() + (pos / columns) as i32 * self.row_height()) as f32
+                        (16 + col as i32 * cell) as f32,
+                        (self.grid_top() + sr as i32 * self.row_height()) as f32
                             - self.scroll.value(self.now()),
                     ];
                     self.motion.landing = Some(Landing {
@@ -710,9 +748,10 @@ impl App {
             self.scaled_icons.retain(|id, _| keep.contains(id));
             self.icon_shadows.retain(|id, _| keep.contains(id));
         }
-        let total = visible.len()
-            + usize::from(self.query.trim().is_empty() && self.group_selection.is_none());
-        let content_end = top as f32 + total.div_ceil(columns) as f32 * row as f32;
+        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+        let total = visible.len() + usize::from(has_add);
+        let grid_layout = self.grid_layout_for(&visible, columns, has_add);
+        let content_end = top as f32 + grid_layout.rows as f32 * row as f32;
         let bottom = h as f32 - 14.;
         self.scroll.bounds(
             if content_end > bottom {
@@ -729,10 +768,12 @@ impl App {
                 let id = visible
                     .get(pos)
                     .map_or_else(|| "__add".into(), |i| self.dock.items[*i].id.clone());
-                let point = [
-                    (16 + (pos % columns) as i32 * cell) as f32,
-                    (top + (pos / columns) as i32 * row) as f32,
-                ];
+                let (col, sr) = grid_layout
+                    .cells
+                    .get(pos)
+                    .copied()
+                    .unwrap_or((pos % columns, pos / columns));
+                let point = [(16 + col as i32 * cell) as f32, (top + sr as i32 * row) as f32];
                 (id, point)
             })
             .collect();
@@ -741,67 +782,69 @@ impl App {
             .retain(|id, _| id == "__add" || self.dock.items.iter().any(|item| item.id == *id));
         self.motion.sync(&layout, now, self.resize_drag.is_none());
         let accent = self.selection_color();
-        for screen_row in 0..total.div_ceil(columns) {
-            let mut col = 0;
-            while col < columns {
-                let pos = screen_row * columns + col;
-                let group = visible
-                    .get(pos)
-                    .and_then(|i| self.dock.items[*i].group.clone());
-                let mut count = 1;
-                if let Some(group) = group {
-                    while col + count < columns
-                        && visible
-                            .get(pos + count)
-                            .and_then(|i| self.dock.items[*i].group.as_deref())
-                            == Some(group.as_str())
+        let low_power = crate::motion::low_power();
+        let moving_win = self.moving_window || crate::fusion::is_moving(hwnd);
+        let allow_liquid = !(low_power && (self.scroll.moving(now) || self.resize_drag.is_some()));
+        for (group, cells) in &grid_layout.group_runs {
+            let mut row_spans: Vec<[f32; 4]> = Vec::new();
+            let mut idx = 0usize;
+            while idx < cells.len() {
+                let (col_start, sr) = cells[idx];
+                let mut count = 1usize;
+                while idx + count < cells.len()
+                    && cells[idx + count].1 == sr
+                    && cells[idx + count].0 == col_start + count
+                {
+                    count += 1;
+                }
+                let x = ((16 + col_start as i32 * cell) as f32 * self.dpi).round() / self.dpi;
+                let y = (top + sr as i32 * row) as f32 - scroll;
+                row_spans.push([
+                    x,
+                    y,
+                    x + cell as f32 * count as f32 - 6.,
+                    y + row as f32 - 4.,
+                ]);
+                idx += count;
+            }
+            for comp in crate::render::split_connected_group_spans(&row_spans, 20.0 * 1.5) {
+                let mut by0 = f32::INFINITY;
+                let mut by1 = f32::NEG_INFINITY;
+                for s in &comp {
+                    by0 = by0.min(s[1]);
+                    by1 = by1.max(s[3]);
+                }
+                if by1 < (top - 14) as f32 || by0 > bottom {
+                    continue;
+                }
+                if !moving_win || (!low_power && crate::glass::liquid_glass()) {
+                    if (allow_liquid && (self.dock.opacity < 100. || crate::glass::liquid_glass()))
+                        || (!allow_liquid && self.dock.opacity < 100.)
                     {
-                        count += 1;
-                    }
-                    let x = ((16 + col as i32 * cell) as f32 * self.dpi).round() / self.dpi;
-                    let y = (top + screen_row as i32 * row) as f32 - scroll;
-                    if y + (row as f32) < (top - 14) as f32 || y > bottom {
-                        col += count;
-                        continue;
-                    }
-                    let r = [
-                        x,
-                        y,
-                        x + cell as f32 * count as f32 - 6.,
-                        y + row as f32 - 4.,
-                    ];
-                    let low_power = crate::motion::low_power();
-                    let moving_win = self.moving_window || crate::fusion::is_moving(hwnd);
-                    if !moving_win || (!low_power && crate::glass::liquid_glass()) {
-                        if low_power && (self.scroll.moving(now) || self.resize_drag.is_some()) {
-                            if self.dock.opacity < 100. {
-                                if let Some(background) = &self.background {
-                                    background.restore_glass_card_fast(dc, r, 20.);
-                                }
-                            }
-                        } else if self.dock.opacity < 100. || crate::glass::liquid_glass() {
-                            if let Some(background) = &self.background {
-                                background.restore_glass_card(dc, r, 20.);
-                            }
-                        }
-                    }
-                    let amount = if self.scroll.moving(now) {
-                        0.
-                    } else {
-                        self.motion.group_alpha(&group, now)
-                    };
-                    if self.resize_drag.is_none() && amount <= 0.001 && batch.group_surface(r, 20., !self.scroll.moving(now)) {
-                        // Blitted directly via batch
-                    } else {
-                        let canvas = Canvas::new(dc, self.dpi);
-                        canvas.group_surface_live(r, 20., self.resize_drag.is_some());
-                        if amount > 0.001 {
-                            canvas.round(r, 20., accent, (amount * 46.) as u8, false, false);
-                            canvas.round(r, 20., accent, (amount * 205.) as u8, true, false);
+                        if let Some(background) = &self.background {
+                            background.restore_glass_group(dc, &comp, 20., allow_liquid);
                         }
                     }
                 }
-                col += count;
+                let amount = if self.scroll.moving(now) {
+                    0.
+                } else {
+                    self.motion.group_alpha(group, now)
+                };
+                if self.resize_drag.is_none()
+                    && amount <= 0.001
+                    && batch.group_poly_surface(&comp, 20., !self.scroll.moving(now))
+                {
+                    // Blitted directly via batch
+                } else {
+                    let canvas = Canvas::new(dc, self.dpi);
+                    canvas.group_poly_surface_live(&comp, 20.);
+                    if amount > 0.001 {
+                        let verts = crate::render::ortho_group_polygon(&comp);
+                        canvas.poly_round(&verts, 20., accent, (amount * 46.) as u8, false);
+                        canvas.poly_round(&verts, 20., accent, (amount * 205.) as u8, true);
+                    }
+                }
             }
         }
         let group_ms = drawing_started.elapsed().as_secs_f64() * 1000.;
@@ -1093,13 +1136,21 @@ impl App {
                     .map(|n| [n.x.sample(now), n.y.sample(now)])
                     .or_else(|| {
                         let columns = self.columns(hwnd);
-                        self.visible(hwnd)
+                        let visible = self.visible(hwnd);
+                        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
+                        let gl = self.grid_layout_for(&visible, columns, has_add);
+                        visible
                             .iter()
                             .position(|idx| self.dock.items[*idx].id == id)
                             .map(|pos| {
+                                let (col, sr) = gl
+                                    .cells
+                                    .get(pos)
+                                    .copied()
+                                    .unwrap_or((pos % columns, pos / columns));
                                 [
-                                    (16 + pos as i32 % columns as i32 * cell) as f32,
-                                    (self.grid_top() + (pos / columns) as i32 * row) as f32,
+                                    (16 + col as i32 * cell) as f32,
+                                    (self.grid_top() + sr as i32 * row) as f32,
                                 ]
                             })
                     });

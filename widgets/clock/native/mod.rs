@@ -106,13 +106,21 @@ impl Host {
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(monitor, &mut info);
-        let x = bounds.left.clamp(
-            info.rcWork.left,
-            (info.rcWork.right - size[0]).max(info.rcWork.left),
+        let min_px = [(MIN_SIZE as f32 * dpi).round() as i32; 2];
+        let clamped = crate::geometry::clamp_rect_to_work(
+            [bounds.left, bounds.top, bounds.right, bounds.bottom],
+            [
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
+            ],
+            min_px,
         );
-        let y = bounds.top.clamp(
-            info.rcWork.top,
-            (info.rcWork.bottom - size[1]).max(info.rcWork.top),
+        let (x, y, size) = (
+            clamped[0],
+            clamped[1],
+            [clamped[2] - clamped[0], clamped[3] - clamped[1]],
         );
         let mut state = Box::new(RefCell::new(State {
             hwnd: null_mut(),
@@ -163,6 +171,9 @@ impl Host {
             return Err(std::io::Error::last_os_error().to_string());
         }
         state.borrow_mut().hwnd = hwnd;
+        let (live_dpi, _) =
+            crate::geometry::clamp_window_to_work(hwnd, [MIN_SIZE, MIN_SIZE], dpi);
+        state.borrow_mut().dpi = live_dpi;
         println!(
             "native-clock-created pid={} theme={} shared_wallpaper=true",
             std::process::id(),
@@ -207,11 +218,13 @@ impl Host {
         let hwnd = self.hwnd();
         {
             let mut s = self.state.borrow_mut();
-            s.config.open = true;
+            if !crate::multi_monitor::is_duplicate(hwnd) {
+                s.config.open = true;
+                s.save_local();
+            }
             s.pressed = None;
             s.hover = None;
             s.key.clear();
-            s.save();
         }
         let (floating, inspect) = {
             let s = self.state.borrow();
@@ -277,7 +290,7 @@ impl State {
             .find(|b| x >= b.r[0] && x <= b.r[2] && y >= b.r[1] && y <= b.r[3])
             .map(|b| b.id)
     }
-    unsafe fn save(&mut self) {
+    unsafe fn save_local(&mut self) {
         if !self.smoke {
             if let Err(e) = self.config.save(&self.root) {
                 eprintln!("native-clock-save: {e}");
@@ -285,7 +298,33 @@ impl State {
             }
         }
     }
+    unsafe fn save(&mut self) {
+        if self.smoke {
+            return;
+        }
+        let res = if crate::multi_monitor::is_duplicate(self.hwnd) {
+            let mut shared = self.config.clone();
+            if let Ok(disk) = Config::load(&self.root) {
+                shared.position = disk.position;
+                shared.size = disk.size;
+                shared.open = disk.open;
+            }
+            shared.save(&self.root)
+        } else {
+            self.config.save(&self.root)
+        };
+        match res {
+            Ok(()) => crate::multi_monitor::notify_peers("clock", self.hwnd),
+            Err(e) => {
+                eprintln!("native-clock-save: {e}");
+                self.error = e;
+            }
+        }
+    }
     unsafe fn save_bounds(&mut self) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+            return;
+        }
         let mut r = zeroed();
         GetWindowRect(self.hwnd, &mut r);
         self.config.position = Some([r.left, r.top]);
@@ -293,7 +332,32 @@ impl State {
             ((r.right - r.left) as f32 / self.dpi).round() as i32,
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
-        self.save();
+        self.save_local();
+    }
+    unsafe fn reload_from_shared(&mut self) {
+        let Ok(mut loaded) = Config::load(&self.root) else {
+            return;
+        };
+        loaded.position = self.config.position;
+        loaded.size = self.config.size;
+        loaded.open = self.config.open;
+        if loaded.time_zone != self.config.time_zone {
+            if let Ok(z) = zone(&loaded.time_zone) {
+                self.zone = z;
+            }
+        }
+        let floating_changed = loaded.floating != self.config.floating;
+        self.config = loaded;
+        self.key.clear();
+        self.background = None;
+        self.theme_texture = None;
+        self.afterglow_content = None;
+        self.arm();
+        if floating_changed {
+            crate::window::apply_window_mode(self.hwnd, self.config.floating, self.inspect);
+        }
+        self.sync_settings();
+        InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn arm_animation(&mut self) {
         KillTimer(self.hwnd, ANIMATION);
@@ -335,7 +399,10 @@ impl State {
                 return;
             }
             1 => {
-                self.config.open = false;
+                let was_visible = IsWindowVisible(self.hwnd) != 0;
+                if !crate::multi_monitor::is_duplicate(self.hwnd) {
+                    self.config.open = false;
+                }
                 self.save_bounds();
                 KillTimer(self.hwnd, TICK);
                 KillTimer(self.hwnd, ANIMATION);
@@ -347,6 +414,9 @@ impl State {
                 self.background = None;
                 self.theme_texture = None;
                 self.afterglow_content = None;
+                if was_visible && !self.smoke {
+                    crate::multi_monitor::request_hide_widget("clock");
+                }
                 return;
             }
             10..=18 => self.config.theme = THEMES[id - 10].0.into(),
@@ -704,6 +774,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.settings_changed();
             0
         }
+        m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
+            s.reload_from_shared();
+            0
+        }
         WM_TIMER if wp == 99 => {
             KillTimer(hwnd, 99);
             s.save();
@@ -762,6 +836,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             s.key.clear();
             s.glass.borrow_mut().refresh();
+            let prev_dpi = s.dpi;
+            let live_dpi = crate::geometry::window_dpi(hwnd);
+            let pre_dpi_changed = (prev_dpi - live_dpi).abs() > 0.005;
+            s.dpi = live_dpi;
+            drop(s);
+            let (dpi, changed) =
+                crate::geometry::clamp_window_to_work(hwnd, [MIN_SIZE, MIN_SIZE], prev_dpi);
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                s.dpi = dpi;
+                if pre_dpi_changed || (s.dpi - dpi).abs() > 0.005 || changed {
+                    s.frame = None;
+                    s.background = None;
+                    s.key.clear();
+                }
+                s.save_bounds();
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -847,9 +937,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_DPICHANGED => {
-            s.dpi = (wp as u16) as f32 / 96.;
+            let new_dpi = ((wp as u16) as f32 / 96.).max(1.);
+            s.dpi = new_dpi;
             s.key.clear();
-            let r = *(lp as *const RECT);
+            s.frame = None;
+            s.background = None;
+            let r = crate::geometry::clamp_dpi_rect(*(lp as *const RECT), [MIN_SIZE, MIN_SIZE], new_dpi);
             drop(s);
             SetWindowPos(
                 hwnd,
@@ -860,6 +953,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_MOUSEMOVE => {

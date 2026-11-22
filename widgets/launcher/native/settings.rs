@@ -90,12 +90,37 @@ impl App {
         }
     }
     pub(super) unsafe fn open_settings(&mut self, owner: HWND) {
+        self.open_settings_on(owner, owner);
+    }
+    pub(super) unsafe fn open_settings_on(&mut self, owner: HWND, anchor: HWND) {
+        if self.is_duplicate {
+            if !self.primary_hwnd.is_null() {
+                PostMessageW(
+                    self.primary_hwnd,
+                    super::FORWARD_OPEN_SETTINGS,
+                    self.hwnd as usize,
+                    0,
+                );
+            }
+            return;
+        }
+        let target = if !anchor.is_null() && IsWindow(anchor) != 0 {
+            anchor
+        } else {
+            owner
+        };
         let accent = self.glass.borrow().wallpaper_accent();
         self.set_accent(accent);
         if !self.settings.hwnd.is_null() {
-            ShowWindow(self.settings.hwnd, SW_SHOW);
-            SetForegroundWindow(self.settings.hwnd);
-            SetFocus(self.settings.hwnd);
+            let shwnd = self.settings.hwnd;
+            self.settings.dpi = crate::geometry::refit_settings_window(shwnd, target);
+            self.settings.content_cache = None;
+            round_window(shwnd, self.settings.dpi, 30);
+            ShowWindow(shwnd, SW_SHOW);
+            SetForegroundWindow(shwnd);
+            SetFocus(shwnd);
+            InvalidateRect(shwnd, null(), 0);
+            self.paint_settings(shwnd);
             return;
         }
         let class = wide("LumenNativeDockSettings");
@@ -109,23 +134,27 @@ impl App {
         };
         RegisterClassW(&wc);
         let mut r: RECT = zeroed();
-        GetWindowRect(owner, &mut r);
-        let scale = GetDpiForWindow(owner) as f32 / 96.;
-        let w = (568. * scale) as i32;
-        let h = (668. * scale) as i32;
+        let owner_rect = (GetWindowRect(target, &mut r) != 0)
+            .then_some([r.left, r.top, r.right, r.bottom]);
+        let scale = (GetDpiForWindow(target) as f32 / 96.).max(1.);
         let mut monitor: MONITORINFO = zeroed();
         monitor.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(
-            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+            MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST),
             &mut monitor,
         );
-        let x = (r.left + (r.right - r.left - w) / 2).clamp(
+        let work = [
             monitor.rcWork.left,
-            (monitor.rcWork.right - w).max(monitor.rcWork.left),
-        );
-        let y = (r.top - 80).clamp(
             monitor.rcWork.top,
-            (monitor.rcWork.bottom - h).max(monitor.rcWork.top),
+            monitor.rcWork.right,
+            monitor.rcWork.bottom,
+        ];
+        let fitted = crate::geometry::fit_settings_rect(owner_rect, work, scale);
+        let (x, y, w, h) = (
+            fitted[0],
+            fitted[1],
+            fitted[2] - fitted[0],
+            fitted[3] - fitted[1],
         );
         let pointer = GetWindowLongPtrW(owner, GWLP_USERDATA);
         let hwnd = CreateWindowExW(
@@ -147,7 +176,7 @@ impl App {
             return;
         }
         self.settings.hwnd = hwnd;
-        self.settings.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
+        self.settings.dpi = crate::geometry::refit_settings_window(hwnd, target);
         round_window(hwnd, self.settings.dpi, 30);
         let none = 0xfffffffeu32;
         DwmSetWindowAttribute(hwnd, 34, &none as *const _ as _, 4);
@@ -182,6 +211,7 @@ impl App {
             },
         );
         self.rebuild_style(self.hwnd);
+        self.sync_duplicate_appearance();
         InvalidateRect(self.hwnd, null(), 0);
         InvalidateRect(self.settings.hwnd, null(), 0);
     }
@@ -942,8 +972,9 @@ unsafe extern "system" fn settings_proc(
             0
         }
         WM_DPICHANGED => {
-            app.settings.dpi = (wparam as u16) as f32 / 96.;
-            let r = &*(lparam as *const RECT);
+            app.settings.dpi = ((wparam as u16) as f32 / 96.).max(1.);
+            app.settings.content_cache = None;
+            let r = crate::geometry::clamp_dpi_rect(*(lparam as *const RECT), [280, 240], app.settings.dpi);
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -953,6 +984,14 @@ unsafe extern "system" fn settings_proc(
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            round_window(hwnd, app.settings.dpi, 30);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_DISPLAYCHANGE => {
+            let owner = app.hwnd;
+            app.settings.dpi = crate::geometry::refit_settings_window(hwnd, owner);
+            app.settings.content_cache = None;
             round_window(hwnd, app.settings.dpi, 30);
             InvalidateRect(hwnd, null(), 0);
             0

@@ -117,30 +117,78 @@ pub fn owner(panes: &[Pane], x: f32, y: f32) -> Option<usize> {
         })
         .map(|p| p.id)
 }
+fn shared_edge_len(a: &Pane, b: &Pane) -> f32 {
+    let scale = a.dpi.max(b.dpi);
+    let [al, at, ar, ab] = a.rect;
+    let [bl, bt, br, bb] = b.rect;
+    if touching_edges(ar, bl, scale) || touching_edges(br, al, scale) {
+        overlap(at, ab, bt, bb)
+    } else if touching_edges(ab, bt, scale) || touching_edges(bb, at, scale) {
+        overlap(al, ar, bl, br)
+    } else {
+        0.0
+    }
+}
 pub fn components(panes: &[Pane]) -> Vec<Vec<Pane>> {
-    let mut out = Vec::new();
-    let mut seen = vec![false; panes.len()];
-    for start in 0..panes.len() {
-        if seen[start] {
-            continue;
+    use std::cmp::Reverse;
+    let n = panes.len();
+    let mut overlap_count = vec![0usize; n];
+    let mut adj_count = vec![0usize; n];
+    let mut area = vec![0.0f32; n];
+    for i in 0..n {
+        let [l, t, r, b] = panes[i].rect;
+        area[i] = (r - l).max(0.0) * (b - t).max(0.0);
+        for j in (i + 1)..n {
+            if deep_overlap(&panes[i], &panes[j]) {
+                overlap_count[i] += 1;
+                overlap_count[j] += 1;
+            }
+            if adjacent(&panes[i], &panes[j]) {
+                adj_count[i] += 1;
+                adj_count[j] += 1;
+            }
         }
-        let deeply_overlaps_any = panes.iter().any(|other| deep_overlap(&panes[start], other));
-        if deeply_overlaps_any {
-            seen[start] = true;
-            out.push(vec![panes[start]]);
+    }
+    let mut seeds: Vec<usize> = (0..n).collect();
+    seeds.sort_by(|&a, &b| {
+        overlap_count[a]
+            .cmp(&overlap_count[b])
+            .then_with(|| Reverse(adj_count[a]).cmp(&Reverse(adj_count[b])))
+            .then_with(|| area[b].total_cmp(&area[a]))
+            .then_with(|| panes[a].id.cmp(&panes[b].id))
+    });
+    let mut out = Vec::new();
+    let mut seen = vec![false; n];
+    for start in seeds {
+        if seen[start] {
             continue;
         }
         seen[start] = true;
         let mut indexes = vec![start];
         let mut at = 0;
         while at < indexes.len() {
-            for i in 0..panes.len() {
-                if !seen[i] {
-                    let deeply_overlaps_other = panes.iter().any(|other| deep_overlap(&panes[i], other));
-                    if !deeply_overlaps_other && adjacent(&panes[indexes[at]], &panes[i]) {
-                        seen[i] = true;
-                        indexes.push(i);
-                    }
+            let cur = indexes[at];
+            let mut candidates: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    !seen[i]
+                        && adjacent(&panes[cur], &panes[i])
+                        && !indexes.iter().any(|&m| deep_overlap(&panes[m], &panes[i]))
+                })
+                .collect();
+            candidates.sort_by(|&a, &b| {
+                overlap_count[a]
+                    .cmp(&overlap_count[b])
+                    .then_with(|| {
+                        shared_edge_len(&panes[cur], &panes[b])
+                            .total_cmp(&shared_edge_len(&panes[cur], &panes[a]))
+                    })
+                    .then_with(|| area[b].total_cmp(&area[a]))
+                    .then_with(|| panes[a].id.cmp(&panes[b].id))
+            });
+            for i in candidates {
+                if !seen[i] && !indexes.iter().any(|&m| deep_overlap(&panes[m], &panes[i])) {
+                    seen[i] = true;
+                    indexes.push(i);
                 }
             }
             at += 1;
@@ -596,9 +644,40 @@ mod tests {
         let cs = components(&[a, b, c]);
         // B must be in its own singleton component [b], not fused with a or c
         assert!(cs.iter().any(|comp| comp.len() == 1 && comp[0].id == 2));
+        assert!(cs
+            .iter()
+            .any(|comp| comp.len() == 2 && comp.iter().any(|p| p.id == 1) && comp.iter().any(|p| p.id == 3)));
         // snap_move should not snap B to C while B deeply overlaps A
         let b_deep = pane(2, [100., 50., 395., 200.]);
         let delta = snap_move(&b_deep, &[a, c]);
         assert_eq!(delta, [0., 0.]);
+    }
+    #[test]
+    fn overlapping_widget_does_not_unfuse_existing_fused_group() {
+        let a = pane(1, [0., 0., 400., 300.]);
+        let c = pane(3, [400., 0., 700., 300.]);
+        // B overlaps A only
+        let b1 = pane(2, [50., 40., 350., 260.]);
+        let cs1 = components(&[a, b1, c]);
+        assert!(cs1.iter().any(|comp| comp.len() == 1 && comp[0].id == 2));
+        assert!(cs1.iter().any(|comp| comp.len() == 2 && comp.iter().any(|p| p.id == 1) && comp.iter().any(|p| p.id == 3)));
+
+        // B overlaps BOTH A and C across their shared seam
+        let b2 = pane(2, [200., 40., 550., 260.]);
+        let cs2 = components(&[a, b2, c]);
+        assert!(cs2.iter().any(|comp| comp.len() == 1 && comp[0].id == 2));
+        assert!(cs2.iter().any(|comp| comp.len() == 2 && comp.iter().any(|p| p.id == 1) && comp.iter().any(|p| p.id == 3)));
+
+        // A -- C -- D fused chain, with B overlapping middle widget C
+        let d = pane(4, [700., 0., 1000., 300.]);
+        let b3 = pane(2, [450., 40., 650., 260.]);
+        let cs3 = components(&[a, b3, c, d]);
+        assert!(cs3.iter().any(|comp| comp.len() == 1 && comp[0].id == 2));
+        assert!(cs3.iter().any(|comp| {
+            comp.len() == 3
+                && comp.iter().any(|p| p.id == 1)
+                && comp.iter().any(|p| p.id == 3)
+                && comp.iter().any(|p| p.id == 4)
+        }));
     }
 }

@@ -491,41 +491,17 @@ unsafe fn mode(name: &str, saved: bool) -> Result<DEVMODEW, String> {
     }
 }
 unsafe fn displays() -> Vec<Display> {
-    let mut result = vec![];
-    for i in 0..64 {
-        let mut d: DISPLAY_DEVICEW = zeroed();
-        d.cb = size_of::<DISPLAY_DEVICEW>() as u32;
-        if EnumDisplayDevicesW(null(), i, &mut d, 0) == 0 {
-            break;
-        }
-        if d.StateFlags & 8 != 0 {
-            continue;
-        }
-        let id = string(&d.DeviceName);
-        let mut monitor: DISPLAY_DEVICEW = zeroed();
-        monitor.cb = size_of::<DISPLAY_DEVICEW>() as u32;
-        let has = EnumDisplayDevicesW(d.DeviceName.as_ptr(), 0, &mut monitor, 0) != 0;
-        if !has
-            && d.StateFlags & 1 == 0
-            && !mode(&id, true).is_ok_and(|m| m.dmPelsWidth > 0 && m.dmPelsHeight > 0)
-        {
-            continue;
-        }
-        result.push(Display {
-            id,
-            name: if has {
-                string(&monitor.DeviceString)
-            } else {
-                string(&d.DeviceString)
-            },
-            enabled: d.StateFlags & 1 != 0,
-            primary: d.StateFlags & 4 != 0,
+    crate::displays::enumerate()
+        .into_iter()
+        .map(|d| Display {
+            id: d.id,
+            name: d.name,
+            enabled: d.enabled,
+            primary: d.primary,
             hdr_supported: false,
             hdr_enabled: false,
-        });
-    }
-    super::display_restore::decorate(&mut result);
-    result
+        })
+        .collect()
 }
 pub fn can_detach(displays: &[Display], id: &str) -> bool {
     displays.iter().any(|d| d.id == id && !d.primary)

@@ -258,20 +258,20 @@ impl Host {
             &mut info,
         );
         let mut r: RECT = zeroed();
-        GetWindowRect(owner, &mut r);
-        let w = (568. * dpi)
-            .min((info.rcWork.right - info.rcWork.left) as f32)
-            .max(420. * dpi) as i32;
-        let h = (668. * dpi)
-            .min((info.rcWork.bottom - info.rcWork.top) as f32)
-            .max(360. * dpi) as i32;
-        let x = (r.left + (r.right - r.left - w) / 2).clamp(
+        let owner_rect = (!owner.is_null() && GetWindowRect(owner, &mut r) != 0)
+            .then_some([r.left, r.top, r.right, r.bottom]);
+        let work = [
             info.rcWork.left,
-            (info.rcWork.right - w).max(info.rcWork.left),
-        );
-        let y = (r.top - 80).clamp(
             info.rcWork.top,
-            (info.rcWork.bottom - h).max(info.rcWork.top),
+            info.rcWork.right,
+            info.rcWork.bottom,
+        ];
+        let fitted = crate::geometry::fit_settings_rect(owner_rect, work, dpi.max(1.0));
+        let (x, y, w, h) = (
+            fitted[0],
+            fitted[1],
+            fitted[2] - fitted[0],
+            fitted[3] - fitted[1],
         );
         let surface = glass.borrow().wallpaper_accent();
         let _light = crate::contrast::luminance(surface) > 0.42;
@@ -324,7 +324,8 @@ impl Host {
         }
         SetWindowTextW(hwnd, wide(title).as_ptr());
         state.borrow_mut().hwnd = hwnd;
-        state.borrow_mut().dpi = GetDpiForWindow(hwnd) as f32 / 96.;
+        let live_dpi = crate::geometry::refit_settings_window(hwnd, owner);
+        state.borrow_mut().dpi = live_dpi;
         Ok(Self { state })
     }
     pub fn hwnd(&self) -> HWND {
@@ -334,12 +335,29 @@ impl Host {
         unsafe { IsWindowVisible(self.hwnd()) != 0 }
     }
     pub unsafe fn show(&mut self) {
-        let hwnd = self.hwnd();
-        {
+        self.show_near(null_mut());
+    }
+    pub unsafe fn show_near(&mut self, anchor: HWND) {
+        let (hwnd, owner) = {
             let mut s = self.state.borrow_mut();
             if s.shadow.is_none() {
-                s.shadow = WindowShadow::new(hwnd);
+                s.shadow = WindowShadow::new(s.hwnd);
             }
+            (s.hwnd, s.owner)
+        };
+        let target = if !anchor.is_null() && IsWindow(anchor) != 0 {
+            anchor
+        } else {
+            owner
+        };
+        let dpi = crate::geometry::refit_settings_window(hwnd, target);
+        {
+            let mut s = self.state.borrow_mut();
+            if (s.dpi - dpi).abs() > 0.005 {
+                s.dpi = dpi;
+            }
+            s.key.clear();
+            s.content_cache = None;
         }
         ShowWindow(hwnd, SW_SHOW);
         SetWindowPos(
@@ -422,6 +440,23 @@ impl Host {
             if IsWindowVisible(s.hwnd) != 0 {
                 InvalidateRect(s.hwnd, null(), 0);
             }
+        }
+    }
+    pub unsafe fn refit(&mut self) {
+        let (hwnd, owner) = {
+            let s = self.state.borrow();
+            (s.hwnd, s.owner)
+        };
+        if hwnd.is_null() || IsWindow(hwnd) == 0 {
+            return;
+        }
+        let dpi = crate::geometry::refit_settings_window(hwnd, owner);
+        let mut s = self.state.borrow_mut();
+        s.dpi = dpi;
+        s.key.clear();
+        s.content_cache = None;
+        if IsWindowVisible(hwnd) != 0 {
+            InvalidateRect(hwnd, null(), 0);
         }
     }
     #[cfg(test)]
@@ -1528,10 +1563,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_DPICHANGED => {
-            s.dpi = wp as u16 as f32 / 96.;
+            s.dpi = (wp as u16 as f32 / 96.).max(1.);
             s.key.clear();
-        s.content_cache = None;
-            let r = *(lp as *const RECT);
+            s.content_cache = None;
+            let r = crate::geometry::clamp_dpi_rect(*(lp as *const RECT), [280, 240], s.dpi);
             drop(s);
             SetWindowPos(
                 hwnd,
@@ -1542,6 +1577,18 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            0
+        }
+        WM_DISPLAYCHANGE => {
+            let owner = s.owner;
+            drop(s);
+            let dpi = crate::geometry::refit_settings_window(hwnd, owner);
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                s.dpi = dpi;
+                s.key.clear();
+                s.content_cache = None;
+            }
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_WINDOWPOSCHANGED => {

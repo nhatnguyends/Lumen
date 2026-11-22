@@ -36,7 +36,7 @@ fn app_kind() -> String {
     "app".into()
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Dock {
     pub version: u32,

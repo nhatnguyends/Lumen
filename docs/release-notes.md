@@ -1,10 +1,10 @@
-Lumen 0.1.9 refines App Dock interactions and animations, unifies fused-widget separation across moves and border resizes, and improves tray, startup, and YouTube Music browser reliability:
+Lumen 0.1.10 introduces multi-monitor duplicate widgets with two-way shared-source synchronization, automatic live DPI/resolution scaling, unified multi-row App Dock group contours, and reorganized General Settings:
 
-- **App Dock Context Menu & Selection Polish**: Kept a visible accent selection highlight on the right-clicked icon while its menu is open, fixed outside-click dismissal across caption bars, resize edges, search box, desktop, and inactive windows, and added a **Copy** command (`CF_HDROP` + `CF_UNICODETEXT`) for real files, folders, and shortcuts while hiding it for virtual `shell:` locations (Recycle Bin, This PC) and Store apps.
-- **Curved 120Hz Launch Animation**: Clicking an icon on App Dock triggers a smooth cubic-bezier burst scaling the launched icon up to `200%` while fading out cleanly at 120Hz.
-- **Live Scroll Hover in App Dock**: Hover glow and surface state remain active and track cursor position accurately while scrolling the App Dock grid.
-- **Unified Fusion Drag-to-Unfuse Threshold**: Consolidated a shared `16` DIP drag-to-unfuse threshold across all widgets for both moving and border resizing, so brief clicks/holds never detach fused panes prematurely.
-- **Startup, Tray, YouTube Music CDP & Tray Updates**: Added resilient tray registration (`!NIF_GUID` fallback and UIPI message filtering), medium-integrity Windows startup task de-elevation, Chrome/Edge CDP `--do-not-de-elevate` launch reliability across admin/standard sessions, and automatic scroll to the Updates section when clicking Update in the tray menu.
+- **Multi-Monitor Independent Duplicates & Two-Way Shared Sync**: Duplicate widgets run independently per selected display at native DPI with isolated hover/click states, per-monitor fusion, and separate saved position/size per monitor, while syncing Sticky Notes content, App Dock ordering/groups, Control Center controls, and individual widget settings two-way across all displays.
+- **Automatic Live DPI Scaling & Work-Area Clamping**: Widgets stay bounded within the active monitor work area and rescale automatically without manual interaction whenever display resolution or Windows scale changes.
+- **Non-Destructive Fusion Overlap**: Dragging another widget over part of a fused group no longer breaks the existing fused widgets apart.
+- **App Dock Multi-Row Group Contours, Fewest-Rows Packing & Crisp Icons**: Multi-row groups render inside one unified rounded background polygon, pack horizontally with the fewest rows before forming compact rectangular blocks, and trim/extract Windows icons consistently across machines.
+- **General Settings Reorganization**: Moved visual material controls (blur size, frosted glass, liquid glass) into a top **Background** section and grouped remaining options under **Misc**.
 
 Optional Python entry points remain available:
 
@@ -16,7 +16,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.9-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.10-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

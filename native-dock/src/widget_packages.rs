@@ -3,11 +3,14 @@ use crate::glass::Glass;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
 };
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::{
+    Foundation::HWND,
+    UI::WindowsAndMessaging::IsWindow,
+};
 
 pub trait WidgetHost {
     unsafe fn show(&mut self);
@@ -74,6 +77,7 @@ pub struct Registry {
     manifests: Vec<Manifest>,
     definitions: HashMap<&'static str, NativeDefinition>,
     hosts: HashMap<String, Box<dyn WidgetHost>>,
+    duplicates: HashMap<(String, String), Box<dyn WidgetHost>>,
     enabled: HashMap<String, bool>,
     visibility_error: Option<String>,
     show_messages: HashMap<u32, String>,
@@ -136,6 +140,7 @@ impl Registry {
             manifests,
             definitions,
             hosts: HashMap::new(),
+            duplicates: HashMap::new(),
             enabled,
             visibility_error,
             show_messages,
@@ -151,6 +156,13 @@ impl Registry {
         self.enabled.get(id).copied().unwrap_or(fallback)
     }
     pub fn shutdown(&mut self) {
+        for h in self.duplicates.values() {
+            crate::multi_monitor::unregister_duplicate(h.hwnd());
+        }
+        for h in self.hosts.values() {
+            crate::multi_monitor::unregister_widget(h.hwnd());
+        }
+        self.duplicates.clear();
         self.hosts.clear();
     }
     pub fn ids(&self) -> Vec<String> {
@@ -229,6 +241,7 @@ impl Registry {
         crate::logger::info(id, "widget initialized");
         unsafe {
             crate::fusion::register_widget(host.hwnd());
+            crate::multi_monitor::register_widget(host.hwnd(), id);
         }
         self.hosts.insert(id.into(), host);
         Ok(())
@@ -243,14 +256,117 @@ impl Registry {
         }
     }
     pub unsafe fn tick(&mut self) {
-        for h in self.hosts.values_mut() {
+        for h in self.hosts.values_mut().chain(self.duplicates.values_mut()) {
             h.tick();
         }
     }
     pub unsafe fn refresh(&mut self) {
-        for h in self.hosts.values_mut() {
+        for h in self.hosts.values_mut().chain(self.duplicates.values_mut()) {
             h.refresh();
         }
+    }
+    pub unsafe fn notify_display_change(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_DISPLAYCHANGE};
+        for h in self.hosts.values().chain(self.duplicates.values()) {
+            let hwnd = h.hwnd();
+            if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+                SendMessageW(hwnd, WM_DISPLAYCHANGE, 0, 0);
+            }
+        }
+    }
+    pub unsafe fn sync_duplicates(
+        &mut self,
+        glass: Rc<RefCell<Glass>>,
+        inspect: bool,
+        smoke: bool,
+    ) -> bool {
+        if !crate::multi_monitor::is_enabled() {
+            if self.duplicates.is_empty() {
+                return false;
+            }
+            for h in self.duplicates.values() {
+                crate::multi_monitor::unregister_duplicate(h.hwnd());
+            }
+            self.duplicates.clear();
+            return true;
+        }
+        let mut desired = Vec::new();
+        for (id, host) in &self.hosts {
+            if !host.visible() {
+                continue;
+            }
+            let src_hwnd = host.hwnd();
+            for disp in crate::multi_monitor::target_displays_for(src_hwnd) {
+                if disp.work.is_some() {
+                    desired.push((id.clone(), disp));
+                }
+            }
+        }
+        let desired_keys: HashSet<(String, String)> = desired
+            .iter()
+            .map(|(id, disp)| (id.clone(), disp.id.clone()))
+            .collect();
+        let before = self.duplicates.len();
+        self.duplicates.retain(|key, h| {
+            let keep = desired_keys.contains(key) && IsWindow(h.hwnd()) != 0;
+            if !keep {
+                crate::multi_monitor::unregister_duplicate(h.hwnd());
+            }
+            keep
+        });
+        let mut changed = self.duplicates.len() != before;
+        for (id, disp) in desired {
+            let key = (id.clone(), disp.id.clone());
+            if self.duplicates.contains_key(&key) {
+                continue;
+            }
+            let Some(def) = self.definitions.get(id.as_str()) else {
+                continue;
+            };
+            let Some(src_hwnd) = self.hosts.get(&id).map(|h| h.hwnd()) else {
+                continue;
+            };
+            let Some(dst_work) = disp.work else {
+                continue;
+            };
+            match (def.factory)(&self.root, glass.clone(), inspect, smoke) {
+                Ok(mut dup) => {
+                    let dup_hwnd = dup.hwnd();
+                    crate::multi_monitor::register_duplicate(dup_hwnd, &id, &disp.id);
+                    crate::fusion::register_widget(dup_hwnd);
+                    let dst_dpi = crate::multi_monitor::display_dpi(dst_work);
+                    crate::multi_monitor::place_duplicate_window(
+                        dup_hwnd,
+                        &id,
+                        &disp.id,
+                        src_hwnd,
+                        dst_work,
+                        dst_dpi,
+                        min_dip_for(&id),
+                    );
+                    dup.show();
+                    self.duplicates.insert(key, dup);
+                    changed = true;
+                }
+                Err(e) => {
+                    crate::logger::error(
+                        &id,
+                        format!("failed to start duplicate on {}: {e}", disp.id),
+                    );
+                }
+            }
+        }
+        changed
+    }
+}
+fn min_dip_for(id: &str) -> [i32; 2] {
+    match id {
+        "clock" => [110, 80],
+        "calendar" => [210, 190],
+        "controls" => [160, 112],
+        "notes" => [180, 160],
+        "music" => [260, 120],
+        _ => [160, 120],
     }
 }
 pub fn show_message(id: &str) -> u32 {

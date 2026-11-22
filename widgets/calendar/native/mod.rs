@@ -165,15 +165,26 @@ impl Host {
         let monitor = MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
+        let (mut left, mut top, mut cw, mut ch) = (bounds.left, bounds.top, w, h);
         if GetMonitorInfoW(monitor, &mut info) != 0 {
-            bounds.left = bounds.left.clamp(
-                info.rcWork.left,
-                (info.rcWork.right - w).max(info.rcWork.left),
+            let min_px = [
+                (model::MIN_WIDTH as f32 * dpi).round() as i32,
+                (model::MIN_HEIGHT as f32 * dpi).round() as i32,
+            ];
+            let clamped = crate::geometry::clamp_rect_to_work(
+                [bounds.left, bounds.top, bounds.right, bounds.bottom],
+                [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ],
+                min_px,
             );
-            bounds.top = bounds.top.clamp(
-                info.rcWork.top,
-                (info.rcWork.bottom - h).max(info.rcWork.top),
-            );
+            left = clamped[0];
+            top = clamped[1];
+            cw = clamped[2] - clamped[0];
+            ch = clamped[3] - clamped[1];
         }
         let hwnd = CreateWindowExW(
             crate::gpu::window_ex_style()
@@ -185,10 +196,10 @@ impl Host {
             class.as_ptr(),
             wide("Lumen · Calendar").as_ptr(),
             WS_POPUP,
-            bounds.left,
-            bounds.top,
-            w,
-            h,
+            left,
+            top,
+            cw,
+            ch,
             null_mut(),
             null_mut(),
             instance,
@@ -200,10 +211,16 @@ impl Host {
         // WM_NCCREATE installs our state before default title initialization.
         // Set it explicitly so window discovery/accessibility sees the name.
         SetWindowTextW(hwnd, wide("Lumen · Calendar").as_ptr());
+        let (live_dpi, _) = crate::geometry::clamp_window_to_work(
+            hwnd,
+            [model::MIN_WIDTH, model::MIN_HEIGHT],
+            dpi,
+        );
         {
             let mut s = state.borrow_mut();
             s.hwnd = hwnd;
-            s.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
+            s.dpi = live_dpi;
+            s.bounds();
             if !smoke {
                 s.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
             }
@@ -214,12 +231,14 @@ impl Host {
         let hwnd = self.state.borrow().hwnd;
         {
             let mut s = self.state.borrow_mut();
-            s.config.open = true;
+            if !crate::multi_monitor::is_duplicate(hwnd) {
+                s.config.open = true;
+                s.save_local();
+            }
             s.today = Date::today();
             if s.shadow.is_none() {
                 s.shadow = WindowShadow::new(hwnd);
             }
-            s.save();
         }
         SetTimer(hwnd, 1, 60_000, None);
         ShowWindow(
@@ -451,14 +470,66 @@ impl State {
         }
         InvalidateRect(self.hwnd, null(), 0);
     }
-    fn save(&self) {
+    fn save_local(&self) {
         if !self.smoke {
             if let Err(e) = self.config.save(&self.root) {
                 eprintln!("native-calendar save: {e}");
             }
         }
     }
+    fn save(&self) {
+        if self.smoke {
+            return;
+        }
+        let res = if crate::multi_monitor::is_duplicate(self.hwnd) {
+            let mut shared = self.config.clone();
+            if let Ok(disk) = Config::load(&self.root) {
+                shared.position = disk.position;
+                shared.size = disk.size;
+                shared.open = disk.open;
+            }
+            shared.save(&self.root)
+        } else {
+            self.config.save(&self.root)
+        };
+        match res {
+            Ok(()) => unsafe { crate::multi_monitor::notify_peers("calendar", self.hwnd) },
+            Err(e) => eprintln!("native-calendar save: {e}"),
+        }
+    }
+    unsafe fn reload_from_shared(&mut self) {
+        let Ok(mut loaded) = Config::load(&self.root) else {
+            return;
+        };
+        loaded.position = self.config.position;
+        loaded.size = self.config.size;
+        loaded.open = self.config.open;
+        let floating_changed = loaded.floating != self.config.floating;
+        self.config = loaded;
+        self.key.clear();
+        self.backdrop = None;
+        self.artwork.clear();
+        self.typo.clear();
+        if floating_changed {
+            PostMessageW(self.hwnd, APPLY_MODE, 0, 0);
+        }
+        if self.settings_host.is_some() {
+            let rows = self.settings_rows();
+            let surface = crate::surface::color(
+                &self.config.palette,
+                self.glass.borrow().wallpaper_accent(),
+            );
+            if let Some(host) = &mut self.settings_host {
+                host.set_rows(rows);
+                host.set_surface(surface, crate::contrast::luminance(surface) > 0.42);
+            }
+        }
+        InvalidateRect(self.hwnd, null(), 0);
+    }
     unsafe fn bounds(&mut self) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+            return;
+        }
         let mut r: RECT = zeroed();
         GetWindowRect(self.hwnd, &mut r);
         self.config.position = Some([r.left, r.top]);
@@ -466,7 +537,7 @@ impl State {
             ((r.right - r.left) as f32 / self.dpi).round() as i32,
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
-        self.save();
+        self.save_local();
     }
     unsafe fn buttons(&self) -> Vec<Button> {
         let [w, h] = self.size();
@@ -602,10 +673,14 @@ impl State {
                 self.open_settings();
             }
             Action::Hide => {
+                let was_visible = IsWindowVisible(self.hwnd) != 0;
                 if let Some(settings) = &mut self.settings_host {
                     settings.hide();
                 }
-                self.config.open = false;
+                let is_dup = crate::multi_monitor::is_duplicate(self.hwnd);
+                if !is_dup {
+                    self.config.open = false;
+                }
                 KillTimer(self.hwnd, 1);
                 KillTimer(self.hwnd, 2);
                 self.hover_clock = None;
@@ -614,7 +689,9 @@ impl State {
                 self.hover = None;
                 self.drag = None;
                 crate::glass::set_resizing(self.hwnd, false);
-                self.save();
+                if !is_dup {
+                    self.save_local();
+                }
                 ShowWindow(self.hwnd, SW_HIDE);
                 self.frame = None;
                 self.artwork.clear();
@@ -622,6 +699,9 @@ impl State {
                 self.backdrop = None;
                 self.shadow = None;
                 self.key.clear();
+                if was_visible && !self.smoke {
+                    crate::multi_monitor::request_hide_widget("calendar");
+                }
                 return;
             }
         }
@@ -898,6 +978,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         SETTINGS_CHANGED => {
             s.settings_changed();
+            0
+        }
+        m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
+            s.reload_from_shared();
             0
         }
         WM_GETMINMAXINFO => {
@@ -1226,9 +1310,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_DPICHANGED => {
-            s.dpi = (wp as u16) as f32 / 96.;
+            let new_dpi = ((wp as u16) as f32 / 96.).max(1.);
+            s.dpi = new_dpi;
             s.key.clear();
-            let r = *(lp as *const RECT);
+            let r = crate::geometry::clamp_dpi_rect(
+                *(lp as *const RECT),
+                [model::MIN_WIDTH, model::MIN_HEIGHT],
+                new_dpi,
+            );
             drop(s);
             SetWindowPos(
                 hwnd,
@@ -1248,6 +1337,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             s.glass.borrow_mut().refresh();
             s.key.clear();
+            let prev_dpi = s.dpi;
+            let live_dpi = crate::geometry::window_dpi(hwnd);
+            let pre_dpi_changed = (prev_dpi - live_dpi).abs() > 0.005;
+            s.dpi = live_dpi;
+            drop(s);
+            let (dpi, changed) = crate::geometry::clamp_window_to_work(
+                hwnd,
+                [model::MIN_WIDTH, model::MIN_HEIGHT],
+                prev_dpi,
+            );
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                s.dpi = dpi;
+                if pre_dpi_changed || changed {
+                    s.frame = None;
+                    s.backdrop = None;
+                    s.key.clear();
+                }
+                s.bounds();
+                if let Some(host) = &mut s.settings_host {
+                    host.refit();
+                }
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
