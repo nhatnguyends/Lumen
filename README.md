@@ -4,6 +4,11 @@ Native Rust desktop widgets for Windows: App Dock, Clock, Calendar, YouTube
 Music, Notes and Control Center. Widget UI shares one Rust/Win32 process and
 wallpaper compositor. The Electron app and its build/runtime dependencies have
 been removed.
+<img width="2924" height="2049" alt="Screenshot 2026-11-14 161211" src="https://github.com/user-attachments/assets/ccbef8d7-cb1e-4c35-8aa2-b4555318dd53" />
+<img width="3158" height="2145" alt="Screenshot 2026-11-14 161735" src="https://github.com/user-attachments/assets/47d6478b-1a1d-46fc-a906-dcbb97e97a20" />
+<img width="1284" height="1375" alt="20261114_152447 1" src="https://github.com/user-attachments/assets/7684e98f-1526-4447-95aa-6409b440589c" />
+
+
 
 ## Portable download
 
