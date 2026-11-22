@@ -1000,16 +1000,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     drop(s);
                     crate::fusion::move_captured_widget(hwnd, r);
                 } else {
-                    crate::fusion::snap_resize_rect(
-                        hwnd,
-                        &mut r,
-                        d.edge,
-                        [
-                            (model::MIN_WIDTH as f32 * s.dpi).ceil() as i32,
-                            (model::MIN_HEIGHT as f32 * s.dpi).ceil() as i32,
-                        ],
-                    );
+                    let min = [
+                        (model::MIN_WIDTH as f32 * s.dpi).ceil() as i32,
+                        (model::MIN_HEIGHT as f32 * s.dpi).ceil() as i32,
+                    ];
+                    let edge = d.edge;
                     drop(s);
+                    if !crate::fusion::snap_resize_rect(hwnd, &mut r, edge, min) {
+                        return 0;
+                    }
                     SetWindowPos(
                         hwnd,
                         null_mut(),

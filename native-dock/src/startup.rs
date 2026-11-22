@@ -7,16 +7,40 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND},
+    Foundation::{CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, HANDLE},
+    Security::{
+        DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation,
+        TokenPrimary, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY,
+    },
     System::{
         Registry::*,
-        Threading::{GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        Threading::{
+            GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+            WaitForSingleObject, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, STARTUPINFOW,
+        },
     },
     UI::{
         Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
-        WindowsAndMessaging::SW_HIDE,
+        WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId, SW_HIDE},
     },
 };
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn CreateProcessWithTokenW(
+        hToken: HANDLE,
+        dwLogonFlags: u32,
+        lpApplicationName: *const u16,
+        lpCommandLine: *mut u16,
+        dwCreationFlags: u32,
+        lpEnvironment: *const std::ffi::c_void,
+        lpCurrentDirectory: *const u16,
+        lpStartupInfo: *const STARTUPINFOW,
+        lpProcessInformation: *mut PROCESS_INFORMATION,
+    ) -> i32;
+}
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const TASK_NAME: &str = "Lumen";
@@ -116,7 +140,7 @@ fn apply_task_scheduler(root: &Path, enabled: bool) -> Result<(), String> {
                 "/SC",
                 "ONLOGON",
                 "/RL",
-                "HIGHEST",
+                "LIMITED",
                 "/F",
             ])
             .creation_flags(CREATE_NO_WINDOW)
@@ -186,4 +210,191 @@ pub fn restart_app() -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn quote_win_arg(arg: &std::ffi::OsStr) -> String {
+    let s = arg.to_string_lossy();
+    if !s.is_empty() && !s.bytes().any(|b| matches!(b, b' ' | b'\t' | b'"')) {
+        return s.into_owned();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in s.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+unsafe fn is_elevated() -> bool {
+    let mut token: HANDLE = null_mut();
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token.is_null() {
+        return false;
+    }
+    let mut elev: TOKEN_ELEVATION = zeroed();
+    let mut len = 0u32;
+    let ok = GetTokenInformation(
+        token,
+        TokenElevation,
+        &mut elev as *mut _ as _,
+        size_of::<TOKEN_ELEVATION>() as u32,
+        &mut len,
+    );
+    CloseHandle(token);
+    ok != 0 && elev.TokenIsElevated != 0
+}
+
+pub fn de_elevate_if_needed() -> bool {
+    if std::env::args().any(|a| matches!(a.as_str(), "--no-de-elevate" | "--quit" | "--smoke-test"))
+    {
+        return false;
+    }
+    unsafe {
+        if !is_elevated() {
+            return false;
+        }
+        let mut shell_hwnd = GetShellWindow();
+        for _ in 0..19 {
+            if !shell_hwnd.is_null() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            shell_hwnd = GetShellWindow();
+        }
+        if shell_hwnd.is_null() {
+            crate::logger::warn("app", "de-elevation skipped: shell window unavailable");
+            return false;
+        }
+        let mut shell_pid = 0u32;
+        GetWindowThreadProcessId(shell_hwnd, &mut shell_pid);
+        if shell_pid == 0 {
+            crate::logger::warn(
+                "app",
+                format!(
+                    "de-elevation failed (err={}); continuing elevated",
+                    GetLastError()
+                ),
+            );
+            return false;
+        }
+        let shell_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, shell_pid);
+        if shell_proc.is_null() {
+            crate::logger::warn(
+                "app",
+                format!(
+                    "de-elevation failed (err={}); continuing elevated",
+                    GetLastError()
+                ),
+            );
+            return false;
+        }
+        let mut shell_token: HANDLE = null_mut();
+        if OpenProcessToken(shell_proc, TOKEN_DUPLICATE, &mut shell_token) == 0
+            || shell_token.is_null()
+        {
+            let err = GetLastError();
+            CloseHandle(shell_proc);
+            crate::logger::warn(
+                "app",
+                format!("de-elevation failed (err={err}); continuing elevated"),
+            );
+            return false;
+        }
+        let mut primary_token: HANDLE = null_mut();
+        let dup_ok = DuplicateTokenEx(
+            shell_token,
+            TOKEN_ASSIGN_PRIMARY
+                | TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary_token,
+        );
+        if dup_ok == 0 || primary_token.is_null() {
+            let err = GetLastError();
+            CloseHandle(shell_token);
+            CloseHandle(shell_proc);
+            crate::logger::warn(
+                "app",
+                format!("de-elevation failed (err={err}); continuing elevated"),
+            );
+            return false;
+        }
+
+        let Ok(exe) = std::env::current_exe() else {
+            CloseHandle(primary_token);
+            CloseHandle(shell_token);
+            CloseHandle(shell_proc);
+            return false;
+        };
+        let mut cmd = quote_win_arg(exe.as_os_str());
+        for arg in std::env::args_os().skip(1) {
+            cmd.push(' ');
+            cmd.push_str(&quote_win_arg(&arg));
+        }
+        cmd.push_str(" --no-de-elevate");
+        let exe_w = crate::model::wide(exe);
+        let mut cmd_w = crate::model::wide(cmd);
+        let mut si: STARTUPINFOW = zeroed();
+        si.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = zeroed();
+        let created = CreateProcessWithTokenW(
+            primary_token,
+            0,
+            exe_w.as_ptr(),
+            cmd_w.as_mut_ptr(),
+            0,
+            null(),
+            null(),
+            &si,
+            &mut pi,
+        );
+        let err = if created == 0 { GetLastError() } else { 0 };
+        if !pi.hThread.is_null() {
+            CloseHandle(pi.hThread);
+        }
+        if !pi.hProcess.is_null() {
+            CloseHandle(pi.hProcess);
+        }
+        CloseHandle(primary_token);
+        CloseHandle(shell_token);
+        CloseHandle(shell_proc);
+        if created != 0 {
+            crate::logger::info(
+                "app",
+                format!(
+                    "elevated launch de-elevated to shell token (child_pid={})",
+                    pi.dwProcessId
+                ),
+            );
+            true
+        } else {
+            crate::logger::warn(
+                "app",
+                format!("de-elevation failed (err={err}); continuing elevated"),
+            );
+            false
+        }
+    }
 }

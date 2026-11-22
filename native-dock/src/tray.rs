@@ -18,6 +18,8 @@ pub struct Tray {
     icon_normal: HICON,
     icon_badge: HICON,
     update_available: bool,
+    registered: bool,
+    use_guid: bool,
 }
 unsafe fn create_hicon(rgba: &[u8]) -> Option<HICON> {
     let mut pixels = rgba.to_vec();
@@ -125,21 +127,34 @@ impl Tray {
         data.guidItem = GUID::from_u128(0xc7c6f41d_f516_4c86_9f3e_8db41829601a);
         let tip = crate::model::wide("Lumen");
         data.szTip[..tip.len().min(127)].copy_from_slice(&tip[..tip.len().min(127)]);
-        let tray = Self {
+        let mut tray = Self {
             data,
             icon_normal,
             icon_badge,
             update_available: false,
+            registered: false,
+            use_guid: true,
         };
-        if !tray.add() {
-            return None;
-        }
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon_normal as isize);
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_normal as isize);
+        let _ = tray.add();
         Some(tray)
     }
+    pub fn is_registered(&self) -> bool {
+        self.registered
+    }
+    fn base_flags(&self) -> u32 {
+        if self.use_guid {
+            NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID
+        } else {
+            NIF_MESSAGE | NIF_ICON | NIF_TIP
+        }
+    }
     pub unsafe fn notify(&mut self, title: &str, body: &str) {
-        self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID | NIF_INFO;
+        if !self.registered {
+            let _ = self.add();
+        }
+        self.data.uFlags = self.base_flags() | NIF_INFO;
         self.data.dwInfoFlags = NIIF_INFO;
         self.data.szInfoTitle.fill(0);
         let t = crate::model::wide(title);
@@ -149,12 +164,18 @@ impl Tray {
         let b = crate::model::wide(body);
         let b_len = b.len().min(self.data.szInfo.len() - 1);
         self.data.szInfo[..b_len].copy_from_slice(&b[..b_len]);
-        Shell_NotifyIconW(NIM_MODIFY, &self.data);
-        self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+        if Shell_NotifyIconW(NIM_MODIFY, &self.data) == 0 {
+            self.registered = false;
+            let _ = self.add();
+        }
+        self.data.uFlags = self.base_flags();
     }
     pub unsafe fn set_update_available(&mut self, available: bool) {
         if self.update_available == available {
             return;
+        }
+        if !self.registered {
+            let _ = self.add();
         }
         self.update_available = available;
         self.data.hIcon = if available {
@@ -165,10 +186,50 @@ impl Tray {
         self.data.szTip.fill(0);
         let tip = crate::model::wide(if available { "Update available" } else { "Lumen" });
         self.data.szTip[..tip.len().min(127)].copy_from_slice(&tip[..tip.len().min(127)]);
-        Shell_NotifyIconW(NIM_MODIFY, &self.data);
+        self.data.uFlags = self.base_flags();
+        if Shell_NotifyIconW(NIM_MODIFY, &self.data) == 0 {
+            self.registered = false;
+            let _ = self.add();
+        }
     }
-    pub unsafe fn add(&self) -> bool {
-        let added = Shell_NotifyIconW(NIM_ADD, &self.data) != 0;
+    pub unsafe fn add(&mut self) -> bool {
+        self.data.uFlags = self.base_flags();
+        let mut added = Shell_NotifyIconW(NIM_ADD, &self.data) != 0;
+        if !added {
+            Shell_NotifyIconW(NIM_DELETE, &self.data);
+            added = Shell_NotifyIconW(NIM_ADD, &self.data) != 0;
+        }
+        if !added && self.use_guid {
+            let err = GetLastError();
+            crate::logger::warn(
+                "tray",
+                format!("tray NIM_ADD with NIF_GUID failed (err={err}); falling back to uID"),
+            );
+            self.use_guid = false;
+            self.data.uFlags = self.base_flags();
+            self.data.guidItem = zeroed();
+            added = Shell_NotifyIconW(NIM_ADD, &self.data) != 0;
+            if !added {
+                Shell_NotifyIconW(NIM_DELETE, &self.data);
+                added = Shell_NotifyIconW(NIM_ADD, &self.data) != 0;
+            }
+        }
+        self.registered = added;
+        if added {
+            crate::logger::info(
+                "tray",
+                format!("tray icon registered={added} use_guid={}", self.use_guid),
+            );
+        } else {
+            let err = GetLastError();
+            crate::logger::warn(
+                "tray",
+                format!(
+                    "tray icon registered={added} use_guid={} err={err}",
+                    self.use_guid
+                ),
+            );
+        }
         eprintln!("native-tray registered={added}");
         added
     }
@@ -207,6 +268,7 @@ impl Tray {
 impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
+            self.data.uFlags = self.base_flags();
             Shell_NotifyIconW(NIM_DELETE, &self.data);
             DestroyIcon(self.icon_normal);
             DestroyIcon(self.icon_badge);

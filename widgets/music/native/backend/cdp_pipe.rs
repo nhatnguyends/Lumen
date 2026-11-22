@@ -152,6 +152,7 @@ pub fn player_arguments(profile: &Path, url: &str) -> Result<Vec<String>, String
         "--profile-directory=LumenMusic".into(),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
+        "--do-not-de-elevate".into(),
         format!("--app={url}"),
     ])
 }
@@ -165,6 +166,7 @@ pub fn sign_in_arguments(profile: &Path) -> Vec<String> {
         "--no-default-browser-check".into(),
         "--disable-background-mode".into(),
         "--new-window".into(),
+        "--do-not-de-elevate".into(),
         "https://music.youtube.com/".into(),
     ]
 }
@@ -727,7 +729,14 @@ mod tests {
     #[test]
     fn player_url_and_arguments_validation() {
         let profile = Path::new(r"C:\Temp\profile");
-        assert!(player_arguments(profile, "https://music.youtube.com/").is_ok());
+        let base_args = player_arguments(profile, "https://music.youtube.com/").unwrap();
+        assert!(base_args.iter().any(|a| a == "--do-not-de-elevate"));
+        assert!(base_args[..base_args.len() - 1]
+            .iter()
+            .any(|a| a == "--do-not-de-elevate"));
+        assert!(sign_in_arguments(profile)
+            .iter()
+            .any(|a| a == "--do-not-de-elevate"));
         assert!(player_arguments(profile, "https://music.youtube.com/library").is_ok());
         assert!(player_arguments(profile, "http://music.youtube.com/").is_err());
         assert!(player_arguments(profile, "https://music.youtube.com.evil.com/").is_err());

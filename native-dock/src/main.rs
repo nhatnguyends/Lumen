@@ -48,6 +48,9 @@ fn main() {
         return;
     }
     logger::init(&model::root());
+    if startup::de_elevate_if_needed() {
+        return;
+    }
     if let Err(error) = window::run() {
         logger::error("app", &error);
         eprintln!("{error}");

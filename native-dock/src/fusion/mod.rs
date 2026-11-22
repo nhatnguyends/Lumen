@@ -25,15 +25,26 @@ use windows_sys::Win32::{
 
 const REFRESH: u32 = WM_APP + 110;
 const SUBCLASS: usize = 0x4c554d46;
+const UNFUSE_DRAG_THRESHOLD_DIP: f32 = 16.0;
+#[derive(Clone, Copy)]
+struct DragSession {
+    anchor_rect: RECT,
+    anchor_cursor: POINT,
+    raw_rect: RECT,
+    last_cursor: POINT,
+    detached: bool,
+    native_moving: bool,
+}
 #[derive(Clone)]
 struct Member {
     pane: Pane,
     window: [i32; 4],
     visible: bool,
     moving: bool,
+    resizing: bool,
     opacity: u8,
     frost: u8,
-    snap_drag: Option<(RECT, POINT)>,
+    drag: Option<DragSession>,
 }
 struct Bridge {
     hwnd: HWND,
@@ -71,6 +82,13 @@ thread_local! {
     static MANAGER: RefCell<Option<Manager>> = const { RefCell::new(None) };
     static PENDING_MOVE: std::cell::Cell<Option<(usize, RECT)>> = const { std::cell::Cell::new(None) };
     static IN_WM_MOVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IN_CAPTURED_MOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn exceeds_unfuse_threshold(dx: i32, dy: i32, dpi: f32) -> bool {
+    let threshold = UNFUSE_DRAG_THRESHOLD_DIP * dpi.max(1.0);
+    let dist_sq = (dx as f32) * (dx as f32) + (dy as f32) * (dy as f32);
+    dist_sq >= threshold * threshold
 }
 
 pub fn in_wm_moving() -> bool {
@@ -140,49 +158,35 @@ pub unsafe fn commit_atomic_move(hwnd: HWND, target: RECT) {
     }
 }
 
-pub unsafe fn move_captured_widget(hwnd: HWND, mut r: RECT) {
-    let w = r.right - r.left;
-    let h = r.bottom - r.top;
+pub unsafe fn move_captured_widget(hwnd: HWND, r: RECT) {
+    let mut target = r;
+    let mut should_move = true;
     MANAGER.with(|m| {
         if let Ok(mut x) = m.try_borrow_mut() {
             if let Some(s) = x.as_mut() {
-                if !s.enabled {
-                    return;
-                }
-                if let Some(p) = s.members.get(&(hwnd as usize)).cloned() {
-                    if !p.moving {
-                        if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
-                            p.moving = true;
-                        }
-                        s.changed();
-                    }
-                    let inset = 4. * p.pane.dpi;
-                    let candidate = Pane {
-                        rect: [
-                            r.left as f32 + inset,
-                            r.top as f32 + inset,
-                            (r.left + w) as f32 - inset,
-                            (r.top + h) as f32 - inset,
-                        ],
-                        ..p.pane
-                    };
-                    let d = snap_move(&candidate, &s.panes());
-                    let dx = d[0].round() as i32;
-                    let dy = d[1].round() as i32;
-                    r.left += dx;
-                    r.right += dx;
-                    r.top += dy;
-                    r.bottom += dy;
+                if let Some((t, move_now)) = s.step_drag_move(hwnd, r, None) {
+                    target = t;
+                    should_move = move_now;
                 }
             }
         }
     });
+    if !should_move {
+        return;
+    }
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_CAPTURED_MOVE.with(|f| f.set(self.0));
+        }
+    }
+    let _guard = Guard(IN_CAPTURED_MOVE.with(|f| f.replace(true)));
     if crate::gpu::is_gpu_window(hwnd) {
         SetWindowPos(
             hwnd,
             null_mut(),
-            r.left,
-            r.top,
+            target.left,
+            target.top,
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -191,7 +195,7 @@ pub unsafe fn move_captured_widget(hwnd: HWND, mut r: RECT) {
             InvalidateRect(hwnd, null(), 0);
         }
     } else {
-        commit_atomic_move(hwnd, r);
+        commit_atomic_move(hwnd, target);
     }
 }
 
@@ -313,9 +317,10 @@ unsafe fn read_member(hwnd: HWND, radius: f32) -> Member {
         window: [r.left, r.top, r.right, r.bottom],
         visible: IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0,
         moving: false,
+        resizing: false,
         opacity: 255,
         frost: 255,
-        snap_drag: None,
+        drag: None,
     }
 }
 impl Manager {
@@ -424,8 +429,10 @@ impl Manager {
         if let Some(old) = self.members.get(&id).cloned() {
             let mut new = read_member(hwnd, radius.unwrap_or(old.pane.radius / old.pane.dpi));
             new.moving = old.moving;
+            new.resizing = old.resizing;
             new.opacity = old.opacity;
             new.frost = old.frost;
+            new.drag = old.drag;
             let changed = old.pane != new.pane || old.visible != new.visible;
             self.members.insert(id, new);
             if changed && !old.moving {
@@ -437,6 +444,263 @@ impl Manager {
                 .insert(id, read_member(hwnd, radius.unwrap_or(34.)));
             SetWindowSubclass(hwnd, Some(widget_proc), SUBCLASS, 0);
             self.changed();
+        }
+    }
+    unsafe fn begin_resize(&mut self, hwnd: HWND, cursor: POINT) {
+        let was_fused = self.enabled && self.group(hwnd as usize).is_some();
+        let anchor_rect = window_rect(hwnd);
+        if let Some(p) = self.members.get_mut(&(hwnd as usize)) {
+            p.resizing = true;
+            p.drag = Some(DragSession {
+                anchor_rect,
+                anchor_cursor: cursor,
+                raw_rect: anchor_rect,
+                last_cursor: cursor,
+                detached: !was_fused,
+                native_moving: false,
+            });
+            if !was_fused && !p.moving {
+                p.moving = true;
+                self.changed();
+            }
+        }
+    }
+    unsafe fn begin_move_drag(&mut self, hwnd: HWND, cursor: POINT) {
+        let was_fused = self.enabled && self.group(hwnd as usize).is_some();
+        let anchor_rect = window_rect(hwnd);
+        if let Some(p) = self.members.get_mut(&(hwnd as usize)) {
+            if p.resizing {
+                return;
+            }
+            p.drag = Some(DragSession {
+                anchor_rect,
+                anchor_cursor: cursor,
+                raw_rect: anchor_rect,
+                last_cursor: cursor,
+                detached: !was_fused,
+                native_moving: true,
+            });
+            if !was_fused && !p.moving {
+                p.moving = true;
+                self.changed();
+            }
+        }
+    }
+    unsafe fn step_drag_move(
+        &mut self,
+        hwnd: HWND,
+        proposed: RECT,
+        cursor: Option<POINT>,
+    ) -> Option<(RECT, bool)> {
+        let was_fused = self.enabled && self.group(hwnd as usize).is_some();
+        let panes = self.panes();
+        let id = hwnd as usize;
+        let Some(p) = self.members.get_mut(&id) else {
+            return Some((proposed, true));
+        };
+        let dpi = p.pane.dpi;
+        let pane_template = p.pane;
+        let mut need_changed = false;
+        let cur = cursor.unwrap_or(POINT { x: 0, y: 0 });
+        let drag = p.drag.get_or_insert_with(|| {
+            let anchor_rect = RECT {
+                left: p.window[0],
+                top: p.window[1],
+                right: p.window[2],
+                bottom: p.window[3],
+            };
+            if !was_fused && !p.moving {
+                p.moving = true;
+                need_changed = true;
+            }
+            DragSession {
+                anchor_rect,
+                anchor_cursor: cur,
+                raw_rect: proposed,
+                last_cursor: cur,
+                detached: !was_fused,
+                native_moving: cursor.is_some(),
+            }
+        });
+        if let Some(cur) = cursor {
+            if cur.x != drag.last_cursor.x || cur.y != drag.last_cursor.y {
+                let dx = cur.x - drag.last_cursor.x;
+                let dy = cur.y - drag.last_cursor.y;
+                drag.raw_rect.left += dx;
+                drag.raw_rect.right += dx;
+                drag.raw_rect.top += dy;
+                drag.raw_rect.bottom += dy;
+                drag.last_cursor = cur;
+            } else if cur.x == drag.anchor_cursor.x && cur.y == drag.anchor_cursor.y {
+                // Real cursor did not move (e.g. synthetic WM_MOVING in tests).
+                drag.raw_rect = proposed;
+            }
+        } else {
+            drag.raw_rect = proposed;
+        }
+        if !drag.detached {
+            let dx = drag.raw_rect.left - drag.anchor_rect.left;
+            let dy = drag.raw_rect.top - drag.anchor_rect.top;
+            if !exceeds_unfuse_threshold(dx, dy, dpi) {
+                let anchor = drag.anchor_rect;
+                if need_changed {
+                    self.changed();
+                }
+                return Some((anchor, false));
+            }
+            drag.detached = true;
+            if !p.moving {
+                p.moving = true;
+                need_changed = true;
+            }
+        } else if !p.moving {
+            p.moving = true;
+            need_changed = true;
+        }
+        let mut target = drag.raw_rect;
+        if self.enabled {
+            let inset = 4. * dpi;
+            let candidate = Pane {
+                rect: [
+                    target.left as f32 + inset,
+                    target.top as f32 + inset,
+                    target.right as f32 - inset,
+                    target.bottom as f32 - inset,
+                ],
+                ..pane_template
+            };
+            let d = snap_move(&candidate, &panes);
+            let sx = d[0].round() as i32;
+            let sy = d[1].round() as i32;
+            target.left += sx;
+            target.right += sx;
+            target.top += sy;
+            target.bottom += sy;
+        }
+        if need_changed {
+            self.changed();
+        }
+        Some((target, true))
+    }
+    unsafe fn step_drag_resize(
+        &mut self,
+        hwnd: HWND,
+        r: &mut RECT,
+        edge: u32,
+        minimum: [i32; 2],
+        cursor: POINT,
+    ) -> bool {
+        let active = [
+            matches!(edge, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT),
+            matches!(edge, HTTOP | HTTOPLEFT | HTTOPRIGHT),
+            matches!(edge, HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT),
+            matches!(edge, HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT),
+        ];
+        let mut need_changed = false;
+        let pane_template;
+        let dpi;
+        {
+            let Some(p) = self.members.get_mut(&(hwnd as usize)) else {
+                return true;
+            };
+            pane_template = p.pane;
+            dpi = p.pane.dpi;
+            if p.resizing {
+                if let Some(drag) = p.drag.as_mut() {
+                    if !drag.detached {
+                        let cur_dx = cursor.x - drag.anchor_cursor.x;
+                        let cur_dy = cursor.y - drag.anchor_cursor.y;
+                        let (dx, dy) = if cur_dx != 0 || cur_dy != 0 {
+                            (cur_dx, cur_dy)
+                        } else {
+                            let edge_dx = if active[0] {
+                                r.left - drag.anchor_rect.left
+                            } else if active[2] {
+                                r.right - drag.anchor_rect.right
+                            } else {
+                                0
+                            };
+                            let edge_dy = if active[1] {
+                                r.top - drag.anchor_rect.top
+                            } else if active[3] {
+                                r.bottom - drag.anchor_rect.bottom
+                            } else {
+                                0
+                            };
+                            (edge_dx, edge_dy)
+                        };
+                        if !exceeds_unfuse_threshold(dx, dy, dpi) {
+                            *r = drag.anchor_rect;
+                            return false;
+                        }
+                        drag.detached = true;
+                        if !p.moving {
+                            p.moving = true;
+                            need_changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if need_changed {
+            self.changed();
+        }
+        if !self.enabled {
+            return true;
+        }
+        let inset = 4. * dpi;
+        let candidate = Pane {
+            rect: [
+                r.left as f32 + inset,
+                r.top as f32 + inset,
+                r.right as f32 - inset,
+                r.bottom as f32 - inset,
+            ],
+            ..pane_template
+        };
+        let snapped = geometry::snap_resize(
+            &candidate,
+            &self.panes(),
+            active,
+            [
+                minimum[0] as f32 - 2. * inset,
+                minimum[1] as f32 - 2. * inset,
+            ],
+        );
+        let values = [
+            (snapped[0] - inset).round() as i32,
+            (snapped[1] - inset).round() as i32,
+            (snapped[2] + inset).round() as i32,
+            (snapped[3] + inset).round() as i32,
+        ];
+        if values[2] - values[0] >= minimum[0] {
+            if active[0] {
+                r.left = values[0];
+            }
+            if active[2] {
+                r.right = values[2];
+            }
+        }
+        if values[3] - values[1] >= minimum[1] {
+            if active[1] {
+                r.top = values[1];
+            }
+            if active[3] {
+                r.bottom = values[3];
+            }
+        }
+        true
+    }
+    unsafe fn end_drag(&mut self, hwnd: HWND) {
+        if let Some(p) = self.members.get_mut(&(hwnd as usize)) {
+            p.drag = None;
+            p.resizing = false;
+            if p.moving {
+                p.moving = false;
+                self.materials.remove(&(hwnd as usize));
+                self.update(hwnd, None);
+                self.changed();
+            }
         }
     }
 }
@@ -796,65 +1060,19 @@ pub fn frost_strength(hwnd: HWND, value: u8) {
 }
 /// Shared by native WM_SIZING and app-local captured resize handlers. The
 /// supplied limits belong to the widget, not its detached settings window.
-pub unsafe fn snap_resize_rect(hwnd: HWND, r: &mut RECT, edge: u32, minimum: [i32; 2]) {
+/// Returns `false` while a fused widget is still held below the unfuse drag threshold.
+pub unsafe fn snap_resize_rect(hwnd: HWND, r: &mut RECT, edge: u32, minimum: [i32; 2]) -> bool {
+    let mut cursor: POINT = zeroed();
+    GetCursorPos(&mut cursor);
     MANAGER.with(|manager| {
-        let Ok(manager) = manager.try_borrow() else {
-            return;
+        let Ok(mut manager) = manager.try_borrow_mut() else {
+            return true;
         };
-        let Some(manager) = manager.as_ref().filter(|s| s.enabled) else {
-            return;
+        let Some(manager) = manager.as_mut() else {
+            return true;
         };
-        let Some(member) = manager.members.get(&(hwnd as usize)) else {
-            return;
-        };
-        let inset = 4. * member.pane.dpi;
-        let candidate = Pane {
-            rect: [
-                r.left as f32 + inset,
-                r.top as f32 + inset,
-                r.right as f32 - inset,
-                r.bottom as f32 - inset,
-            ],
-            ..member.pane
-        };
-        let active = [
-            matches!(edge, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT),
-            matches!(edge, HTTOP | HTTOPLEFT | HTTOPRIGHT),
-            matches!(edge, HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT),
-            matches!(edge, HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT),
-        ];
-        let snapped = geometry::snap_resize(
-            &candidate,
-            &manager.panes(),
-            active,
-            [
-                minimum[0] as f32 - 2. * inset,
-                minimum[1] as f32 - 2. * inset,
-            ],
-        );
-        let values = [
-            (snapped[0] - inset).round() as i32,
-            (snapped[1] - inset).round() as i32,
-            (snapped[2] + inset).round() as i32,
-            (snapped[3] + inset).round() as i32,
-        ];
-        if values[2] - values[0] >= minimum[0] {
-            if active[0] {
-                r.left = values[0];
-            }
-            if active[2] {
-                r.right = values[2];
-            }
-        }
-        if values[3] - values[1] >= minimum[1] {
-            if active[1] {
-                r.top = values[1];
-            }
-            if active[3] {
-                r.bottom = values[3];
-            }
-        }
-    });
+        manager.step_drag_resize(hwnd, r, edge, minimum, cursor)
+    })
 }
 /// Both sides sample the same mix of their actual unblended chrome colors.
 pub unsafe fn shared_material(
@@ -1119,61 +1337,63 @@ unsafe extern "system" fn widget_proc(
                 ],
             );
         }
-        WM_ENTERSIZEMOVE | WM_NCLBUTTONDOWN => {
-            let drag = msg == WM_ENTERSIZEMOVE || (HTLEFT..=HTBOTTOMRIGHT).contains(&(wp as u32));
-            if drag {
+        WM_NCLBUTTONDOWN => {
+            if (HTLEFT..=HTBOTTOMRIGHT).contains(&(wp as u32)) {
+                let mut cursor: POINT = zeroed();
+                GetCursorPos(&mut cursor);
                 MANAGER.with(|m| {
                     if let Ok(mut x) = m.try_borrow_mut() {
                         if let Some(s) = x.as_mut() {
-                            if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
-                                p.snap_drag = None;
-                                if !p.moving {
-                                    p.moving = true;
-                                    s.changed();
-                                }
-                            }
+                            s.begin_resize(hwnd, cursor);
                         }
                     }
                 });
             }
         }
+        WM_ENTERSIZEMOVE => {
+            let mut cursor: POINT = zeroed();
+            GetCursorPos(&mut cursor);
+            MANAGER.with(|m| {
+                if let Ok(mut x) = m.try_borrow_mut() {
+                    if let Some(s) = x.as_mut() {
+                        s.begin_move_drag(hwnd, cursor);
+                    }
+                }
+            });
+        }
         WM_WINDOWPOSCHANGING => {
-            // Calendar and Dock also have capture-based drags. Snap those in
-            // the same physical-coordinate path as Windows' native move loop.
-            if GetCapture() == hwnd && !is_atomic_moving(hwnd) {
+            // Forward any capture-based SetWindowPos moves into the same
+            // shared drag threshold and snapping path.
+            if GetCapture() == hwnd
+                && !is_atomic_moving(hwnd)
+                && !IN_CAPTURED_MOVE.with(|f| f.get())
+            {
                 let pos = &mut *(lp as *mut WINDOWPOS);
                 if pos.flags & SWP_NOMOVE == 0 {
                     MANAGER.with(|m| {
                         if let Ok(mut x) = m.try_borrow_mut() {
                             if let Some(s) = x.as_mut() {
-                                if !s.enabled {
-                                    return;
-                                }
                                 if let Some(p) = s.members.get(&(hwnd as usize)).cloned() {
+                                    if p.drag.is_some_and(|d| d.native_moving) {
+                                        return;
+                                    }
                                     let w = p.window[2] - p.window[0];
                                     let h = p.window[3] - p.window[1];
                                     let moving =
                                         pos.flags & SWP_NOSIZE != 0 || (pos.cx == w && pos.cy == h);
                                     if moving && (pos.x != p.window[0] || pos.y != p.window[1]) {
-                                        if !p.moving {
-                                            if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
-                                                p.moving = true;
-                                            }
-                                            s.changed();
-                                        }
-                                        let inset = 4. * p.pane.dpi;
-                                        let candidate = Pane {
-                                            rect: [
-                                                pos.x as f32 + inset,
-                                                pos.y as f32 + inset,
-                                                (pos.x + w) as f32 - inset,
-                                                (pos.y + h) as f32 - inset,
-                                            ],
-                                            ..p.pane
+                                        let proposed = RECT {
+                                            left: pos.x,
+                                            top: pos.y,
+                                            right: pos.x + w,
+                                            bottom: pos.y + h,
                                         };
-                                        let d = snap_move(&candidate, &s.panes());
-                                        pos.x += d[0].round() as i32;
-                                        pos.y += d[1].round() as i32;
+                                        if let Some((target, _)) =
+                                            s.step_drag_move(hwnd, proposed, None)
+                                        {
+                                            pos.x = target.left;
+                                            pos.y = target.top;
+                                        }
                                     }
                                 }
                             }
@@ -1184,82 +1404,41 @@ unsafe extern "system" fn widget_proc(
         }
         WM_MOVING => {
             let r = &mut *(lp as *mut RECT);
+            let mut target = *r;
+            let mut should_move = true;
+            let mut cursor: POINT = zeroed();
+            GetCursorPos(&mut cursor);
             MANAGER.with(|m| {
                 if let Ok(mut x) = m.try_borrow_mut() {
                     if let Some(s) = x.as_mut() {
-                        if !s.enabled {
-                            return;
-                        }
-                        let panes = s.panes();
-                        if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
-                            let mut cursor: POINT = zeroed();
-                            GetCursorPos(&mut cursor);
-                            let raw = match &mut p.snap_drag {
-                                Some((raw, last)) => {
-                                    if cursor.x != last.x || cursor.y != last.y {
-                                        let dx = cursor.x - last.x;
-                                        let dy = cursor.y - last.y;
-                                        raw.left += dx;
-                                        raw.right += dx;
-                                        raw.top += dy;
-                                        raw.bottom += dy;
-                                        *last = cursor;
-                                    }
-                                    *raw
-                                }
-                                None => {
-                                    p.snap_drag = Some((*r, cursor));
-                                    *r
-                                }
-                            };
-                            let inset = 4. * p.pane.dpi;
-                            let moving = Pane {
-                                rect: [
-                                    raw.left as f32 + inset,
-                                    raw.top as f32 + inset,
-                                    raw.right as f32 - inset,
-                                    raw.bottom as f32 - inset,
-                                ],
-                                ..p.pane
-                            };
-                            let d = snap_move(&moving, &panes);
-                            let dx = d[0].round() as i32;
-                            let dy = d[1].round() as i32;
-                            r.left = raw.left + dx;
-                            r.right = raw.right + dx;
-                            r.top = raw.top + dy;
-                            r.bottom = raw.bottom + dy;
+                        if let Some((t, move_now)) = s.step_drag_move(hwnd, *r, Some(cursor)) {
+                            target = t;
+                            should_move = move_now;
                         }
                     }
                 }
             });
-            let target = *r;
-            if crate::gpu::is_gpu_window(hwnd) {
-                if crate::glass::move_paint_due(hwnd) {
-                    IN_WM_MOVING.with(|f| f.set(true));
-                    PENDING_MOVE.with(|p| p.set(Some((hwnd as usize, target))));
-                    InvalidateRect(hwnd, null(), 0);
-                    UpdateWindow(hwnd);
-                    PENDING_MOVE.with(|p| p.set(None));
-                    IN_WM_MOVING.with(|f| f.set(false));
+            *r = target;
+            if should_move {
+                if crate::gpu::is_gpu_window(hwnd) {
+                    if crate::glass::move_paint_due(hwnd) {
+                        IN_WM_MOVING.with(|f| f.set(true));
+                        PENDING_MOVE.with(|p| p.set(Some((hwnd as usize, target))));
+                        InvalidateRect(hwnd, null(), 0);
+                        UpdateWindow(hwnd);
+                        PENDING_MOVE.with(|p| p.set(None));
+                        IN_WM_MOVING.with(|f| f.set(false));
+                    }
+                } else {
+                    commit_atomic_move(hwnd, target);
                 }
-            } else {
-                commit_atomic_move(hwnd, target);
             }
         }
         WM_EXITSIZEMOVE | WM_CAPTURECHANGED | WM_CANCELMODE => {
             MANAGER.with(|m| {
                 if let Ok(mut x) = m.try_borrow_mut() {
                     if let Some(s) = x.as_mut() {
-                        if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
-                            p.snap_drag = None;
-                            if p.moving {
-                                p.moving = false;
-                                s.materials.remove(&(hwnd as usize));
-                                s.update(hwnd, None);
-                                s.changed();
-                            }
-                        }
+                        s.end_drag(hwnd);
                     }
                 }
             });
@@ -1961,8 +2140,12 @@ mod tests {
                 begin.elapsed().as_secs_f64() * 1000.
             );
             assert!(fused(windows[0]));
+            let mut moved = window_rect(windows[0]);
+            moved.left += 24;
+            moved.right += 24;
             let begin = std::time::Instant::now();
             SendMessageW(windows[0], WM_ENTERSIZEMOVE, 0, 0);
+            SendMessageW(windows[0], WM_MOVING, 0, &mut moved as *mut _ as isize);
             refresh();
             eprintln!(
                 "fusion-profile detach_ms={:.2}",
@@ -4090,6 +4273,328 @@ mod tests {
                 (ba - ma).abs() <= 16,
                 "concave fillet to member edge alpha handover must be smooth: bridge_a={ba}, music_a={ma}"
             );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn unfuse_drag_threshold_scales_with_dpi() {
+        assert!(!exceeds_unfuse_threshold(0, 0, 1.0));
+        assert!(!exceeds_unfuse_threshold(10, 0, 1.0));
+        assert!(!exceeds_unfuse_threshold(15, 0, 1.0));
+        assert!(!exceeds_unfuse_threshold(11, 11, 1.0));
+        assert!(exceeds_unfuse_threshold(16, 0, 1.0));
+        assert!(exceeds_unfuse_threshold(-16, 0, 1.0));
+        assert!(exceeds_unfuse_threshold(12, 12, 1.0));
+
+        assert!(!exceeds_unfuse_threshold(23, 0, 1.5));
+        assert!(exceeds_unfuse_threshold(24, 0, 1.5));
+    }
+
+    #[test]
+    fn fused_widget_requires_drag_distance_before_detaching_in_both_native_and_capture_paths() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            init(Rc::new(RefCell::new(Glass::new(12., 1.))));
+            let instance = GetModuleHandleW(null());
+            let mut windows = Vec::new();
+            for (x, y, w, h) in [(100, 100, 240, 208), (332, 100, 240, 208)] {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Lumen unfuse threshold test").as_ptr(),
+                    WS_POPUP,
+                    x - 20000,
+                    y - 20000,
+                    w,
+                    h,
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                MANAGER.with(|m| {
+                    m.borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .members
+                        .insert(hwnd as usize, read_member(hwnd, 30.));
+                });
+                SetWindowSubclass(hwnd, Some(widget_proc), SUBCLASS, 0);
+                windows.push(hwnd);
+            }
+            refresh();
+            assert!(fused(windows[0]));
+            assert!(fused(windows[1]));
+            let anchor = window_rect(windows[0]);
+            let dpi = (GetDpiForWindow(windows[0]) as f32 / 96.).max(1.);
+            let small_dx = (8. * dpi).round() as i32;
+            let small_dy = (6. * dpi).round() as i32;
+            let large_dx = (24. * dpi).round() as i32;
+
+            // 1. Native HTCAPTION / WM_ENTERSIZEMOVE + WM_MOVING path:
+            // Clicking/holding and dragging < 16 DIP keeps the widget fused and stationary.
+            SendMessageW(windows[0], WM_ENTERSIZEMOVE, 0, 0);
+            refresh();
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            let mut small = RECT {
+                left: anchor.left + small_dx,
+                top: anchor.top + small_dy,
+                right: anchor.right + small_dx,
+                bottom: anchor.bottom + small_dy,
+            };
+            SendMessageW(windows[0], WM_MOVING, 0, &mut small as *mut _ as isize);
+            refresh();
+            assert_eq!([small.left, small.top], [anchor.left, anchor.top]);
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            SendMessageW(windows[0], WM_EXITSIZEMOVE, 0, 0);
+            refresh();
+            assert!(fused(windows[0]));
+
+            // Dragging >= 16 DIP detaches and moves the widget cleanly.
+            SendMessageW(windows[0], WM_ENTERSIZEMOVE, 0, 0);
+            let mut large = RECT {
+                left: anchor.left - large_dx,
+                top: anchor.top,
+                right: anchor.right - large_dx,
+                bottom: anchor.bottom,
+            };
+            SendMessageW(windows[0], WM_MOVING, 0, &mut large as *mut _ as isize);
+            refresh();
+            assert!(!fused(windows[0]));
+            assert!(is_moving(windows[0]));
+            assert_eq!(large.left, anchor.left - large_dx);
+            SendMessageW(windows[0], WM_EXITSIZEMOVE, 0, 0);
+            assert!(!is_moving(windows[0]));
+
+            // Restore position to re-fuse both widgets for the capture-based test.
+            SetWindowPos(
+                windows[0],
+                null_mut(),
+                anchor.left,
+                anchor.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            refresh();
+            assert!(fused(windows[0]));
+
+            // 2. Capture-based drag path (Calendar / Controls):
+            // Dragging < 16 DIP keeps the widget fused and stationary.
+            let small_cap = RECT {
+                left: anchor.left + small_dx,
+                top: anchor.top + small_dy,
+                right: anchor.right + small_dx,
+                bottom: anchor.bottom + small_dy,
+            };
+            move_captured_widget(windows[0], small_cap);
+            refresh();
+            let after_small = window_rect(windows[0]);
+            assert_eq!([after_small.left, after_small.top], [anchor.left, anchor.top]);
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            // Dragging >= 16 DIP detaches and moves the captured widget.
+            let large_cap = RECT {
+                left: anchor.left - large_dx,
+                top: anchor.top,
+                right: anchor.right - large_dx,
+                bottom: anchor.bottom,
+            };
+            move_captured_widget(windows[0], large_cap);
+            refresh();
+            let after_large = window_rect(windows[0]);
+            assert_eq!(after_large.left, anchor.left - large_dx);
+            assert!(!fused(windows[0]));
+            assert!(is_moving(windows[0]));
+
+            SendMessageW(windows[0], WM_CAPTURECHANGED, 0, 0);
+            assert!(!is_moving(windows[0]));
+
+            // 3. Standalone (unfused) widget still moves immediately on small drags.
+            assert!(!fused(windows[0]));
+            let solo_rect = window_rect(windows[0]);
+            let solo_step = RECT {
+                left: solo_rect.left - 6,
+                top: solo_rect.top,
+                right: solo_rect.right - 6,
+                bottom: solo_rect.bottom,
+            };
+            move_captured_widget(windows[0], solo_step);
+            let after_solo = window_rect(windows[0]);
+            assert_eq!(after_solo.left, solo_rect.left - 6);
+            SendMessageW(windows[0], WM_CAPTURECHANGED, 0, 0);
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn fused_widget_requires_drag_distance_before_detaching_on_resize() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            init(Rc::new(RefCell::new(Glass::new(12., 1.))));
+            let instance = GetModuleHandleW(null());
+            let mut windows = Vec::new();
+            for (x, y, w, h) in [(100, 100, 240, 208), (332, 100, 240, 208)] {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Lumen unfuse resize threshold test").as_ptr(),
+                    WS_POPUP,
+                    x - 20000,
+                    y - 20000,
+                    w,
+                    h,
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                MANAGER.with(|m| {
+                    m.borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .members
+                        .insert(hwnd as usize, read_member(hwnd, 30.));
+                });
+                SetWindowSubclass(hwnd, Some(widget_proc), SUBCLASS, 0);
+                windows.push(hwnd);
+            }
+            refresh();
+            assert!(fused(windows[0]));
+            assert!(fused(windows[1]));
+            let anchor = window_rect(windows[0]);
+            let dpi = (GetDpiForWindow(windows[0]) as f32 / 96.).max(1.);
+            let small_dx = (8. * dpi).round() as i32;
+            let large_dx = (24. * dpi).round() as i32;
+            let min_size = [(160. * dpi).round() as i32, (112. * dpi).round() as i32];
+
+            // 1. Native WM_NCLBUTTONDOWN(HTRIGHT) + WM_ENTERSIZEMOVE + WM_SIZING path:
+            // Clicking/holding border and dragging < 16 DIP keeps widget fused and unresized.
+            SendMessageW(windows[0], WM_NCLBUTTONDOWN, HTRIGHT as usize, 0);
+            SendMessageW(windows[0], WM_ENTERSIZEMOVE, 0, 0);
+            refresh();
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            let mut small_sizing = RECT {
+                left: anchor.left,
+                top: anchor.top,
+                right: anchor.right + small_dx,
+                bottom: anchor.bottom,
+            };
+            SendMessageW(
+                windows[0],
+                WM_SIZING,
+                WMSZ_RIGHT as usize,
+                &mut small_sizing as *mut _ as isize,
+            );
+            refresh();
+            assert_eq!(small_sizing.right, anchor.right);
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            SendMessageW(windows[0], WM_EXITSIZEMOVE, 0, 0);
+            refresh();
+            assert!(fused(windows[0]));
+
+            // Dragging border >= 16 DIP detaches and allows resize.
+            SendMessageW(windows[0], WM_NCLBUTTONDOWN, HTRIGHT as usize, 0);
+            SendMessageW(windows[0], WM_ENTERSIZEMOVE, 0, 0);
+            let mut large_sizing = RECT {
+                left: anchor.left,
+                top: anchor.top,
+                right: anchor.right + large_dx,
+                bottom: anchor.bottom,
+            };
+            SendMessageW(
+                windows[0],
+                WM_SIZING,
+                WMSZ_RIGHT as usize,
+                &mut large_sizing as *mut _ as isize,
+            );
+            refresh();
+            assert_eq!(large_sizing.right, anchor.right + large_dx);
+            assert!(!fused(windows[0]));
+            assert!(is_moving(windows[0]));
+            SendMessageW(windows[0], WM_EXITSIZEMOVE, 0, 0);
+            assert!(!is_moving(windows[0]));
+
+            // 2. Captured resize (WM_NCLBUTTONDOWN + snap_resize_rect) path (Dock / Calendar / Controls):
+            refresh();
+            assert!(fused(windows[0]));
+            SendMessageW(windows[0], WM_NCLBUTTONDOWN, HTRIGHT as usize, 0);
+            refresh();
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            let mut small_cap = RECT {
+                left: anchor.left,
+                top: anchor.top,
+                right: anchor.right + small_dx,
+                bottom: anchor.bottom,
+            };
+            assert!(!snap_resize_rect(windows[0], &mut small_cap, HTRIGHT, min_size));
+            refresh();
+            assert_eq!(small_cap.right, anchor.right);
+            assert!(fused(windows[0]));
+            assert!(!is_moving(windows[0]));
+
+            let mut large_cap = RECT {
+                left: anchor.left,
+                top: anchor.top,
+                right: anchor.right + large_dx,
+                bottom: anchor.bottom,
+            };
+            assert!(snap_resize_rect(windows[0], &mut large_cap, HTRIGHT, min_size));
+            refresh();
+            assert_eq!(large_cap.right, anchor.right + large_dx);
+            assert!(!fused(windows[0]));
+            assert!(is_moving(windows[0]));
+
+            SendMessageW(windows[0], WM_CAPTURECHANGED, 0, 0);
+            assert!(!is_moving(windows[0]));
+
+            // 3. Standalone (unfused) widget resizes immediately on small drags.
+            SetWindowPos(
+                windows[0],
+                null_mut(),
+                anchor.left - 400,
+                anchor.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            refresh();
+            assert!(!fused(windows[0]));
+            let solo_anchor = window_rect(windows[0]);
+            SendMessageW(windows[0], WM_NCLBUTTONDOWN, HTRIGHT as usize, 0);
+            let mut solo_resize = RECT {
+                left: solo_anchor.left,
+                top: solo_anchor.top,
+                right: solo_anchor.right + 6,
+                bottom: solo_anchor.bottom,
+            };
+            assert!(snap_resize_rect(windows[0], &mut solo_resize, HTRIGHT, min_size));
+            assert_eq!(solo_resize.right, solo_anchor.right + 6);
+            SendMessageW(windows[0], WM_CAPTURECHANGED, 0, 0);
 
             for hwnd in windows {
                 DestroyWindow(hwnd);

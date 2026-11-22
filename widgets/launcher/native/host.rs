@@ -64,6 +64,7 @@ const PIN_TIMER: usize = 1;
 const SMOKE_TIMER: usize = 2;
 const UPDATE_CHECK_TIMER: usize = 6;
 const UPDATE_PROGRESS_TIMER: usize = 7;
+const TRAY_RETRY_TIMER: usize = 8;
 const CMD_ADD: u32 = 10;
 const CMD_PC: u32 = 11;
 const CMD_BIN: u32 = 12;
@@ -481,8 +482,8 @@ impl App {
                 (min[1] as f32 * scale) as i32,
             ],
         );
-        if hwnd == self.hwnd {
-            crate::fusion::snap_resize_rect(
+        if hwnd == self.hwnd
+            && !crate::fusion::snap_resize_rect(
                 hwnd,
                 &mut r,
                 drag.edge,
@@ -490,7 +491,9 @@ impl App {
                     (min[0] as f32 * scale) as i32,
                     (min[1] as f32 * scale) as i32,
                 ],
-            );
+            )
+        {
+            return;
         }
         self.pending_resize = Some(r);
         self.apply_resize();
@@ -954,19 +957,20 @@ impl App {
         }
     }
     unsafe fn context_menu(&mut self, hwnd: HWND, x: i32, y: i32, item: Option<usize>) {
-        if item.is_none() {
+        let Some(index) = item else {
+            self.close_popup(hwnd);
             return;
-        }
+        };
         let mut point = POINT { x, y };
         ScreenToClient(hwnd, &mut point);
-        if let Some(index) = item {
-            if let Some(item) = self.dock.items.get(index) {
-                self.open_popup(
-                    hwnd,
-                    popup::Kind::Item(item.id.clone()),
-                    [point.x as f32 / self.dpi, point.y as f32 / self.dpi],
-                );
-            }
+        if let Some(item) = self.dock.items.get(index) {
+            self.open_popup(
+                hwnd,
+                popup::Kind::Item(item.id.clone()),
+                [point.x as f32 / self.dpi, point.y as f32 / self.dpi],
+            );
+        } else {
+            self.close_popup(hwnd);
         }
     }
     unsafe fn context_command(&mut self, hwnd: HWND, result: u32, item: Option<usize>) {
@@ -2085,6 +2089,23 @@ unsafe extern "system" fn search_proc(
             }
         }
     }
+    if message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN {
+        let pointer = GetWindowLongPtrW(parent as HWND, GWLP_USERDATA) as *const RefCell<App>;
+        if !pointer.is_null() {
+            if let Ok(mut app) = (*pointer).try_borrow_mut() {
+                if app.popup.is_some() {
+                    let (x, y) = xy(lparam);
+                    let mut pt = POINT { x, y };
+                    MapWindowPoints(hwnd, parent as HWND, &mut pt, 1);
+                    let p = [pt.x as f32 / app.dpi, pt.y as f32 / app.dpi];
+                    if app.popup.as_ref().is_some_and(|popup| popup.inside(p)) {
+                        return 0;
+                    }
+                    app.close_popup(parent as HWND);
+                }
+            }
+        }
+    }
     let result = DefSubclassProc(hwnd, message, wparam, lparam);
     if matches!(
         message,
@@ -2212,7 +2233,15 @@ unsafe extern "system" fn wndproc(
                 },
             );
             DragAcceptFiles(hwnd, 1);
+            if app.taskbar_created != 0 {
+                ChangeWindowMessageFilterEx(hwnd, app.taskbar_created, MSGFLT_ALLOW, null_mut());
+            }
+            ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, null_mut());
+            ChangeWindowMessageFilterEx(hwnd, 0x0049, MSGFLT_ALLOW, null_mut());
             app.tray = crate::tray::Tray::new(hwnd, &app.root);
+            if app.tray.as_ref().is_some_and(|t| !t.is_registered()) {
+                SetTimer(hwnd, TRAY_RETRY_TIMER, 1500, None);
+            }
             let yes = 1u32;
             DwmSetWindowAttribute(hwnd, 11, &yes as *const _ as _, 4);
             DwmSetWindowAttribute(hwnd, 12, &yes as *const _ as _, 4);
@@ -2246,8 +2275,15 @@ unsafe extern "system" fn wndproc(
             0
         }
         message if message == app.taskbar_created && message != 0 => {
-            if let Some(tray) = &app.tray {
-                tray.add();
+            if let Some(tray) = &mut app.tray {
+                if tray.add() {
+                    KillTimer(hwnd, TRAY_RETRY_TIMER);
+                }
+            } else {
+                app.tray = crate::tray::Tray::new(hwnd, &app.root);
+                if app.tray.as_ref().is_some_and(|t| t.is_registered()) {
+                    KillTimer(hwnd, TRAY_RETRY_TIMER);
+                }
             }
             0
         }
@@ -2336,6 +2372,7 @@ unsafe extern "system" fn wndproc(
                         host.start_update_check();
                         Vec::new()
                     };
+                    host.scroll_to_updates();
                     (acts, host.is_updating())
                 } else {
                     (Vec::new(), false)
@@ -2439,6 +2476,10 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
+        WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN if app.popup.is_some() => {
+            app.close_popup(hwnd);
+            0
+        }
         WM_NCLBUTTONDOWN if (HTLEFT..=HTBOTTOMRIGHT).contains(&(wparam as u32)) => {
             app.start_resize(hwnd, wparam as u32, lparam);
             0
@@ -2512,6 +2553,12 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
+        WM_ACTIVATE => {
+            if (wparam & 0xffff) == WA_INACTIVE as usize {
+                app.close_popup(hwnd);
+            }
+            0
+        }
         WM_CANCELMODE | WM_KILLFOCUS => {
             if app.resize_drag.take().is_some() {
                 app.pending_resize = None;
@@ -2522,7 +2569,7 @@ unsafe extern "system" fn wndproc(
                 selection.pressed = None;
             }
             if !app.popup.as_ref().is_some_and(|p| p.edit == wparam as HWND) {
-                app.popup = None;
+                app.close_popup(hwnd);
             }
             app.cancel_pointer(hwnd);
             if message == WM_CANCELMODE {
@@ -2561,6 +2608,15 @@ unsafe extern "system" fn wndproc(
                 app.px(10),
                 app.px(40),
             );
+            if let Some(popup) = &app.popup {
+                let client_p = [
+                    (x - rect.left) as f32 / app.dpi,
+                    (y - rect.top) as f32 / app.dpi,
+                ];
+                if popup.inside(client_p) {
+                    return HTCLIENT as isize;
+                }
+            }
             if edge != HTCLIENT {
                 return edge as isize;
             }
@@ -2765,14 +2821,36 @@ unsafe extern "system" fn wndproc(
             if app.popup_wheel(hwnd, delta) {
                 return 0;
             }
-            let pointer = app.pointer;
-            app.hover = None;
-            app.motion.hover(None, pointer, now);
-            app.motion.group_target(None, now);
+            let (sx, sy) = xy(lparam);
+            let mut pt = POINT { x: sx, y: sy };
+            ScreenToClient(hwnd, &mut pt);
+            let dpi = app.dpi;
+            let (w, h) = app.dimensions(hwnd);
+            let client_p = [pt.x as f32 / dpi, pt.y as f32 / dpi];
+            let pointer = if client_p[0] >= 0.
+                && client_p[1] >= 0.
+                && client_p[0] < w as f32
+                && client_p[1] < h as f32
+            {
+                client_p
+            } else {
+                app.pointer
+            };
             app.scroll.by(-(delta as f32) / 120. * 72., now);
+            if app.tile_drag.is_none() && app.bar_drag.is_none() && pointer[0] >= 0. {
+                app.hover_tile(hwnd, pointer);
+            }
             app.arm_motion(hwnd);
             if !app.frame_queued {
                 InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_RBUTTONDOWN if app.popup.is_some() => {
+            let (x, y) = xy(lparam);
+            let p = [x as f32 / app.dpi, y as f32 / app.dpi];
+            if app.popup.as_ref().is_some_and(|popup| !popup.inside(p)) {
+                app.close_popup(hwnd);
             }
             0
         }
@@ -2793,12 +2871,12 @@ unsafe extern "system" fn wndproc(
             } else {
                 let mut point = POINT { x, y };
                 ScreenToClient(hwnd, &mut point);
-                app.hit(
-                    hwnd,
-                    (point.x as f32 / app.dpi) as i32,
-                    (point.y as f32 / app.dpi) as i32,
-                )
-                .and_then(|pos| app.visible(hwnd).get(pos).copied())
+                let client_p = [point.x as f32 / app.dpi, point.y as f32 / app.dpi];
+                if app.popup.as_ref().is_some_and(|p| p.inside(client_p)) {
+                    return 0;
+                }
+                app.hit(hwnd, client_p[0] as i32, client_p[1] as i32)
+                    .and_then(|pos| app.visible(hwnd).get(pos).copied())
             };
             app.context_menu(hwnd, x, y, item);
             0
@@ -2987,6 +3065,19 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
+        WM_TIMER if wparam == TRAY_RETRY_TIMER => {
+            if let Some(tray) = &mut app.tray {
+                if tray.is_registered() || tray.add() {
+                    KillTimer(hwnd, TRAY_RETRY_TIMER);
+                }
+            } else {
+                app.tray = crate::tray::Tray::new(hwnd, &app.root);
+                if app.tray.as_ref().is_some_and(|t| t.is_registered()) {
+                    KillTimer(hwnd, TRAY_RETRY_TIMER);
+                }
+            }
+            0
+        }
         WM_TIMER if wparam == SMOKE_TIMER => {
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
             0
@@ -3023,6 +3114,7 @@ unsafe extern "system" fn wndproc(
             KillTimer(hwnd, SMOKE_TIMER);
             KillTimer(hwnd, UPDATE_CHECK_TIMER);
             KillTimer(hwnd, UPDATE_PROGRESS_TIMER);
+            KillTimer(hwnd, TRAY_RETRY_TIMER);
             for id in [MOTION_TIMER, LAUNCH_TIMER, CARET_TIMER] {
                 KillTimer(hwnd, id);
             }

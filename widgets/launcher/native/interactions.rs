@@ -299,6 +299,7 @@ impl App {
         self.pending_launch = Some(id);
         SetTimer(hwnd, LAUNCH_TIMER, 32, None);
         self.arm_motion(hwnd);
+        InvalidateRect(hwnd, null(), 0);
     }
     pub(super) unsafe fn motion_tick(&mut self, hwnd: HWND) {
         let now = self.now();
@@ -321,7 +322,12 @@ impl App {
                 self.pointer_move(hwnd, p);
             }
         }
-        if !self.scroll.moving(now) && self.tile_drag.is_none() && self.hover.is_none() && self.pointer[0] >= 0. {
+        if self.tile_drag.is_none()
+            && self.bar_drag.is_none()
+            && self.popup.is_none()
+            && self.pointer[0] >= 0.
+            && (self.scroll.moving(now) || self.hover.is_none())
+        {
             self.hover_tile(hwnd, self.pointer);
         }
         let active = self.motion.tick(now)
@@ -841,9 +847,14 @@ impl App {
             );
             p.text = ink;
             p.muted = muted;
-            let selected = self.keyboard_selection && self.selected == pos;
+            let popup_selected = self
+                .popup
+                .as_ref()
+                .and_then(popup::Popup::target_item_id)
+                == Some(id.as_str());
+            let selected = (self.keyboard_selection && self.selected == pos) || popup_selected;
             let scrolling = self.scroll.moving(now);
-            let hover = if self.resize_drag.is_some() || scrolling {
+            let hover = if self.resize_drag.is_some() {
                 0.
             } else {
                 visual.hover.max(if selected { 1. } else { 0. })
@@ -857,6 +868,11 @@ impl App {
                 if !batch.hover_glow(r, 20., visual.pointer, glow_alpha) {
                     Canvas::new(dc, self.dpi).glow(r, 20., visual.pointer, 0xffffff, glow_alpha);
                 }
+            }
+            if popup_selected {
+                let c = Canvas::new(dc, self.dpi);
+                c.round(r, 20., accent, 24, false, false);
+                c.round(r, 20., accent, 155, true, false);
             }
             if visual.launch > 0.001 {
                 let c = Canvas::new(dc, self.dpi);
@@ -996,12 +1012,12 @@ impl App {
                 Some(&batch),
                 &item,
                 r,
-                if self.group_selection.is_some() || scrolling {
+                if self.group_selection.is_some() {
                     1.
                 } else {
                     visual.scale
                 },
-                if self.group_selection.is_some() || scrolling {
+                if self.group_selection.is_some() {
                     0.
                 } else {
                     visual.lift
@@ -1062,6 +1078,77 @@ impl App {
                     true,
                     rotation,
                 );
+            }
+        }
+        if let Some((id, frame)) = self
+            .motion
+            .launch_frame(now)
+            .map(|(id, frame)| (id.to_owned(), frame))
+        {
+            if frame.alpha > 0.001 {
+                let origin = self
+                    .motion
+                    .nodes
+                    .get(&id)
+                    .map(|n| [n.x.sample(now), n.y.sample(now)])
+                    .or_else(|| {
+                        let columns = self.columns(hwnd);
+                        self.visible(hwnd)
+                            .iter()
+                            .position(|idx| self.dock.items[*idx].id == id)
+                            .map(|pos| {
+                                [
+                                    (16 + pos as i32 % columns as i32 * cell) as f32,
+                                    (self.grid_top() + (pos / columns) as i32 * row) as f32,
+                                ]
+                            })
+                    });
+                if let (Some([x, content_y]), Some(item)) = (
+                    origin,
+                    self.dock.items.iter().find(|i| i.id == id).cloned(),
+                ) {
+                    let scroll = self.scroll.value(now);
+                    let cx = x + (cell as f32 - 6.) * 0.5;
+                    let cy = (content_y - scroll) + 8. + self.dock.icon_size as f32 * 0.5;
+                    let size = self.dock.icon_size as f32 * frame.scale;
+                    let icon_rect = [
+                        cx - size * 0.5,
+                        cy - size * 0.5,
+                        cx + size * 0.5,
+                        cy + size * 0.5,
+                    ];
+                    let canvas = Canvas::new(dc, self.dpi);
+                    if let Some(image) = self
+                        .icons
+                        .get(&item.id)
+                        .and_then(|icon| match icon {
+                            Icon::Image(img) => Some(img),
+                            _ => None,
+                        })
+                        .or_else(|| self.scaled_icons.get(&item.id).map(|(_, img)| img))
+                    {
+                        canvas.image_cpu_alpha(image, icon_rect, frame.alpha);
+                    } else {
+                        let ink = palette(self.dock.light).text;
+                        canvas.round(
+                            icon_rect,
+                            12. * frame.scale,
+                            ink,
+                            (25. * frame.alpha).round() as u8,
+                            false,
+                            false,
+                        );
+                        canvas.text_alpha(
+                            &item.name.chars().next().unwrap_or('·').to_string(),
+                            icon_rect,
+                            size * 0.5,
+                            true,
+                            ink,
+                            1,
+                            (255. * frame.alpha).round() as u8,
+                        );
+                    }
+                }
             }
         }
     }

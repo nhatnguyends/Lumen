@@ -294,6 +294,10 @@ impl Host {
         self.update_rows();
         self.ui.show();
     }
+    pub unsafe fn scroll_to_updates(&mut self) {
+        self.update_rows();
+        self.ui.scroll_to_section("Updates");
+    }
     pub unsafe fn hide(&mut self) {
         self.ui.hide();
     }
@@ -821,6 +825,12 @@ mod tests {
             ]);
             assert_eq!(actions, Vec::<Action>::new());
             assert!(!crate::fusion::enabled());
+            host.scroll_to_updates();
+            let updates_scroll = host.ui.scroll_offset();
+            assert!(
+                updates_scroll > 0.,
+                "expected scroll_to_updates to scroll down to Updates section, got {updates_scroll}"
+            );
             host.hide();
             drop(host);
             crate::fusion::shutdown();

@@ -22,12 +22,16 @@ the executable. Start with Windows defaults on and can be disabled in General
 Settings. Launch once after moving the folder to refresh the startup path.
 
 General Settings > Updates checks official stable releases, downloads and
-verifies the portable ZIP, then restarts to apply it. Network work runs away from
+verifies the portable ZIP, then restarts to apply it. Clicking **Update** in
+the system tray menu opens General Settings scrolled directly to the Updates
+section. Network work runs away from
 the UI thread. Updates preserve `config/` and keep file backups in
 `config/updates/`. Modified app files cause an update to stop rather than overwrite
 local edits. GitHub HTTPS release metadata/digests provide integrity; this is not
 an independently signed update feed. All six native widget implementations
 currently update together with Lumen. Independent binary plugins remain planned.
+Tray registration and startup tasks handle Explorer restarts and medium-integrity
+shell launch cleanly across both standard and elevated sessions.
 
 ## Optional Python launch (portable)
 
@@ -58,7 +62,17 @@ YouTube Music playback runs natively in Rust against an owned Chrome or Edge pro
 
 Open the native tray menu to show the widget manager. Every widget has an On/Off
 switch and independent settings. Appearance, size and position are remembered.
+Widgets snap and fuse smoothly when moved or resized adjacent to one another; a
+shared drag-to-unfuse threshold (`16` DIP) prevents accidental separation on brief
+clicks when dragging a widget or grabbing a fused border to resize.
 Packages live in `widgets/<id>/native/`; see [package development](widgets/README.md).
+
+App Dock preserves live cursor hover highlights during 120Hz scrolling, keeps
+the right-clicked tile visibly selected while its context menu is open, dismisses
+context menus cleanly on any outside click, offers a **Copy** command for real
+files, folders and shortcuts (omitted for virtual shell locations such as Recycle
+Bin or This PC and Store apps), and animates launched icons with a curved 200%
+zoom-and-fade burst.
 
 Control Center groups displays, audio outputs and microphones into one control
 per family. Device names lead each row; newly connected devices appear in the

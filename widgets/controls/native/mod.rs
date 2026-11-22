@@ -3729,8 +3729,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     drop(s);
                     crate::fusion::move_captured_widget(hwnd, r);
                 } else {
-                    crate::fusion::snap_resize_rect(hwnd, &mut r, edge, min);
                     drop(s);
+                    if !crate::fusion::snap_resize_rect(hwnd, &mut r, edge, min) {
+                        return 0;
+                    }
                     SetWindowPos(
                         hwnd,
                         null_mut(),

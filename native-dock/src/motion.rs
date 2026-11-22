@@ -366,6 +366,18 @@ impl Node {
         }
     }
 }
+pub const LAUNCH_DURATION_MS: f64 = 420.;
+pub const LAUNCH_MAX_SCALE: f32 = 2.0; // 200%
+pub const LAUNCH_SCALE_CURVE: [f32; 4] = [0.16, 1.0, 0.3, 1.0];
+pub const LAUNCH_FADE_CURVE: [f32; 4] = [0.4, 0.0, 0.2, 1.0];
+
+#[derive(Clone, Copy, Debug)]
+pub struct LaunchFrame {
+    pub progress: f32,
+    pub scale: f32,
+    pub alpha: f32,
+}
+
 #[derive(Clone, Copy)]
 pub struct Visual {
     pub position: Point,
@@ -397,7 +409,7 @@ pub struct Motion {
     pub hovered: Option<String>,
     pub pressed: Option<String>,
     pub landing: Option<Landing>,
-    pub launching: Option<(String, f64, f64)>,
+    pub launching: Option<(String, f64)>,
     pub group: HashMap<String, Tween>,
     pub timer_running: bool,
     pub clock: Option<FrameClock>,
@@ -541,25 +553,32 @@ impl Motion {
         self.group.get(id).map_or(0., |t| t.sample(now))
     }
     pub fn launch(&mut self, id: String, now: f64) {
-        self.launching = Some((id, now, now + 280.));
+        self.launching = Some((id, now));
     }
-    pub fn launch_finished(&mut self, now: f64) {
-        if let Some((_, _, end)) = &mut self.launching {
-            *end = now + 280.;
+    pub fn launch_finished(&mut self, _now: f64) {}
+    pub fn launch_frame(&self, now: f64) -> Option<(&str, LaunchFrame)> {
+        let (id, start) = self.launching.as_ref()?;
+        let elapsed = now - *start;
+        if elapsed < 0. || elapsed >= LAUNCH_DURATION_MS {
+            return None;
         }
+        let progress = (elapsed / LAUNCH_DURATION_MS).clamp(0., 1.) as f32;
+        let scale_t = bezier(progress, LAUNCH_SCALE_CURVE);
+        let fade_t = bezier(progress, LAUNCH_FADE_CURVE);
+        Some((
+            id.as_str(),
+            LaunchFrame {
+                progress,
+                scale: 1.0 + (LAUNCH_MAX_SCALE - 1.0) * scale_t,
+                alpha: (1.0 - fade_t).clamp(0.0, 1.0),
+            },
+        ))
     }
     pub fn visual(&self, id: &str, fallback: Point, now: f64) -> Visual {
         let launch = self
-            .launching
-            .as_ref()
-            .filter(|(key, _, _)| key == id)
-            .map_or(0., |(_, start, end)| {
-                if now < *end {
-                    ((now - start) / 60.).clamp(0., 1.) as f32
-                } else {
-                    (1. - (now - end) / 200.).clamp(0., 1.) as f32
-                }
-            });
+            .launch_frame(now)
+            .filter(|(key, _)| *key == id)
+            .map_or(0., |(_, f)| f.alpha);
         if let Some(n) = self.nodes.get(id) {
             Visual {
                 position: [n.x.sample(now), n.y.sample(now)],
@@ -589,7 +608,7 @@ impl Motion {
         if self
             .launching
             .as_ref()
-            .is_some_and(|(_, _, end)| now >= end + 200.)
+            .is_some_and(|(_, start)| now >= *start + LAUNCH_DURATION_MS)
         {
             self.launching = None;
         }
@@ -798,5 +817,31 @@ mod tests {
         assert!(frame_interval_ms() <= 16);
         set_low_power(false);
         assert_eq!(frame_interval_ms(), 10);
+    }
+    #[test]
+    fn launch_scales_to_two_x_and_fades_along_curves() {
+        let mut m = Motion::default();
+        m.launch("app".into(), 100.);
+
+        let (_, start) = m.launch_frame(100.).expect("frame at start");
+        assert!((start.scale - 1.0).abs() < 0.0001);
+        assert!((start.alpha - 1.0).abs() < 0.0001);
+
+        let mid_time = 100. + LAUNCH_DURATION_MS * 0.5;
+        let (_, mid) = m.launch_frame(mid_time).expect("frame at midpoint");
+        assert!(mid.scale > 1.5 && mid.scale < LAUNCH_MAX_SCALE);
+        assert!(mid.alpha > 0.0 && mid.alpha < 1.0);
+        assert!(m.tick(mid_time));
+
+        let (_, near_end) = m
+            .launch_frame(100. + LAUNCH_DURATION_MS - 0.1)
+            .expect("frame just before completion");
+        assert!(near_end.scale > 1.98 && near_end.scale <= LAUNCH_MAX_SCALE);
+        assert!(near_end.alpha < 0.02 && near_end.alpha >= 0.0);
+
+        let end_time = 100. + LAUNCH_DURATION_MS;
+        assert!(m.launch_frame(end_time).is_none());
+        assert!(!m.tick(end_time));
+        assert!(m.launching.is_none());
     }
 }

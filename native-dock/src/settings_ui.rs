@@ -367,6 +367,34 @@ impl Host {
             }
         }
     }
+    pub unsafe fn scroll_to_section(&mut self, title: &str) {
+        let mut s = self.state.borrow_mut();
+        let Some(idx) = s
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Section(t) if t == title))
+        else {
+            return;
+        };
+        let [w, h] = s.size();
+        let layout = row_layout(&s.rows, w);
+        let Some(rect) = layout.get(idx) else {
+            return;
+        };
+        let max = (s.content_height(w) - h + 18.).max(0.);
+        let target = (rect[1] - 64.).clamp(0., max);
+        s.scroll = target;
+        s.smooth_scroll.snap(target);
+        KillTimer(s.hwnd, 1);
+        s.scroll_clock = None;
+        if IsWindowVisible(s.hwnd) != 0 {
+            InvalidateRect(s.hwnd, null(), 0);
+        }
+    }
+    #[cfg(test)]
+    pub fn scroll_offset(&self) -> f32 {
+        self.state.borrow().scroll
+    }
     pub fn set_surface(&mut self, _color: u32, _light: bool) {
         let mut s = self.state.borrow_mut();
         let fixed = 0x24201e;

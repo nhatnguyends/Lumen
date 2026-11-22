@@ -14,6 +14,7 @@ pub(super) enum Action {
     Folder,
     System(bool),
     Open(String),
+    Copy(String),
     EmptyRecycleBin(String),
     Rename(String),
     Icon(String),
@@ -75,8 +76,14 @@ impl Popup {
         let index = row + self.scroll;
         (row < self.slots && index < self.rows.len() && self.rows[index].enabled).then_some(index)
     }
-    fn inside(&self, p: [f32; 2]) -> bool {
+    pub(super) fn inside(&self, p: [f32; 2]) -> bool {
         p[0] >= self.rect[0] && p[0] <= self.rect[2] && p[1] >= self.rect[1] && p[1] <= self.rect[3]
+    }
+    pub(super) fn target_item_id(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Item(id) | Kind::Rename(id) => Some(id.as_str()),
+            Kind::Add => None,
+        }
     }
     fn retarget_hover(&mut self, now: f64) {
         const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.];
@@ -177,6 +184,9 @@ impl App {
                     }
                     .into();
                     push("Open", Action::Open(id.clone()), 1, true, false);
+                    if is_copyable_item(item) {
+                        push("Copy", Action::Copy(id.clone()), 4, true, false);
+                    }
                     if item.target.eq_ignore_ascii_case("shell:RecycleBinFolder") {
                         push(
                             "Empty Recycle Bin",
@@ -292,16 +302,24 @@ impl App {
         }
         self.arm_motion(hwnd);
     }
+    pub(super) unsafe fn close_popup(&mut self, hwnd: HWND) -> bool {
+        if self.popup.take().is_some() {
+            self.arm_motion(hwnd);
+            InvalidateRect(hwnd, null(), 0);
+            true
+        } else {
+            false
+        }
+    }
     pub(super) unsafe fn popup_down(&mut self, hwnd: HWND, p: [f32; 2]) -> bool {
         let now = self.now();
+        if self.popup.as_ref().is_some_and(|popup| !popup.inside(p)) {
+            self.close_popup(hwnd);
+            return true;
+        }
         let Some(popup) = &mut self.popup else {
             return false;
         };
-        if !popup.inside(p) {
-            self.popup = None;
-            self.arm_motion(hwnd);
-            return true;
-        }
         if !popup.edit.is_null() {
             if p[1] >= popup.rect[1] + 110. {
                 popup.pressed = Some(0);
@@ -382,9 +400,8 @@ impl App {
             return false;
         };
         if key == 27 {
-            self.popup = None;
+            self.close_popup(hwnd);
             SetFocus(hwnd);
-            self.arm_motion(hwnd);
             return true;
         }
         if key == 13 {
@@ -442,6 +459,15 @@ impl App {
             Action::Open(id) => {
                 if let Some(i) = self.dock.items.iter().position(|i| i.id == id) {
                     self.launch(hwnd, i);
+                }
+            }
+            Action::Copy(id) => {
+                if let Some(item) = self.dock.items.iter().find(|i| i.id == id).cloned() {
+                    if copy_item_to_clipboard(hwnd, &item) {
+                        self.status = format!("Copied {}", item.name);
+                        self.status_ticks = 0;
+                        InvalidateRect(hwnd, null(), 0);
+                    }
                 }
             }
             Action::EmptyRecycleBin(id) => {
@@ -697,6 +723,10 @@ impl App {
                         1.,
                     );
                 }
+                4 => {
+                    canvas.round([x + 4., iy, x + 13., iy + 10.], 2., color, 175, true, false);
+                    canvas.round([x, iy + 3., x + 9., iy + 13.], 2., color, 200, true, false);
+                }
                 5 => {
                     canvas.line(
                         &[
@@ -801,5 +831,168 @@ impl App {
             DeleteObject(bmp);
             DeleteDC(edc);
         }
+    }
+}
+
+fn normalize_copy_path(target: &str) -> Option<String> {
+    let path = std::path::Path::new(target);
+    if !path.exists() {
+        return None;
+    }
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let clean = abs.to_string_lossy();
+    Some(clean.strip_prefix(r"\\?\").unwrap_or(&clean).to_owned())
+}
+
+fn is_copyable_item(item: &crate::model::Item) -> bool {
+    item.kind != "shell" && item.kind != "aumid" && normalize_copy_path(&item.target).is_some()
+}
+
+fn build_hdrop_bytes(path: &str) -> Vec<u8> {
+    let mut wide_list = crate::model::wide(path);
+    wide_list.push(0); // double-null terminated
+    let header_bytes = size_of::<DROPFILES>();
+    let mut bytes = vec![0u8; header_bytes + wide_list.len() * 2];
+    unsafe {
+        let df = bytes.as_mut_ptr() as *mut DROPFILES;
+        (*df).pFiles = header_bytes as u32;
+        (*df).fWide = 1;
+        std::ptr::copy_nonoverlapping(
+            wide_list.as_ptr() as *const u8,
+            bytes.as_mut_ptr().add(header_bytes),
+            wide_list.len() * 2,
+        );
+    }
+    bytes
+}
+
+unsafe fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::{
+        Foundation::GlobalFree,
+        System::{
+            DataExchange::SetClipboardData,
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT},
+        },
+    };
+    let hmem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len());
+    if hmem.is_null() {
+        return false;
+    }
+    let ptr = GlobalLock(hmem) as *mut u8;
+    if ptr.is_null() {
+        GlobalFree(hmem);
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+    GlobalUnlock(hmem);
+    if SetClipboardData(format, hmem).is_null() {
+        GlobalFree(hmem);
+        return false;
+    }
+    true
+}
+
+unsafe fn copy_item_to_clipboard(hwnd: HWND, item: &crate::model::Item) -> bool {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+    let Some(path) = is_copyable_item(item)
+        .then(|| normalize_copy_path(&item.target))
+        .flatten()
+    else {
+        return false;
+    };
+    if OpenClipboard(hwnd) == 0 {
+        return false;
+    }
+    EmptyClipboard();
+    let mut copied = set_clipboard_bytes(CF_HDROP, &build_hdrop_bytes(&path));
+    let wide_text = crate::model::wide(&path);
+    let text_bytes =
+        std::slice::from_raw_parts(wide_text.as_ptr() as *const u8, wide_text.len() * 2);
+    copied |= set_clipboard_bytes(CF_UNICODETEXT, text_bytes);
+    CloseClipboard();
+    copied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_popup(kind: Kind) -> Popup {
+        Popup {
+            rect: [10., 20., 210., 220.],
+            kind,
+            title: String::new(),
+            subtitle: String::new(),
+            rows: Vec::new(),
+            hover: None,
+            pressed: None,
+            hover_tweens: Vec::new(),
+            open_alpha: crate::motion::Tween::fixed(1.),
+            open_scale: crate::motion::Tween::fixed(1.),
+            scroll: 0,
+            slots: 0,
+            edit: null_mut(),
+            brush: null_mut(),
+        }
+    }
+
+    #[test]
+    fn target_item_id_tracks_item_and_rename_popups() {
+        assert_eq!(test_popup(Kind::Item("app-1".into())).target_item_id(), Some("app-1"));
+        assert_eq!(test_popup(Kind::Rename("app-2".into())).target_item_id(), Some("app-2"));
+        assert_eq!(test_popup(Kind::Add).target_item_id(), None);
+    }
+
+    #[test]
+    fn build_hdrop_bytes_sets_wide_header_and_double_null_path() {
+        let bytes = build_hdrop_bytes(r"C:\Tools\App.exe");
+        let header_size = size_of::<DROPFILES>();
+        assert!(bytes.len() > header_size);
+        unsafe {
+            let df = &*(bytes.as_ptr() as *const DROPFILES);
+            let p_files = df.pFiles;
+            let f_wide = df.fWide;
+            assert_eq!(p_files, header_size as u32);
+            assert_eq!(f_wide, 1);
+        }
+        let wide_tail: Vec<u16> = bytes[header_size..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let mut expected = crate::model::wide(r"C:\Tools\App.exe");
+        expected.push(0);
+        assert_eq!(wide_tail, expected);
+    }
+
+    #[test]
+    fn normalize_copy_path_handles_existing_and_virtual_targets() {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let normalized = normalize_copy_path(&manifest).expect("existing directory should normalize");
+        assert!(!normalized.starts_with(r"\\?\"));
+        assert!(std::path::Path::new(&normalized).exists());
+        assert_eq!(normalize_copy_path("shell:RecycleBinFolder"), None);
+    }
+
+    #[test]
+    fn is_copyable_item_excludes_virtual_and_store_items() {
+        let base = |target: &str, kind: &str| crate::model::Item {
+            id: "id".into(),
+            name: "Item".into(),
+            target: target.into(),
+            kind: kind.into(),
+            args: None,
+            cwd: None,
+            icon_source: None,
+            icon: None,
+            group: None,
+            catalog: false,
+        };
+        assert!(!is_copyable_item(&base("shell:RecycleBinFolder", "shell")));
+        assert!(!is_copyable_item(&base("shell:MyComputerFolder", "shell")));
+        assert!(!is_copyable_item(&base("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "aumid")));
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        assert!(is_copyable_item(&base(&manifest, "folder")));
     }
 }
