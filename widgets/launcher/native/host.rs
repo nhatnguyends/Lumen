@@ -203,7 +203,6 @@ struct App {
     layout_generation: std::cell::Cell<u64>,
     layout_cache: RefCell<Option<CachedDockLayout>>,
     synced_layout_key: (u64, u64, i32, i32, usize, bool, bool),
-    scroll_was_moving: bool,
     mouse_tracked: bool,
     search_cache: RefCell<Option<(String, usize, Vec<usize>)>>,
     search_ink: u32,
@@ -1303,7 +1302,6 @@ impl App {
             layout_generation: std::cell::Cell::new(0),
             layout_cache: RefCell::new(None),
             synced_layout_key: (0, 0, 0, 0, 0, false, false),
-            scroll_was_moving: false,
             mouse_tracked: false,
             search_cache: RefCell::new(None),
             search_ink: rgb(248, 250, 253),
@@ -3638,12 +3636,7 @@ unsafe extern "system" fn wndproc(
                 app.pointer
             };
             app.scroll.by(-(delta as f32) / 120. * 72., now);
-            app.pointer = pointer;
-            if app.scroll.moving(now) {
-                if app.hover.take().is_some() || app.motion.hovered.is_some() {
-                    app.motion.hover(None, pointer, now);
-                }
-            } else if app.tile_drag.is_none() && app.bar_drag.is_none() && pointer[0] >= 0. {
+            if app.tile_drag.is_none() && app.bar_drag.is_none() && pointer[0] >= 0. {
                 app.hover_tile(hwnd, pointer);
             }
             app.arm_motion(hwnd);
@@ -4272,7 +4265,6 @@ pub fn run() -> Result<(), String> {
             layout_generation: std::cell::Cell::new(0),
             layout_cache: RefCell::new(None),
             synced_layout_key: (0, 0, 0, 0, 0, false, false),
-            scroll_was_moving: false,
             mouse_tracked: false,
             search_cache: RefCell::new(None),
             search_ink: rgb(248, 250, 253),

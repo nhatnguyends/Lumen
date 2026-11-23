@@ -1,10 +1,8 @@
-Lumen 0.1.11 focuses on App Dock scrolling and hover smoothness in both Low Power Mode and Normal Mode:
+Lumen 0.1.12 refines App Dock pointer responsiveness and YouTube Music 120Hz frame pacing:
 
-- **Consistent Group Liquid Glass During Scroll**: App Dock group containers maintain consistent Liquid Glass refraction and rim highlights throughout scrolling without visual popping or fallback degradation.
-- **Cached Integer `GroupRimLut` & `groups_base` Layer Caching**: Precomputed integer rim lookup tables (`GroupRimLut`) and cached `groups_base` layers eliminate redundant per-frame group glass recomputation.
-- **Persistent Worker Pool & DPI `.5` Cache Key Stability**: Parallel rendering reuses a persistent worker thread pool, and fractional `.5` DPI scale keys remain stable so cached layers and icons do not thrash.
-- **Axis-Aligned Hover Scaling Fast-Path**: App Dock hover scaling uses an axis-aligned fast-path for crisp, low-overhead frame blitting.
-- **Non-Blocking VSync & Input Pacing**: Non-blocking VSync and input pacing prevent frame-wait stalls during rapid scrolling and pointer interaction across both Low Power Mode and Normal Mode.
+- **Live Cursor-Following Hover During App Dock Scroll**: Hover state updates continuously underneath the cursor while scrolling the App Dock so items respond immediately without stale or frozen highlights.
+- **16.16 Fixed-Point Incremental Affine Sampling**: Rotated sprite blitting uses 16.16 fixed-point incremental affine sampling for fast, smooth sub-pixel rotation.
+- **YouTube Music `spin_base` Caching & `AlphaTargetScope`**: Static-layer caching via `spin_base` paired with `AlphaTargetScope` keeps YouTube Music rendering fast to preserve 120Hz across animations, scroll, and hover while music is playing.
 
 Optional Python entry points remain available:
 
@@ -16,7 +14,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.11-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.12-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

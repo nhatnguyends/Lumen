@@ -74,6 +74,10 @@ struct State {
     frost: Option<Image>,
     background: Option<Buffer>,
     frame: Option<Buffer>,
+    spin_base: Option<Buffer>,
+    spin_base_key: String,
+    spin_disc_rect: Option<[f32; 4]>,
+    skip_spin_disc: bool,
     overlay: Option<Image>,
     shadow: Option<WindowShadow>,
     dpi: f32,
@@ -267,6 +271,7 @@ impl State {
         self.blur_dirty = false;
         self.frame = None;
         self.background = None;
+        self.clear_spin_base();
         self.overlay = None;
         self.frost = None;
         self.card_cache.clear();
@@ -322,6 +327,7 @@ impl State {
                 }
                 self.frame = None;
                 self.background = None;
+                self.clear_spin_base();
                 self.overlay = None;
                 self.shadow = None;
                 self.images.clear();
@@ -550,9 +556,11 @@ impl State {
                 self.sync_spin_timer();
             }
             if IsWindowVisible(self.hwnd) != 0 {
-                self.restore_art();
+                if dirty {
+                    self.restore_art();
+                }
                 InvalidateRect(self.hwnd, null(), 0);
-            } else {
+            } else if dirty {
                 self.remember_view();
             }
         }
@@ -610,6 +618,89 @@ impl State {
         }
         self.remember_view();
     }
+    fn clear_spin_base(&mut self) {
+        self.spin_base = None;
+        self.spin_base_key.clear();
+        self.spin_disc_rect = None;
+    }
+    unsafe fn spin_base_key(&self, w: i32, h: i32, width: f32, height: f32) -> Option<String> {
+        let eligible = !self.moving
+            && !self.resizing
+            && height >= 260.
+            && self.config.design != "coverflow"
+            && ((self.config.design == "orbit" && width >= 340. && width > height * 1.25)
+                || (self.config.design == "disc" && width >= 340.));
+        if !eligible {
+            return None;
+        }
+        use std::fmt::Write;
+        let header_motion = crate::widget_header::visual(self.hwnd);
+        let art_url = self.playback.art.as_deref().unwrap_or("");
+        let art_id = self.cover_image(art_url).map_or(0, Image::identity);
+        let pos_key = if self.pressed == Some(Action::Seek) {
+            self.position().to_bits()
+        } else {
+            ((self.position() * 2.0).floor() as i64) as u64
+        };
+        let mut key = String::with_capacity(256);
+        let _ = write!(
+            key,
+            "{w}x{h}\x1f{}\x1f{}\x1f{}\x1f{:?}\x1f{}",
+            self.dpi.to_bits(),
+            self.revision,
+            self.fusion_revision,
+            self.window_origin,
+            self.was_low_power_moving,
+        );
+        let _ = write!(
+            key,
+            "\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            self.config.design,
+            self.config.frosted_glass,
+            self.config.opacity.to_bits(),
+            self.config.tint.to_bits(),
+            self.config.frost_strength.to_bits(),
+            self.config.blur.to_bits(),
+            self.config.palette,
+            self.config.queue,
+            self.light,
+            self.ink,
+            self.muted,
+            crate::glass::liquid_glass(),
+            crate::glass::frosted_glass(),
+        );
+        let _ = write!(
+            key,
+            "\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            self.playback.signed_in,
+            self.playback.title.len(),
+            self.playback.title,
+            self.playback.artist.len(),
+            self.playback.artist,
+            art_url,
+            self.playback.available,
+            self.playback.playing,
+            self.playback.can_previous,
+            self.playback.can_next,
+            self.playback.can_seek,
+            pos_key,
+        );
+        let _ = write!(
+            key,
+            "\x1f{}\x1f{}\x1f{}\x1f{:?}\x1f{:?}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{art_id}",
+            (self.playback.duration * 2.0).floor() as i64,
+            self.error.len(),
+            self.error,
+            self.hover,
+            self.pressed,
+            (header_motion.alpha * 1000.0).round() as i32,
+            (header_motion.hover[0] * 1000.0).round() as i32,
+            (header_motion.hover[1] * 1000.0).round() as i32,
+            (header_motion.rotation[0] * 100.0).round() as i32,
+            (header_motion.rotation[1] * 100.0).round() as i32,
+        );
+        Some(key)
+    }
     unsafe fn paint(&mut self) {
         let frame_started = Instant::now();
         let mut ps = zeroed();
@@ -625,6 +716,7 @@ impl State {
         if revision != self.revision && !self.moving {
             self.revision = revision;
             self.background = None;
+            self.clear_spin_base();
             if !self.moving { self.overlay = None; }
             if let Some(glass) = &mut self.local_glass {
                 glass.refresh();
@@ -644,6 +736,7 @@ impl State {
         if changed {
             self.frame = Buffer::new(w, h, self.dpi, 34.);
             self.background = None;
+            self.clear_spin_base();
             if !self.moving { self.overlay = None; }
         }
         let Some(mut frame) = self.frame.take() else {
@@ -656,6 +749,7 @@ impl State {
         let move_backdrop_dirty = crate::glass::frosted_glass()
             && ([wr.left, wr.top] != self.window_origin || low_moving != self.was_low_power_moving);
         if self.background.is_none() || fusion_changed || move_backdrop_dirty {
+            self.clear_spin_base();
             let reuse_frost = fusion_changed
                 && !move_backdrop_dirty
                 && !crate::glass::liquid_glass()
@@ -731,30 +825,84 @@ impl State {
                 self.background = Some(bg);
             }
         }
-        if let Some(bg) = &self.background {
-            frame.copy_from(bg.dc);
-        }
-        frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55) as u8);
-        let batch = render::AlphaBatch::new(frame.dc, self.dpi);
-        self.content(frame.dc, width, height);
-        drop(batch);
-        if !self.moving {
-            if let Some(bg) = &self.background {
-                for (rect, radius) in &self.control_plates {
-                    frame.retain_control_backing(bg, *rect, *radius, 1.);
-                }
-                crate::settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, width);
+        let spin_key = self.spin_base_key(w, h, width, height);
+        let fast_hit = if let (Some(key), Some(base), Some(_)) =
+            (spin_key.as_ref(), self.spin_base.as_ref(), self.spin_disc_rect)
+        {
+            *key == self.spin_base_key && base.matches_geometry(w, h, self.dpi, 0.)
+        } else {
+            false
+        };
+        if fast_hit {
+            let base = self.spin_base.as_ref().unwrap();
+            let disc_r = self.spin_disc_rect.unwrap();
+            frame.copy_from(base.dc);
+            {
+                let _scope = render::AlphaTargetScope::new(frame.dc, self.dpi);
+                self.spinning_disc(frame.dc, disc_r, width, height);
             }
+            frame.present_with_alpha(self.hwnd, true);
+            if self.shadow.is_none() {
+                crate::widget_interaction::sync_shadow(
+                    self.hwnd,
+                    self.moving,
+                    self.resizing,
+                    &mut self.shadow,
+                    self.dpi,
+                    (self.config.opacity * 2.55) as u8,
+                );
+            }
+        } else {
+            if let Some(bg) = &self.background {
+                frame.copy_from(bg.dc);
+            }
+            frame.background_alpha_for(self.hwnd, (self.config.opacity * 2.55) as u8);
+            if spin_key.is_some() {
+                self.skip_spin_disc = true;
+                self.spin_disc_rect = None;
+            }
+            let batch = render::AlphaBatch::new(frame.dc, self.dpi);
+            self.content(frame.dc, width, height);
+            drop(batch);
+            self.skip_spin_disc = false;
+            if !self.moving {
+                if let Some(bg) = &self.background {
+                    for (rect, radius) in &self.control_plates {
+                        frame.retain_control_backing(bg, *rect, *radius, 1.);
+                    }
+                    crate::settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, width);
+                }
+            }
+            if let (Some(key), Some(disc_r)) = (spin_key, self.spin_disc_rect) {
+                if let Some(base) = self
+                    .spin_base
+                    .take()
+                    .filter(|b| b.matches_geometry(w, h, self.dpi, 0.))
+                    .or_else(|| Buffer::plain(w, h, self.dpi))
+                {
+                    base.copy_from(frame.dc);
+                    self.spin_base_key = key;
+                    self.spin_base = Some(base);
+                } else {
+                    self.spin_base_key.clear();
+                }
+                {
+                    let _scope = render::AlphaTargetScope::new(frame.dc, self.dpi);
+                    self.spinning_disc(frame.dc, disc_r, width, height);
+                }
+            } else {
+                self.clear_spin_base();
+            }
+            frame.present_with_alpha(self.hwnd, true);
+            crate::widget_interaction::sync_shadow(
+                self.hwnd,
+                self.moving,
+                self.resizing,
+                &mut self.shadow,
+                self.dpi,
+                (self.config.opacity * 2.55) as u8,
+            );
         }
-        frame.present_with_alpha(self.hwnd, true);
-        crate::widget_interaction::sync_shadow(
-            self.hwnd,
-            self.moving,
-            self.resizing,
-            &mut self.shadow,
-            self.dpi,
-            (self.config.opacity * 2.55) as u8,
-        );
         self.frame = Some(frame);
         EndPaint(self.hwnd, &ps);
         if IsWindowVisible(self.hwnd) != 0
@@ -875,6 +1023,10 @@ impl Host {
             frost: None,
             background: None,
             frame: None,
+            spin_base: None,
+            spin_base_key: String::new(),
+            spin_disc_rect: None,
+            skip_spin_disc: false,
             overlay: None,
             shadow: None,
             dpi,
@@ -971,6 +1123,7 @@ impl Host {
             glass.refresh();
         }
         s.background = None;
+        s.clear_spin_base();
         s.overlay = None;
         s.frost = None;
         s.window_origin = [i32::MIN, i32::MIN];
@@ -986,6 +1139,7 @@ impl Host {
         if let Some(opacity) = opacity.filter(|v| v.is_finite()) {
             s.config.opacity = opacity.clamp(0., 100.);
             s.background = None;
+            s.clear_spin_base();
         }
         if let Some(floating) = floating {
             s.config.floating = floating;
@@ -1229,6 +1383,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             if let Some(glass) = &mut s.local_glass {
                 if glass.finish_async() {
                     s.background = None;
+                    s.clear_spin_base();
                     s.overlay = None;
                     s.frost = None;
                     InvalidateRect(hwnd, null(), 0);
@@ -1412,6 +1567,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             crate::widget_interaction::exit_size_move(hwnd, &mut s.moving, &mut s.resizing);
             s.window_origin = [i32::MIN, i32::MIN];
             s.frost = None;
+            s.clear_spin_base();
             s.card_cache.clear();
             s.bounds();
             InvalidateRect(hwnd, null(), 0);
@@ -1429,6 +1585,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let had_frame = s.frame.is_some();
                 s.frame = None;
                 s.background = None;
+                s.clear_spin_base();
                 if !s.moving { s.overlay = None; }
                 if s.moving {
                     let s = &mut *s;
@@ -1469,6 +1626,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.dpi = new_dpi;
             s.frame = None;
             s.background = None;
+            s.clear_spin_base();
             s.overlay = None;
             s.local_glass = None;
             let r = crate::geometry::clamp_dpi_rect(*(lp as *const RECT), model::MIN_SIZE, new_dpi);
@@ -1494,6 +1652,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             if !s.moving && (changed || msg == WM_DISPLAYCHANGE) {
                 s.frame = None;
                 s.background = None;
+                s.clear_spin_base();
                 s.overlay = None;
             }
             let prev_dpi = s.dpi;
@@ -1516,6 +1675,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         s.dpi = dpi;
                         s.frame = None;
                         s.background = None;
+                        s.clear_spin_base();
                         s.overlay = None;
                         s.frost = None;
                         s.local_glass = None;
@@ -2266,6 +2426,10 @@ mod tests {
                             frost: None,
             background: None,
                             frame: None,
+                            spin_base: None,
+                            spin_base_key: String::new(),
+                            spin_disc_rect: None,
+                            skip_spin_disc: false,
                             overlay: None,
                             shadow: None,
                             dpi,
@@ -2629,6 +2793,111 @@ mod tests {
                 };
                 s.accept_smtc(&unrelated_smtc);
                 assert!(s.playback.queue.is_empty());
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn spin_base_fast_path_matches_full_content_at_zero_opacity() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _runtime = render::Runtime::start().unwrap();
+            let root = test_root("music-spin-base-fast-path");
+            std::fs::create_dir_all(&root).unwrap();
+            let host = Host::create(
+                &root,
+                Rc::new(RefCell::new(Glass::new(13., 1.))),
+                true,
+                true,
+            )
+            .unwrap();
+            {
+                let mut s = host.state.borrow_mut();
+                let dpi = s.dpi;
+                let hwnd = s.hwnd;
+                let (w_dip, h_dip) = (520.0f32, 300.0f32);
+                let (w_px, h_px) = ((w_dip * dpi).round() as i32, (h_dip * dpi).round() as i32);
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    -19600,
+                    -20000,
+                    w_px,
+                    h_px,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let pixels: Vec<u8> = (0..128 * 128)
+                    .flat_map(|n| [40 + (n % 128) as u8, 70 + (n / 128) as u8, 190, 255])
+                    .collect();
+                s.images.insert(
+                    "spin-test-art".into(),
+                    Image::from_rgba(128, 128, pixels).unwrap(),
+                );
+                s.playback = Playback {
+                    title: "Spin Base Parity".into(),
+                    artist: "Test Artist".into(),
+                    art: Some("spin-test-art".into()),
+                    available: true,
+                    playing: true,
+                    can_previous: true,
+                    can_next: true,
+                    can_seek: true,
+                    position: 30.0,
+                    duration: 180.0,
+                    ..Playback::default()
+                };
+                s.config.opacity = 0.0;
+                s.config.queue = false;
+                s.spin_angle = 27.5;
+                for design in ["orbit", "disc"] {
+                    s.config.design = design.into();
+                    s.received = Instant::now();
+                    s.background = None;
+                    s.clear_spin_base();
+                    s.rounded_art.borrow_mut().clear();
+
+                    // Frame 1 captures spin_base; Frame 2 takes the fast path.
+                    s.paint();
+                    assert!(s.spin_base.is_some(), "{design}: spin_base populated");
+                    assert!(!s.spin_base_key.is_empty(), "{design}: spin_base_key set");
+                    assert!(s.spin_disc_rect.is_some(), "{design}: spin_disc_rect set");
+                    s.paint();
+                    let fast = s.frame.as_ref().unwrap().snapshot();
+
+                    let mut ref_buf = Buffer::new(w_px, h_px, dpi, 34.).unwrap();
+                    ref_buf.copy_from(s.background.as_ref().unwrap().dc);
+                    ref_buf.background_alpha_for(hwnd, 0);
+                    let batch = render::AlphaBatch::new(ref_buf.dc, dpi);
+                    s.skip_spin_disc = false;
+                    s.content(ref_buf.dc, w_px as f32 / dpi, h_px as f32 / dpi);
+                    drop(batch);
+                    if let Some(bg) = &s.background {
+                        for (rect, radius) in &s.control_plates {
+                            ref_buf.retain_control_backing(bg, *rect, *radius, 1.);
+                        }
+                        crate::settings_ui::retain_header_backing(
+                            &mut ref_buf,
+                            bg,
+                            hwnd,
+                            w_px as f32 / dpi,
+                        );
+                    }
+                    ref_buf.present_with_alpha(hwnd, true);
+                    let reference = ref_buf.snapshot();
+
+                    let max_diff = fast
+                        .iter()
+                        .zip(&reference)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(
+                        max_diff <= 2,
+                        "{design}: spin_base fast path max channel diff {max_diff} > 2"
+                    );
+                }
             }
             drop(host);
             let _ = std::fs::remove_dir_all(root);

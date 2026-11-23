@@ -915,6 +915,28 @@ impl Drop for AlphaBatch {
         ALPHA_DC.with(|a| a.set(self.previous));
     }
 }
+pub struct AlphaTargetScope {
+    previous: Option<usize>,
+    batch: Option<Batch>,
+}
+impl AlphaTargetScope {
+    pub unsafe fn new(dc: HDC, dpi: f32) -> Self {
+        let previous = ALPHA_DC.with(|a| a.replace(Some(dc as usize)));
+        Self {
+            previous,
+            batch: Some(Batch::new(dc, dpi)),
+        }
+    }
+    pub fn batch(&self) -> Option<&Batch> {
+        self.batch.as_ref()
+    }
+}
+impl Drop for AlphaTargetScope {
+    fn drop(&mut self) {
+        drop(self.batch.take());
+        ALPHA_DC.with(|a| a.set(self.previous));
+    }
+}
 unsafe fn target_for_dc(dc: HDC) -> Option<crate::sampling::Target> {
     let mut dib: DIBSECTION = std::mem::zeroed();
     let bitmap = GetCurrentObject(dc, OBJ_BITMAP as u32);
@@ -1038,6 +1060,52 @@ impl Batch {
                 r_px,
                 [cx_px, cy_px, scale, 0.],
                 1.,
+                image.tint,
+            );
+        }
+        true
+    }
+    pub fn blit_clipped_transformed(
+        &self,
+        image: &Image,
+        r: [f32; 4],
+        clip: [f32; 4],
+        center: [f32; 2],
+        scale: f32,
+        rotation: f32,
+        opacity: f32,
+    ) -> bool {
+        let (Some(mut target), Some(pixels)) = (self.target, image._pixels.as_ref()) else {
+            return false;
+        };
+        if opacity <= 0. {
+            return true;
+        }
+        let _cost = Cost::new(2);
+        let bounds = clip.map(|v| (v * self.scale).round() as i32);
+        target.clip = [
+            target.clip[0].max(bounds[0]),
+            target.clip[1].max(bounds[1]),
+            target.clip[2].min(bounds[2]),
+            target.clip[3].min(bounds[3]),
+        ];
+        let w = ((r[2] - r[0]) * self.scale).round();
+        let h = ((r[3] - r[1]) * self.scale).round();
+        let cx = (r[0] + r[2]) * self.scale * 0.5;
+        let cy = (r[1] + r[3]) * self.scale * 0.5;
+        unsafe {
+            if BATCH_DIRTY.with(|d| d.replace(false)) {
+                if let Some((_, g)) = ACTIVE_BATCH.with(|a| a.get()).filter(|(_, g)| *g != 0) {
+                    GdipFlush(g as Ptr, 1);
+                }
+                GdiFlush();
+            }
+            target.draw(
+                pixels,
+                [image.width as usize, image.height as usize],
+                [cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5],
+                [center[0] * self.scale, center[1] * self.scale, scale, rotation],
+                opacity,
                 image.tint,
             );
         }

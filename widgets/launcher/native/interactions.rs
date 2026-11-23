@@ -74,12 +74,7 @@ impl App {
     }
     pub(super) unsafe fn hover_tile(&mut self, hwnd: HWND, p: Point) {
         let now = self.now();
-        let scrolling = self.scroll.moving(now);
-        let hover = if scrolling {
-            None
-        } else {
-            self.hit(hwnd, p[0] as i32, p[1] as i32)
-        };
+        let hover = self.hit(hwnd, p[0] as i32, p[1] as i32);
         let width = self.dimensions(hwnd).0;
         let prev_toolbar = self.toolbar_hit(width, self.pointer);
         let next_toolbar = self.toolbar_hit(width, p);
@@ -363,17 +358,14 @@ impl App {
                 self.pointer_move(hwnd, p);
             }
         }
-        let scrolling = self.scroll.moving(now);
-        if !scrolling
-            && self.tile_drag.is_none()
+        if self.tile_drag.is_none()
             && self.bar_drag.is_none()
             && self.popup.is_none()
             && self.pointer[0] >= 0.
-            && (self.scroll_was_moving || self.hover.is_none())
+            && (self.scroll.moving(now) || self.hover.is_none())
         {
             self.hover_tile(hwnd, self.pointer);
         }
-        self.scroll_was_moving = scrolling;
         let active = self.motion.tick(now)
             || self.scroll.moving(now)
             || self.tile_drag.as_ref().is_some_and(|d| d.active)
@@ -966,16 +958,12 @@ impl App {
             let selected = (self.keyboard_selection && self.selected == pos) || popup_selected;
             let hover = if self.resize_drag.is_some() {
                 0.
-            } else if scrolling {
-                if selected { 1. } else { 0. }
             } else {
                 visual.hover.max(if selected { 1. } else { 0. })
             };
             if hover > 0.001 {
                 let bright = self.dock.light || crate::contrast::luminance(p.text) < 0.5;
-                let glow_alpha =
-                    (if scrolling { 0. } else { visual.hover } * if bright { 34. } else { 42. })
-                        as u8;
+                let glow_alpha = (visual.hover * if bright { 34. } else { 42. }) as u8;
                 if !batch.hover_surface(r, 20., hover, bright) {
                     Canvas::new(dc, self.dpi).hover_surface(r, 20., hover, bright);
                 }
@@ -1121,12 +1109,12 @@ impl App {
                 continue;
             }
             let item_idx = visible[pos];
-            let scale = if scrolling || self.group_selection.is_some() {
+            let scale = if self.group_selection.is_some() {
                 1.
             } else {
                 visual.scale
             };
-            let lift = if scrolling || self.group_selection.is_some() {
+            let lift = if self.group_selection.is_some() {
                 0.
             } else {
                 visual.lift

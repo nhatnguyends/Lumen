@@ -162,7 +162,10 @@ impl State {
                     let y = top + ((h - top - 16. - side) / 2.).max(0.);
                     let r = [24., y, 24. + side, y + side];
                     c.soft_shadow(r, side / 2., 48., 18., 8.);
-                    self.spinning_disc(dc, r, w, h);
+                    self.spin_disc_rect = Some(r);
+                    if !self.skip_spin_disc {
+                        self.spinning_disc(dc, r, w, h);
+                    }
                     let right_left = r[2] + 24.;
                     let right_w = w - 24. - right_left;
                     let block_y = top + ((h - top - 16. - 124.) / 2.).max(0.);
@@ -238,7 +241,10 @@ impl State {
                         false,
                     );
                     c.soft_shadow(disc, side / 2., 52., 15., 6.);
-                    self.spinning_disc(dc, disc, w, h);
+                    self.spin_disc_rect = Some(disc);
+                    if !self.skip_spin_disc {
+                        self.spinning_disc(dc, disc, w, h);
+                    }
 
                     let content_left = disc[2] + 18.;
                     let content_right = card[2] - 16.;
@@ -575,14 +581,34 @@ impl State {
         // Detailed 3D tonearm
         draw_tonearm(c, r);
     }
-    unsafe fn spinning_disc(&self, dc: HDC, r: [f32; 4], w: f32, h: f32) {
+    pub(super) unsafe fn spinning_disc(&self, dc: HDC, r: [f32; 4], w: f32, h: f32) {
+        let clip = [4., 4., w - 4., h - 4.];
+        let size = r[2] - r[0];
+        let px = (size * self.dpi).round().max(1.) as i32;
+        let url = self.playback.art.as_deref().unwrap_or("");
+        let identity = self.cover_image(url).map_or(0, Image::identity);
+        let key = format!("disc:{identity}:{px}:{}:{r:?}:{clip:?}:{}", self.dpi, 0.0f32);
+        if let Some(image) = self.rounded_art.borrow().get(&key) {
+            let batch = render::Batch::new(dc, self.dpi);
+            if batch.blit_clipped_transformed(
+                image,
+                r,
+                clip,
+                [(r[0] + r[2]) / 2., (r[1] + r[3]) / 2.],
+                1.,
+                self.spin_angle,
+                1.,
+            ) {
+                return;
+            }
+        }
         let art = Canvas::new(dc, self.dpi);
         art.transform_about(
             [(r[0] + r[2]) / 2., (r[1] + r[3]) / 2.],
             1.,
             self.spin_angle,
         );
-        self.disc_art(&art, r, [4., 4., w - 4., h - 4.], 0.);
+        self.disc_art(&art, r, clip, 0.);
     }
     unsafe fn pocket_graphic(&mut self, c: &Canvas, dc: HDC, w: f32, h: f32, design: &str) {
         let tall = w < 240. && h >= 210.;
