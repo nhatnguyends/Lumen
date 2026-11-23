@@ -80,22 +80,38 @@ impl FramePacing {
             }
         }
     }
-    unsafe fn wait_until(&mut self, started: std::time::Instant, low: bool) {
+    unsafe fn arm_timer(
+        &mut self,
+        remaining: std::time::Duration,
+    ) -> Option<windows_sys::Win32::Foundation::HANDLE> {
         use windows_sys::Win32::System::Threading::*;
-        let remaining = self.budget(low).saturating_sub(started.elapsed());
-        if remaining < std::time::Duration::from_micros(100) { return; }
         if self.timer.is_null() {
             self.timer = CreateWaitableTimerExW(
-                std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                 TIMER_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE,
             );
         }
         if !self.timer.is_null() {
             let due = -((remaining.as_nanos() / 100).max(1).min(i64::MAX as u128) as i64);
             if SetWaitableTimer(self.timer, &due, 0, None, std::ptr::null(), 0) != 0 {
-                WaitForSingleObject(self.timer, INFINITE);
-                return;
+                return Some(self.timer);
             }
+        }
+        None
+    }
+    unsafe fn wait_until(&mut self, started: std::time::Instant, low: bool) {
+        let remaining = self.budget(low).saturating_sub(started.elapsed());
+        if remaining < std::time::Duration::from_micros(100) {
+            return;
+        }
+        if let Some(timer) = self.arm_timer(remaining) {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                timer,
+                windows_sys::Win32::System::Threading::INFINITE,
+            );
+            return;
         }
         std::thread::sleep(remaining);
     }
@@ -105,46 +121,17 @@ impl Drop for FramePacing {
         if !self.timer.is_null() { unsafe { windows_sys::Win32::Foundation::CloseHandle(self.timer); } }
     }
 }
+struct ScheduledVsync {
+    deadline: std::time::Instant,
+    queued: Vec<(usize, u32)>,
+}
 thread_local! {
     static PENDING_VSYNC: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     static PENDING_VSYNC_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static SCHEDULED_VSYNC: std::cell::RefCell<Option<ScheduledVsync>> = const { std::cell::RefCell::new(None) };
     static FRAME_PACING: std::cell::RefCell<FramePacing> = std::cell::RefCell::new(FramePacing::new());
 }
-pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
-    let queued = PENDING_VSYNC.with(|q| {
-        let mut q = q.borrow_mut();
-        if q.is_empty() {
-            Vec::new()
-        } else {
-            std::mem::take(&mut *q)
-        }
-    });
-    if queued.is_empty() {
-        return;
-    }
-    let started = PENDING_VSYNC_START
-        .with(|c| c.take())
-        .unwrap_or(frame_started);
-    let present_ms = started.elapsed().as_secs_f64() * 1000.;
-    let low = low_power();
-    let can_flush = FRAME_PACING.with(|p| {
-        let mut p = p.borrow_mut();
-        p.refresh(std::time::Instant::now());
-        p.can_flush(present_ms, std::time::Instant::now(), low)
-    });
-    if can_flush {
-        let hr = windows_sys::Win32::Graphics::Dwm::DwmFlush();
-        FRAME_PACING.with(|p| {
-            let mut p = p.borrow_mut();
-            // A successful DwmFlush can still wait TWO refreshes for a layered
-            // window. Detect that measured miss instead of halving 120Hz scroll.
-            if hr < 0 || p.record_flush(started.elapsed(), std::time::Instant::now(), low) {
-                p.avoid_flush_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-            }
-        });
-    } else {
-        FRAME_PACING.with(|p| p.borrow_mut().wait_until(started, low));
-    }
+unsafe fn post_vsync_batch(queued: Vec<(usize, u32)>) {
     for (hwnd, message) in queued {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
             hwnd as windows_sys::Win32::Foundation::HWND,
@@ -154,9 +141,131 @@ pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
         );
     }
 }
+pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
+    let mut queued = PENDING_VSYNC.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *q)
+        }
+    });
+    if let Some(sched) = SCHEDULED_VSYNC.with(|s| s.borrow_mut().take()) {
+        for entry in sched.queued {
+            if !queued.contains(&entry) {
+                queued.push(entry);
+            }
+        }
+    }
+    if queued.is_empty() {
+        return;
+    }
+    let started = PENDING_VSYNC_START
+        .with(|c| c.take())
+        .unwrap_or(frame_started);
+    let now = std::time::Instant::now();
+    let present_ms = now.saturating_duration_since(started).as_secs_f64() * 1000.;
+    let low = low_power();
+    let use_dwm = !low
+        && FRAME_PACING.with(|p| {
+            let mut p = p.borrow_mut();
+            p.refresh(now);
+            p.can_flush(present_ms, now, false)
+        });
+    if use_dwm {
+        let hr = windows_sys::Win32::Graphics::Dwm::DwmFlush();
+        let done = std::time::Instant::now();
+        FRAME_PACING.with(|p| {
+            let mut p = p.borrow_mut();
+            // A successful DwmFlush can still wait TWO refreshes for a layered
+            // window. Detect that measured miss instead of halving 120Hz scroll.
+            if hr < 0 || p.record_flush(done.saturating_duration_since(started), done, false) {
+                p.avoid_flush_until = Some(done + std::time::Duration::from_secs(1));
+            }
+        });
+    } else {
+        FRAME_PACING.with(|p| p.borrow_mut().wait_until(started, low));
+    }
+    post_vsync_batch(queued);
+}
+pub unsafe fn step_pending_vsync(
+    frame_started: std::time::Instant,
+) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    let queued = PENDING_VSYNC.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *q)
+        }
+    });
+    let started = PENDING_VSYNC_START
+        .with(|c| c.take())
+        .unwrap_or(frame_started);
+    if let Some(mut sched) = SCHEDULED_VSYNC.with(|s| s.borrow_mut().take()) {
+        for entry in queued {
+            if !sched.queued.contains(&entry) {
+                sched.queued.push(entry);
+            }
+        }
+        let now = std::time::Instant::now();
+        if now + std::time::Duration::from_micros(250) >= sched.deadline {
+            post_vsync_batch(sched.queued);
+            return None;
+        }
+        let remaining = sched.deadline.saturating_duration_since(now);
+        if let Some(handle) = FRAME_PACING.with(|p| p.borrow_mut().arm_timer(remaining)) {
+            SCHEDULED_VSYNC.with(|s| *s.borrow_mut() = Some(sched));
+            return Some(handle);
+        }
+        std::thread::sleep(remaining);
+        post_vsync_batch(sched.queued);
+        return None;
+    }
+    if queued.is_empty() {
+        return None;
+    }
+    let low = low_power();
+    let now = std::time::Instant::now();
+    let present_ms = now.saturating_duration_since(started).as_secs_f64() * 1000.;
+    let (use_dwm, budget) = FRAME_PACING.with(|p| {
+        let mut p = p.borrow_mut();
+        p.refresh(now);
+        (!low && p.can_flush(present_ms, now, false), p.budget(low))
+    });
+    if use_dwm {
+        let hr = windows_sys::Win32::Graphics::Dwm::DwmFlush();
+        let done = std::time::Instant::now();
+        FRAME_PACING.with(|p| {
+            let mut p = p.borrow_mut();
+            if hr < 0 || p.record_flush(done.saturating_duration_since(started), done, false) {
+                p.avoid_flush_until = Some(done + std::time::Duration::from_secs(1));
+            }
+        });
+        post_vsync_batch(queued);
+        return None;
+    }
+    let deadline = started + budget;
+    if now + std::time::Duration::from_micros(250) >= deadline {
+        post_vsync_batch(queued);
+        return None;
+    }
+    if let Some(handle) = FRAME_PACING
+        .with(|p| p.borrow_mut().arm_timer(deadline.saturating_duration_since(now)))
+    {
+        SCHEDULED_VSYNC.with(|s| {
+            *s.borrow_mut() = Some(ScheduledVsync { deadline, queued });
+        });
+        return Some(handle);
+    }
+    FRAME_PACING.with(|p| p.borrow_mut().wait_until(started, low));
+    post_vsync_batch(queued);
+    None
+}
 pub fn clear_pending_vsync() {
     PENDING_VSYNC.with(|q| q.borrow_mut().clear());
     PENDING_VSYNC_START.with(|c| c.set(None));
+    SCHEDULED_VSYNC.with(|s| *s.borrow_mut() = None);
 }
 pub unsafe fn pace_vsync(
     hwnd: windows_sys::Win32::Foundation::HWND,
@@ -817,6 +926,48 @@ mod tests {
         assert!(frame_interval_ms() <= 16);
         set_low_power(false);
         assert_eq!(frame_interval_ms(), 10);
+    }
+    #[test]
+    fn low_power_step_pending_vsync_targets_60hz_without_blocking() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                clear_pending_vsync();
+                set_low_power(self.0);
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                    let mut msg: MSG = std::mem::zeroed();
+                    while PeekMessageW(&mut msg, std::ptr::null_mut(), VSYNC_FRAME, VSYNC_FRAME, PM_REMOVE) != 0 {}
+                }
+            }
+        }
+        let _reset = Reset(low_power());
+        clear_pending_vsync();
+        set_low_power(true);
+
+        let start = std::time::Instant::now();
+        let mut queued = false;
+        unsafe {
+            pace_vsync(std::ptr::null_mut(), start, &mut queued, VSYNC_FRAME);
+            assert!(queued);
+            let handle = step_pending_vsync(start);
+            assert!(handle.is_some());
+            assert!(start.elapsed() < std::time::Duration::from_millis(12));
+
+            let mut handle = step_pending_vsync(start);
+            assert!(handle.is_some());
+
+            for _ in 0..5 {
+                let Some(h) = handle else {
+                    break;
+                };
+                windows_sys::Win32::System::Threading::WaitForSingleObject(h, 100);
+                handle = step_pending_vsync(start);
+            }
+            assert!(handle.is_none());
+            assert!(start.elapsed() >= std::time::Duration::from_millis(15));
+        }
     }
     #[test]
     fn launch_scales_to_two_x_and_fades_along_curves() {

@@ -1807,8 +1807,8 @@ fn sample_channel_stride(
 ) -> f32 {
     let cx = x.clamp(0.0, (w - 1) as f32);
     let cy = y.clamp(0.0, (h - 1) as f32);
-    let x0 = cx.floor() as usize;
-    let y0 = cy.floor() as usize;
+    let x0 = cx as usize;
+    let y0 = cy as usize;
     let x1 = (x0 + 1).min(w - 1);
     let y1 = (y0 + 1).min(h - 1);
     let fx = cx - x0 as f32;
@@ -1822,6 +1822,31 @@ fn sample_channel_stride(
     let top = p00 + (p10 - p00) * fx;
     let bot = p01 + (p11 - p01) * fx;
     top + (bot - top) * fy
+}
+
+#[inline]
+fn sample_bgr(src: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32; 3] {
+    let cx = x.clamp(0.0, (w - 1) as f32);
+    let cy = y.clamp(0.0, (h - 1) as f32);
+    let x0 = cx as usize;
+    let y0 = cy as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = cx - x0 as f32;
+    let fy = cy - y0 as f32;
+    let i00 = (y0 * w + x0) * 4;
+    let i10 = (y0 * w + x1) * 4;
+    let i01 = (y1 * w + x0) * 4;
+    let i11 = (y1 * w + x1) * 4;
+    std::array::from_fn(|ch| {
+        let p00 = src[i00 + ch] as f32;
+        let p10 = src[i10 + ch] as f32;
+        let p01 = src[i01 + ch] as f32;
+        let p11 = src[i11 + ch] as f32;
+        let top = p00 + (p10 - p00) * fx;
+        let bot = p01 + (p11 - p01) * fx;
+        top + (bot - top) * fy
+    })
 }
 
 #[inline]
@@ -1874,6 +1899,45 @@ fn sample_placed_disp_2d(
     })
 }
 
+/// Returns `(disp, soft_ca, spec, weight)` for a Liquid Glass card/group rim pixel.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn card_rim_lens_params(
+    d: f32,
+    nx: f32,
+    ny: f32,
+    rim: f32,
+    bend: f32,
+    ca_strength: f32,
+    dpi: f32,
+) -> (f32, f32, f32, f32) {
+    let u = (-d / rim).clamp(0.0, 1.0);
+    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
+    let disp = -bend * edge_align;
+    let ca = ca_factor * ca_strength;
+    let soft_ca = if ca.abs() <= 0.05 {
+        0.0
+    } else {
+        let transition = 0.75 * dpi.max(1.0);
+        let footprint = if ca.abs() >= 0.05 + transition {
+            1.0
+        } else {
+            optical_fade((ca.abs() - 0.05) / transition)
+        };
+        ca * footprint
+    };
+    let spec = if u < 0.32 {
+        let edge = (1.0 - u / 0.32).clamp(0.0, 1.0);
+        let light_dir =
+            (-nx * 0.55 - ny * 0.83).max(0.0) + (nx * 0.4 + ny * 0.6).max(0.0) * 0.35;
+        edge * edge * (12.0 + 26.0 * light_dir)
+    } else {
+        0.0
+    };
+    let weight = inner_rim_weight(u);
+    (disp, soft_ca, spec, weight)
+}
+
 /// Evaluates a single Liquid Glass rim pixel (`[B, G, R]`) from an opaque BGRA
 /// backing buffer for sub-cards, pills, and control plates.
 #[inline]
@@ -1892,14 +1956,23 @@ pub fn refract_bgra_card_pixel(
     ca_strength: f32,
     dpi: f32,
 ) -> [u8; 3] {
+    if sw == 0 || sh == 0 || source.len() < sw * sh * 4 {
+        return [0; 3];
+    }
     let u = (-d / rim).clamp(0.0, 1.0);
     let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
     let disp = -bend * edge_align;
     let ca = ca_factor * ca_strength;
 
-    let b = sample_disp_2d(source, sw, sh, x, y, nx, ny, disp, ca, dpi, 0);
-    let g = sample_disp_2d(source, sw, sh, x, y, nx, ny, disp, 0.0, dpi, 1);
-    let r = sample_disp_2d(source, sw, sh, x, y, nx, ny, disp, -ca, dpi, 2);
+    let [b, g, r] = if ca.abs() <= 0.05 {
+        sample_bgr(source, sw, sh, x + nx * disp, y + ny * disp)
+    } else {
+        [
+            sample_disp_2d(source, sw, sh, x, y, nx, ny, disp, ca, dpi, 0),
+            sample_disp_2d(source, sw, sh, x, y, nx, ny, disp, 0.0, dpi, 1),
+            sample_disp_2d(source, sw, sh, x, y, nx, ny, disp, -ca, dpi, 2),
+        ]
+    };
 
     let spec = if u < 0.32 {
         let edge = (1.0 - u / 0.32).clamp(0.0, 1.0);
@@ -1910,11 +1983,26 @@ pub fn refract_bgra_card_pixel(
         0.0
     };
     let weight = inner_rim_weight(u);
+    let backing = if weight < 1.0 {
+        if x == (x as i32) as f32 && y == (y as i32) as f32 {
+            let base = (y.clamp(0.0, (sh - 1) as f32) as usize * sw
+                + x.clamp(0.0, (sw - 1) as f32) as usize)
+                * 4;
+            [
+                source[base] as f32,
+                source[base + 1] as f32,
+                source[base + 2] as f32,
+            ]
+        } else {
+            sample_bgr(source, sw, sh, x, y)
+        }
+    } else {
+        [0.0; 3]
+    };
     std::array::from_fn(|ch| {
         let refracted = ([b, g, r][ch] + spec).min(255.0);
         let value = if weight < 1.0 {
-            let backing = sample_channel(source, sw, sh, x, y, ch);
-            backing + (refracted - backing) * weight
+            backing[ch] + (refracted - backing[ch]) * weight
         } else {
             refracted
         };
@@ -2190,27 +2278,164 @@ fn apply_liquid_glass_pixels(
     with_pixel_rows_parallel(dst_buf, dst_stride, 0..h, w * h, 196_608, render_rows);
 }
 
+struct PoolState {
+    generation: u64,
+    active_workers: usize,
+    remaining: usize,
+    batches_ptr: usize,
+    fn_ptr: unsafe fn(*const (), *mut ()),
+    ctx_ptr: usize,
+    panicked: Option<Box<dyn std::any::Any + Send>>,
+}
+
+struct RowPool {
+    dispatch_lock: std::sync::Mutex<()>,
+    inner: std::sync::Arc<RowPoolInner>,
+    worker_count: usize,
+}
+
+struct RowPoolInner {
+    state: std::sync::Mutex<PoolState>,
+    work_cv: std::sync::Condvar,
+    done_cv: std::sync::Condvar,
+}
+
+unsafe fn noop_batch(_ctx: *const (), _batch: *mut ()) {}
+
+unsafe fn invoke_batch<F: Fn(Vec<(usize, &mut [u8])>) + Sync>(ctx: *const (), batch: *mut ()) {
+    let f = &*(ctx as *const F);
+    let rows = std::mem::take(&mut *(batch as *mut Vec<(usize, &mut [u8])>));
+    f(rows);
+}
+
+impl RowPool {
+    fn new(max_extra_workers: usize) -> Self {
+        let inner = std::sync::Arc::new(RowPoolInner {
+            state: std::sync::Mutex::new(PoolState {
+                generation: 0,
+                active_workers: 0,
+                remaining: 0,
+                batches_ptr: 0,
+                fn_ptr: noop_batch,
+                ctx_ptr: 0,
+                panicked: None,
+            }),
+            work_cv: std::sync::Condvar::new(),
+            done_cv: std::sync::Condvar::new(),
+        });
+        let mut spawned = 0usize;
+        for worker_idx in 0..max_extra_workers {
+            let shared = std::sync::Arc::clone(&inner);
+            let res = std::thread::Builder::new()
+                .name(format!("lumen-glass-{worker_idx}"))
+                .spawn(move || {
+                    let mut seen_gen = 0u64;
+                    loop {
+                        let (job_gen, batch_ptr, fn_ptr, ctx_ptr) = {
+                            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while st.generation == seen_gen || worker_idx >= st.active_workers {
+                                st = shared.work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                            seen_gen = st.generation;
+                            let batch_ptr = unsafe {
+                                (st.batches_ptr as *mut Vec<(usize, &'static mut [u8])>)
+                                    .add(worker_idx) as *mut ()
+                            };
+                            (st.generation, batch_ptr, st.fn_ptr, st.ctx_ptr)
+                        };
+                        struct DoneGuard<'a> {
+                            inner: &'a RowPoolInner,
+                            job_gen: u64,
+                            panic_payload: Option<Box<dyn std::any::Any + Send>>,
+                        }
+                        impl Drop for DoneGuard<'_> {
+                            fn drop(&mut self) {
+                                let mut st =
+                                    self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                                if st.generation == self.job_gen {
+                                    if let Some(payload) = self.panic_payload.take() {
+                                        if st.panicked.is_none() {
+                                            st.panicked = Some(payload);
+                                        }
+                                    }
+                                    st.remaining = st.remaining.saturating_sub(1);
+                                    if st.remaining == 0 {
+                                        self.inner.done_cv.notify_all();
+                                    }
+                                }
+                            }
+                        }
+                        let mut guard = DoneGuard {
+                            inner: &shared,
+                            job_gen,
+                            panic_payload: None,
+                        };
+                        if let Err(payload) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                                (fn_ptr)(ctx_ptr as *const (), batch_ptr);
+                            }))
+                        {
+                            guard.panic_payload = Some(payload);
+                        }
+                    }
+                });
+            if res.is_ok() {
+                spawned += 1;
+            } else {
+                break;
+            }
+        }
+        Self {
+            dispatch_lock: std::sync::Mutex::new(()),
+            inner,
+            worker_count: spawned,
+        }
+    }
+}
+
 /// CPU-only optical passes. Workers receive disjoint row slices; callers finish
 /// all GDI work before entering and don't present until the scoped jobs join.
-pub(crate) fn with_pixel_rows_parallel(
+pub(crate) fn with_pixel_rows_parallel<F>(
     pixels: &mut [u8],
     stride: usize,
     rows: std::ops::Range<usize>,
     work_pixels: usize,
     threshold: usize,
-    render_rows: impl Fn(Vec<(usize, &mut [u8])>) + Sync,
-) {
+    render_rows: F,
+) where
+    F: Fn(Vec<(usize, &mut [u8])>) + Sync,
+{
     static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static POOL: std::sync::OnceLock<RowPool> = std::sync::OnceLock::new();
+    let max_workers = *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 8))
+    });
     let workers = if work_pixels < threshold || crate::motion::low_power() {
         1
     } else {
-        *WORKERS.get_or_init(|| {
-            std::thread::available_parallelism()
-                .map_or(1, |n| (n.get() / 2).clamp(1, 8))
-        })
+        max_workers.min(if work_pixels < 196_608 { 4 } else { 8 })
     };
-    let workers = workers.min(if work_pixels < 196_608 { 4 } else { 8 });
-    let mut batches: Vec<Vec<_>> = (0..workers)
+    if workers <= 1 {
+        let mut batch = Vec::with_capacity(rows.len());
+        for (y, row) in pixels.chunks_exact_mut(stride).enumerate().take(rows.end).skip(rows.start) {
+            batch.push((y, row));
+        }
+        render_rows(batch);
+        return;
+    }
+
+    let pool = POOL.get_or_init(|| RowPool::new(max_workers - 1));
+    let workers = workers.min(pool.worker_count + 1);
+    if workers <= 1 {
+        let mut batch = Vec::with_capacity(rows.len());
+        for (y, row) in pixels.chunks_exact_mut(stride).enumerate().take(rows.end).skip(rows.start) {
+            batch.push((y, row));
+        }
+        render_rows(batch);
+        return;
+    }
+
+    let mut batches: Vec<Vec<(usize, &mut [u8])>> = (0..workers)
         .map(|_| Vec::with_capacity(rows.len().div_ceil(workers)))
         .collect();
     for (y, row) in pixels.chunks_exact_mut(stride).enumerate().take(rows.end).skip(rows.start) {
@@ -2218,18 +2443,47 @@ pub(crate) fn with_pixel_rows_parallel(
         // other workers only get the much cheaper flat middle of the card.
         batches[y % workers].push((y, row));
     }
-    if workers == 1 {
-        render_rows(batches.pop().unwrap());
-    } else {
-        std::thread::scope(|scope| {
-            let ui_rows = batches.pop().unwrap();
-            let render = &render_rows;
-            for rows in batches {
-                scope.spawn(move || render(rows));
-            }
-            render(ui_rows);
-        });
+    let ui_rows = batches.pop().unwrap();
+    let active_workers = workers - 1;
+
+    let _dispatch = pool.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut st = pool.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.generation = st.generation.wrapping_add(1);
+        st.active_workers = active_workers;
+        st.remaining = active_workers;
+        st.batches_ptr = batches.as_mut_ptr() as usize;
+        st.fn_ptr = invoke_batch::<F>;
+        st.ctx_ptr = (&render_rows as *const F) as usize;
+        st.panicked = None;
     }
+    pool.inner.work_cv.notify_all();
+
+    struct WaitGuard<'a> {
+        inner: &'a RowPoolInner,
+    }
+    impl Drop for WaitGuard<'_> {
+        fn drop(&mut self) {
+            let panicked = {
+                let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                while st.remaining > 0 {
+                    st = self.inner.done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                st.active_workers = 0;
+                st.batches_ptr = 0;
+                st.fn_ptr = noop_batch;
+                st.ctx_ptr = 0;
+                st.panicked.take()
+            };
+            if let Some(payload) = panicked {
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
+    let _wait = WaitGuard { inner: &pool.inner };
+    render_rows(ui_rows);
 }
 impl Glass {
     unsafe fn wallpaper_placement(&self, hwnd: HWND, window: RECT) -> (f32, f32, f32, f32, f32) {
@@ -2730,8 +2984,8 @@ unsafe fn resolve_live_wallpaper_file() -> Option<PathBuf> {
 fn sample_channel(src: &[u8], w: usize, h: usize, x: f32, y: f32, ch: usize) -> f32 {
     let cx = x.clamp(0.0, (w - 1) as f32);
     let cy = y.clamp(0.0, (h - 1) as f32);
-    let x0 = cx.floor() as usize;
-    let y0 = cy.floor() as usize;
+    let x0 = cx as usize;
+    let y0 = cy as usize;
     let x1 = (x0 + 1).min(w - 1);
     let y1 = (y0 + 1).min(h - 1);
     let fx = cx - x0 as f32;

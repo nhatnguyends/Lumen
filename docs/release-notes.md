@@ -1,10 +1,10 @@
-Lumen 0.1.10 introduces multi-monitor duplicate widgets with two-way shared-source synchronization, automatic live DPI/resolution scaling, unified multi-row App Dock group contours, and reorganized General Settings:
+Lumen 0.1.11 focuses on App Dock scrolling and hover smoothness in both Low Power Mode and Normal Mode:
 
-- **Multi-Monitor Independent Duplicates & Two-Way Shared Sync**: Duplicate widgets run independently per selected display at native DPI with isolated hover/click states, per-monitor fusion, and separate saved position/size per monitor, while syncing Sticky Notes content, App Dock ordering/groups, Control Center controls, and individual widget settings two-way across all displays.
-- **Automatic Live DPI Scaling & Work-Area Clamping**: Widgets stay bounded within the active monitor work area and rescale automatically without manual interaction whenever display resolution or Windows scale changes.
-- **Non-Destructive Fusion Overlap**: Dragging another widget over part of a fused group no longer breaks the existing fused widgets apart.
-- **App Dock Multi-Row Group Contours, Fewest-Rows Packing & Crisp Icons**: Multi-row groups render inside one unified rounded background polygon, pack horizontally with the fewest rows before forming compact rectangular blocks, and trim/extract Windows icons consistently across machines.
-- **General Settings Reorganization**: Moved visual material controls (blur size, frosted glass, liquid glass) into a top **Background** section and grouped remaining options under **Misc**.
+- **Consistent Group Liquid Glass During Scroll**: App Dock group containers maintain consistent Liquid Glass refraction and rim highlights throughout scrolling without visual popping or fallback degradation.
+- **Cached Integer `GroupRimLut` & `groups_base` Layer Caching**: Precomputed integer rim lookup tables (`GroupRimLut`) and cached `groups_base` layers eliminate redundant per-frame group glass recomputation.
+- **Persistent Worker Pool & DPI `.5` Cache Key Stability**: Parallel rendering reuses a persistent worker thread pool, and fractional `.5` DPI scale keys remain stable so cached layers and icons do not thrash.
+- **Axis-Aligned Hover Scaling Fast-Path**: App Dock hover scaling uses an axis-aligned fast-path for crisp, low-overhead frame blitting.
+- **Non-Blocking VSync & Input Pacing**: Non-blocking VSync and input pacing prevent frame-wait stalls during rapid scrolling and pointer interaction across both Low Power Mode and Normal Mode.
 
 Optional Python entry points remain available:
 
@@ -16,7 +16,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.10-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.11-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

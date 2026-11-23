@@ -42,7 +42,7 @@ use windows_sys::Win32::{
     System::{
         ApplicationInstallationAndServicing::*,
         LibraryLoader::GetModuleHandleW,
-        Threading::{CreateMutexW, GetCurrentProcess, GetProcessTimes},
+        Threading::{CreateMutexW, GetCurrentProcess, GetProcessTimes, INFINITE},
     },
     UI::{
         Controls::{Dialogs::*, EM_GETSEL, EM_LIMITTEXT, EM_SETCUEBANNER, WM_MOUSELEAVE},
@@ -133,6 +133,32 @@ impl Drop for SecondaryDock {
         }
     }
 }
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct LabelKey {
+    pub name: String,
+    pub width_q: i32,
+    pub dpi_bits: u32,
+    pub text_color: u32,
+}
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TileKey {
+    pub name: String,
+    pub icon_id: usize,
+    pub dpi_bits: u32,
+    pub text_color: u32,
+    pub labels_visible: bool,
+    pub icon_size: i32,
+    pub label_key: Option<LabelKey>,
+    pub size_q: [i32; 2],
+}
+struct CachedDockLayout {
+    query: String,
+    columns: usize,
+    has_add: bool,
+    dock_revision: u64,
+    visible: Rc<Vec<usize>>,
+    grid_layout: Rc<crate::geometry::DockGridLayout>,
+}
 enum Icon {
     Image(render::Image),
     Shell(HICON),
@@ -151,6 +177,8 @@ struct App {
     search_text: Option<(String, render::Image)>,
     list_base: Option<crate::compositor::Buffer>,
     list_base_key: String,
+    groups_base: Option<crate::compositor::Buffer>,
+    groups_base_key: String,
     pointer: [f32; 2],
     paint_time: f64,
     toolbar_pressed: Option<usize>,
@@ -171,6 +199,12 @@ struct App {
     clear_pressed: bool,
     catalog_rx: Option<std::sync::mpsc::Receiver<Vec<Item>>>,
     catalog_loaded: f64,
+    dock_revision: u64,
+    layout_generation: std::cell::Cell<u64>,
+    layout_cache: RefCell<Option<CachedDockLayout>>,
+    synced_layout_key: (u64, u64, i32, i32, usize, bool, bool),
+    scroll_was_moving: bool,
+    mouse_tracked: bool,
     search_cache: RefCell<Option<(String, usize, Vec<usize>)>>,
     search_ink: u32,
     search_muted: u32,
@@ -192,8 +226,8 @@ struct App {
     scaled_icons: HashMap<String, ((usize, u32), render::Image)>,
     icon_shadows: HashMap<String, (u32, render::Image)>,
     label_shadows: HashMap<String, (u32, render::Image)>,
-    labels: HashMap<String, (String, render::Image)>,
-    tile_cache: HashMap<String, (String, f32, render::Image)>,
+    labels: HashMap<String, (LabelKey, render::Image)>,
+    tile_cache: HashMap<String, (TileKey, f32, render::Image)>,
     pub(super) add_tile: Option<((i32, i32, i32, u32, u32, u32, bool), render::Image)>,
     profile_counts: [u32; 4],
     label_budget: u8,
@@ -381,6 +415,9 @@ impl App {
                     self.frame = None;
                     self.background = None;
                     self.list_base = None;
+                    self.list_base_key.clear();
+                    self.groups_base = None;
+                    self.groups_base_key.clear();
                     if !self.settings.hwnd.is_null() {
                         ShowWindow(self.settings.hwnd, SW_HIDE);
                     }
@@ -620,11 +657,19 @@ impl App {
             self.status = format!("Save failed: {error}");
         }
     }
+    pub(super) fn bump_dock_revision(&mut self) {
+        self.dock_revision = self.dock_revision.wrapping_add(1).max(1);
+        self.search_cache.get_mut().take();
+        self.layout_cache.get_mut().take();
+        self.groups_base = None;
+        self.groups_base_key.clear();
+        self.synced_layout_key = (0, 0, 0, 0, 0, false, false);
+    }
     fn save(&mut self) {
         if self.smoke {
             return;
         }
-        self.search_cache.get_mut().take();
+        self.bump_dock_revision();
         let result = if self.is_duplicate {
             // Duplicate docks share data, groups, ordering, and appearance, but
             // must preserve the primary monitor's saved position and size on disk.
@@ -646,26 +691,68 @@ impl App {
             }
         }
     }
-    fn visible(&self, hwnd: HWND) -> Vec<usize> {
+    pub(super) unsafe fn cached_visible_and_layout(
+        &self,
+        hwnd: HWND,
+    ) -> (Rc<Vec<usize>>, Rc<crate::geometry::DockGridLayout>) {
+        let columns = self.columns(hwnd);
+        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
         if let Some(drag) = self.tile_drag.as_ref().filter(|d| d.active) {
-            return drag
+            let visible: Vec<usize> = drag
                 .preview
                 .iter()
                 .filter_map(|id| self.dock.items.iter().position(|i| &i.id == id))
                 .collect();
+            let layout = self.grid_layout_for(&visible, columns, has_add);
+            return (Rc::new(visible), Rc::new(layout));
         }
-        if !self.query.is_empty() {
-            let mut cache = self.search_cache.borrow_mut();
-            if let Some((q, count, results)) = &*cache {
-                if *q == self.query && *count == self.dock.items.len() {
-                    return results.clone();
+        {
+            let cache = self.layout_cache.borrow();
+            if let Some(c) = cache.as_ref() {
+                if c.dock_revision == self.dock_revision
+                    && c.columns == columns
+                    && c.has_add == has_add
+                    && c.query == self.query
+                {
+                    return (Rc::clone(&c.visible), Rc::clone(&c.grid_layout));
                 }
             }
-            let results = self.dock.matches(&self.query);
-            *cache = Some((self.query.clone(), self.dock.items.len(), results.clone()));
-            return results;
         }
-        self.dock.layout_matches(&self.query, self.columns(hwnd))
+        let visible = if !self.query.is_empty() {
+            let mut sc = self.search_cache.borrow_mut();
+            if let Some((q, count, results)) = &*sc {
+                if *q == self.query && *count == self.dock.items.len() {
+                    results.clone()
+                } else {
+                    let results = self.dock.matches(&self.query);
+                    *sc = Some((self.query.clone(), self.dock.items.len(), results.clone()));
+                    results
+                }
+            } else {
+                let results = self.dock.matches(&self.query);
+                *sc = Some((self.query.clone(), self.dock.items.len(), results.clone()));
+                results
+            }
+        } else {
+            self.dock.layout_matches(&self.query, columns)
+        };
+        let grid_layout = self.grid_layout_for(&visible, columns, has_add);
+        let visible = Rc::new(visible);
+        let grid_layout = Rc::new(grid_layout);
+        let gen = self.layout_generation.get().wrapping_add(1).max(1);
+        self.layout_generation.set(gen);
+        *self.layout_cache.borrow_mut() = Some(CachedDockLayout {
+            query: self.query.clone(),
+            columns,
+            has_add,
+            dock_revision: self.dock_revision,
+            visible: Rc::clone(&visible),
+            grid_layout: Rc::clone(&grid_layout),
+        });
+        (visible, grid_layout)
+    }
+    fn visible(&self, hwnd: HWND) -> Vec<usize> {
+        unsafe { (*self.cached_visible_and_layout(hwnd).0).clone() }
     }
     unsafe fn dimensions(&self, hwnd: HWND) -> (i32, i32) {
         let mut rect: RECT = zeroed();
@@ -701,10 +788,7 @@ impl App {
         crate::geometry::pack_dock_grid(&groups, has_add, columns)
     }
     pub(super) unsafe fn grid_layout(&self, hwnd: HWND) -> crate::geometry::DockGridLayout {
-        let visible = self.visible(hwnd);
-        let columns = self.columns(hwnd);
-        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
-        self.grid_layout_for(&visible, columns, has_add)
+        (*self.cached_visible_and_layout(hwnd).1).clone()
     }
     unsafe fn hit(&self, hwnd: HWND, x: i32, y: i32) -> Option<usize> {
         let (width, height) = self.dimensions(hwnd);
@@ -724,10 +808,21 @@ impl App {
             return None;
         }
         let row = (content_y / self.row_height() as f32) as usize;
-        let visible = self.visible(hwnd);
-        let has_add = self.query.trim().is_empty() && self.group_selection.is_none();
-        let layout = self.grid_layout_for(&visible, columns, has_add);
+        let (_, layout) = self.cached_visible_and_layout(hwnd);
         layout.cells.iter().position(|&(c, r)| c == col && r == row)
+    }
+    pub(super) fn toolbar_count(&self) -> usize {
+        let manifests = self.packages.manifests();
+        let pinned = &self.dock.pinned_widgets;
+        let mut count = 2usize;
+        for (idx, id) in pinned.iter().enumerate() {
+            if manifests.iter().any(|m| m.id == *id)
+                && !pinned[..idx].iter().any(|prev| prev == id)
+            {
+                count += 1;
+            }
+        }
+        count
     }
     fn toolbar_items(&self) -> Vec<Option<String>> {
         let mut items = vec![None];
@@ -742,10 +837,10 @@ impl App {
         items
     }
     fn header_layout(&self, w: i32) -> crate::geometry::DockHeader {
-        crate::geometry::dock_header_with_toolbar(w, !self.query.is_empty(), self.toolbar_items().len())
+        crate::geometry::dock_header_with_toolbar(w, !self.query.is_empty(), self.toolbar_count())
     }
     fn toolbar_hit(&self, w: i32, p: [f32; 2]) -> Option<usize> {
-        let count = self.toolbar_items().len();
+        let count = self.toolbar_count();
         let header = self.header_layout(w);
         if !self.search_visible() || (p[1] - header.toolbar_y).abs() > 17. {
             return None;
@@ -774,6 +869,7 @@ impl App {
         );
     }
     unsafe fn rebuild_style(&mut self, hwnd: HWND) {
+        self.bump_dock_revision();
         let old_font = self.search_font;
         self.search_font = font(self.px(14), false);
         SendMessageW(self.edit, WM_SETFONT, self.search_font as usize, 1);
@@ -971,11 +1067,15 @@ impl App {
                 d.frame = None;
                 d.background = None;
                 d.list_base = None;
+                d.list_base_key.clear();
+                d.groups_base = None;
+                d.groups_base_key.clear();
                 d.overlay = None;
                 d.search_frost = None;
                 d.search_text = None;
                 d.add_tile = None;
                 d.tile_cache.clear();
+                d.bump_dock_revision();
                 d.layout_edit(d_hwnd);
                 d.rebuild_style(d_hwnd);
             }
@@ -1049,17 +1149,19 @@ impl App {
         if self.dock.theme == crate::accent::THEME {
             self.dock.light = crate::accent::light(self.accent_color);
         }
-        self.search_cache.get_mut().take();
         self.tile_cache.clear();
         self.background_key.clear();
         self.list_base_key.clear();
         self.frame = None;
         self.background = None;
         self.list_base = None;
+        self.groups_base = None;
+        self.groups_base_key.clear();
         self.overlay = None;
         self.search_frost = None;
         self.search_text = None;
         self.add_tile = None;
+        self.bump_dock_revision();
         if let Some(sel) = &mut self.group_selection {
             sel.checked
                 .retain(|id| self.dock.items.iter().any(|i| !i.catalog && i.id == *id));
@@ -1169,6 +1271,8 @@ impl App {
             background: None,
             list_base: None,
             list_base_key: String::new(),
+            groups_base: None,
+            groups_base_key: String::new(),
             pointer: [-1000.; 2],
             paint_time: 0.,
             toolbar_pressed: None,
@@ -1195,6 +1299,12 @@ impl App {
             clear_pressed: false,
             catalog_rx: None,
             catalog_loaded: 0.,
+            dock_revision: 1,
+            layout_generation: std::cell::Cell::new(0),
+            layout_cache: RefCell::new(None),
+            synced_layout_key: (0, 0, 0, 0, 0, false, false),
+            scroll_was_moving: false,
+            mouse_tracked: false,
             search_cache: RefCell::new(None),
             search_ink: rgb(248, 250, 253),
             search_muted: rgb(193, 202, 215),
@@ -1522,7 +1632,7 @@ impl App {
         }
         self.keyboard_selection = true;
         let columns = self.columns(hwnd);
-        let visible = self.visible(hwnd);
+        let (visible, _) = self.cached_visible_and_layout(hwnd);
         match key {
             0x0D => {
                 if let Some(index) = visible.get(self.selected) {
@@ -1534,6 +1644,7 @@ impl App {
                 if !self.query.is_empty() {
                     SetWindowTextW(self.edit, wide("").as_ptr());
                     self.query.clear();
+                    self.bump_dock_revision();
                     self.selected = 0;
                     self.scroll.snap(0.);
                 } else {
@@ -1546,8 +1657,8 @@ impl App {
             0x28 => self.selected = (self.selected + columns).min(visible.len().saturating_sub(1)),
             _ => return,
         }
-        let selected_row = self
-            .grid_layout(hwnd)
+        let (_, layout) = self.cached_visible_and_layout(hwnd);
+        let selected_row = layout
             .cells
             .get(self.selected)
             .map_or(0, |&(_, r)| r);
@@ -1690,7 +1801,7 @@ impl App {
         let own_alpha = (self.dock.opacity * 2.55).round() as u8;
         let group_op = crate::fusion::group_opacities(hwnd, own_alpha);
         let moving = self.moving_window || crate::fusion::is_moving(hwnd);
-        let toolbar_items = self.toolbar_items();
+        let toolbar_count = self.toolbar_count();
         let fast_header_key = if bg_cached
             && self.resize_drag.is_none()
             && self.group_selection.is_none()
@@ -1716,7 +1827,7 @@ impl App {
                     hk.push_str(&format!(":{o}"));
                 }
             }
-            for i in 0..toolbar_items.len() {
+            for i in 0..toolbar_count {
                 let a = self.motion.toolbar.get(&i).map_or(0., |t| t.sample(now));
                 let r = self
                     .motion
@@ -1886,7 +1997,7 @@ impl App {
                     hk.push_str(&format!(":{o}"));
                 }
             }
-            for i in 0..toolbar_items.len() {
+            for i in 0..toolbar_count {
                 let a = self.motion.toolbar.get(&i).map_or(0., |t| t.sample(now));
                 let r = self
                     .motion
@@ -1916,7 +2027,38 @@ impl App {
                     .list_base
                     .as_ref()
                     .is_some_and(|b| b.width == frame.width && b.height == frame.height && b.dpi == self.dpi));
-        if reused_header {
+        let groups_cache_eligible = reused_header
+            && self.list_base.is_some()
+            && !self.scroll.moving(now)
+            && self.resize_drag.is_none()
+            && self.group_selection.is_none()
+            && self.tile_drag.is_none()
+            && self.motion.group.values().all(|t| t.sample(now) <= 0.001);
+        let groups_key = if groups_cache_eligible {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                self.list_base_key,
+                self.scroll.value(now).to_bits(),
+                self.dock_revision,
+                self.columns(hwnd),
+                self.dock.icon_size,
+                self.labels_visible(),
+                crate::glass::liquid_glass(),
+                self.dock.opacity.to_bits(),
+            )
+        } else {
+            String::new()
+        };
+        let groups_cache_hit = groups_cache_eligible
+            && !groups_key.is_empty()
+            && groups_key == self.groups_base_key
+            && self
+                .groups_base
+                .as_ref()
+                .is_some_and(|b| b.width == frame.width && b.height == frame.height && b.dpi == self.dpi);
+        if groups_cache_hit {
+            frame.copy_from(self.groups_base.as_ref().unwrap().dc);
+        } else if reused_header {
             frame.copy_from(self.list_base.as_ref().unwrap().dc);
         } else {
         if self.search_visible() || self.group_selection.is_some() {
@@ -1983,6 +2125,7 @@ impl App {
                     1.,
                 );
             }
+            let toolbar_items = self.toolbar_items();
             for (i, item) in toolbar_items.iter().enumerate() {
                 let amount = self
                     .motion
@@ -2133,8 +2276,9 @@ impl App {
         render::flush(dc);
         }
         let header_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-        let needs_fade =
-            self.grid_top() + self.grid_layout(hwnd).rows as i32 * self.row_height() > h - 14;
+        let needs_fade = self.grid_top()
+            + self.cached_visible_and_layout(hwnd).1.rows as i32 * self.row_height()
+            > h - 14;
         let base = if needs_fade || !header_key.is_empty() {
             let base = self
                 .list_base
@@ -2150,6 +2294,8 @@ impl App {
         } else {
             self.list_base = None;
             self.list_base_key.clear();
+            self.groups_base = None;
+            self.groups_base_key.clear();
             None
         };
         let clip = SaveDC(dc);
@@ -2160,7 +2306,17 @@ impl App {
             self.px(w - 14),
             self.px(h - 14),
         );
-        self.paint_tiles(dc, hwnd, w, h);
+        self.paint_tiles(
+            dc,
+            hwnd,
+            w,
+            h,
+            frame.width,
+            frame.height,
+            groups_cache_hit,
+            groups_cache_eligible,
+            groups_key,
+        );
         render::flush(dc);
         let tiles_ms = frame_started.elapsed().as_secs_f64() * 1000.;
         RestoreDC(dc, clip);
@@ -2704,6 +2860,9 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
             app.frame = None;
             app.background = None;
             app.list_base = None;
+            app.list_base_key.clear();
+            app.groups_base = None;
+            app.groups_base_key.clear();
             app.overlay = None;
             app.search_frost = None;
             app.search_text = None;
@@ -2714,6 +2873,7 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
             app.scaled_icons.clear();
             app.icon_shadows.clear();
             app.background_key.clear();
+            app.bump_dock_revision();
             app.layout_edit(hwnd);
             app.rebuild_style(hwnd);
         } else {
@@ -3126,7 +3286,7 @@ unsafe extern "system" fn wndproc(
             if app.bar_drag.take().is_some() {
                 ReleaseCapture();
             } else if let Some(button) = app.toolbar_pressed.take() {
-                let count = app.toolbar_items().len();
+                let count = app.toolbar_count();
                 let now = app.now();
                 app.motion.toolbar_press(None, count, now);
                 app.arm_motion(hwnd);
@@ -3140,7 +3300,9 @@ unsafe extern "system" fn wndproc(
                 app.motion.press(None, now);
                 app.arm_motion(hwnd);
                 ReleaseCapture();
-                if app.hit(hwnd, p[0] as i32, p[1] as i32) == Some(app.visible(hwnd).len()) {
+                if app.hit(hwnd, p[0] as i32, p[1] as i32)
+                    == Some(app.cached_visible_and_layout(hwnd).0.len())
+                {
                     app.add_anything(hwnd);
                 }
             } else if app.resize_drag.is_some() {
@@ -3311,6 +3473,7 @@ unsafe extern "system" fn wndproc(
             let mut text = vec![0u16; len + 1];
             GetWindowTextW(app.edit, text.as_mut_ptr(), text.len() as i32);
             app.query = String::from_utf16_lossy(&text[..len]).trim().to_owned();
+            app.bump_dock_revision();
             app.layout_edit(hwnd);
             app.selected = 0;
             app.scroll.snap(0.);
@@ -3368,7 +3531,7 @@ unsafe extern "system" fn wndproc(
             if let Some(button) = app.toolbar_hit(width, p) {
                 SetFocus(hwnd);
                 app.toolbar_pressed = Some(button);
-                let count = app.toolbar_items().len();
+                let count = app.toolbar_count();
                 let now = app.now();
                 app.motion.toolbar_press(Some(button), count, now);
                 app.arm_motion(hwnd);
@@ -3376,7 +3539,7 @@ unsafe extern "system" fn wndproc(
             } else if app.search_visible() && (14..60).contains(&y) {
                 SetFocus(app.edit);
             } else if let Some(pos) = app.hit(hwnd, x, y) {
-                if pos == app.visible(hwnd).len() {
+                if pos == app.cached_visible_and_layout(hwnd).0.len() {
                     SetFocus(hwnd);
                     app.add_pressed = true;
                     let now = app.now();
@@ -3413,16 +3576,20 @@ unsafe extern "system" fn wndproc(
             } else {
                 app.pointer_move(hwnd, [x as f32 / dpi, y as f32 / dpi]);
             }
-            let mut tracking = TRACKMOUSEEVENT {
-                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: hwnd,
-                dwHoverTime: 0,
-            };
-            TrackMouseEvent(&mut tracking);
+            if !app.mouse_tracked {
+                let mut tracking = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut tracking);
+                app.mouse_tracked = true;
+            }
             0
         }
         WM_MOUSELEAVE => {
+            app.mouse_tracked = false;
             app.check_widget_pointer(hwnd);
             app.popup_leave(hwnd);
             if app.tile_drag.is_none() {
@@ -3471,7 +3638,12 @@ unsafe extern "system" fn wndproc(
                 app.pointer
             };
             app.scroll.by(-(delta as f32) / 120. * 72., now);
-            if app.tile_drag.is_none() && app.bar_drag.is_none() && pointer[0] >= 0. {
+            app.pointer = pointer;
+            if app.scroll.moving(now) {
+                if app.hover.take().is_some() || app.motion.hovered.is_some() {
+                    app.motion.hover(None, pointer, now);
+                }
+            } else if app.tile_drag.is_none() && app.bar_drag.is_none() && pointer[0] >= 0. {
                 app.hover_tile(hwnd, pointer);
             }
             app.arm_motion(hwnd);
@@ -3501,7 +3673,7 @@ unsafe extern "system" fn wndproc(
             }
             let item = app
                 .hit(hwnd, client_p[0] as i32, client_p[1] as i32)
-                .and_then(|pos| app.visible(hwnd).get(pos).copied());
+                .and_then(|pos| app.cached_visible_and_layout(hwnd).0.get(pos).copied());
             let mut screen = POINT { x, y };
             ClientToScreen(hwnd, &mut screen);
             app.context_menu(hwnd, screen.x, screen.y, item);
@@ -3520,7 +3692,10 @@ unsafe extern "system" fn wndproc(
                 ClientToScreen(hwnd, &mut point);
                 x = point.x;
                 y = point.y;
-                app.visible(hwnd).get(app.selected).copied()
+                app.cached_visible_and_layout(hwnd)
+                    .0
+                    .get(app.selected)
+                    .copied()
             } else {
                 let mut point = POINT { x, y };
                 ScreenToClient(hwnd, &mut point);
@@ -3529,7 +3704,7 @@ unsafe extern "system" fn wndproc(
                     return 0;
                 }
                 app.hit(hwnd, client_p[0] as i32, client_p[1] as i32)
-                    .and_then(|pos| app.visible(hwnd).get(pos).copied())
+                    .and_then(|pos| app.cached_visible_and_layout(hwnd).0.get(pos).copied())
             };
             app.context_menu(hwnd, x, y, item);
             0
@@ -3677,7 +3852,6 @@ unsafe extern "system" fn wndproc(
             app.refresh_manager();
             app.packages.tick();
             if let Some(items) = app.catalog_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-                app.search_cache.get_mut().take();
                 app.catalog_rx = None;
                 app.catalog_loaded = app.now();
                 app.dock.items.retain(|i| !i.catalog);
@@ -3696,6 +3870,7 @@ unsafe extern "system" fn wndproc(
                 app.dock.items.extend(items.into_iter().filter(|i| {
                     names.insert(i.name.to_lowercase()) && targets.insert(i.target.to_lowercase())
                 }));
+                app.bump_dock_revision();
                 if !app.query.is_empty() {
                     app.arm_motion(hwnd);
                 }
@@ -4065,6 +4240,8 @@ pub fn run() -> Result<(), String> {
             background: None,
             list_base: None,
             list_base_key: String::new(),
+            groups_base: None,
+            groups_base_key: String::new(),
             pointer: [-1000.; 2],
             paint_time: 0.,
             toolbar_pressed: None,
@@ -4091,6 +4268,12 @@ pub fn run() -> Result<(), String> {
             clear_pressed: false,
             catalog_rx: Some(crate::catalog::start()),
             catalog_loaded: 0.,
+            dock_revision: 1,
+            layout_generation: std::cell::Cell::new(0),
+            layout_cache: RefCell::new(None),
+            synced_layout_key: (0, 0, 0, 0, 0, false, false),
+            scroll_was_moving: false,
+            mouse_tracked: false,
             search_cache: RefCell::new(None),
             search_ink: rgb(248, 250, 253),
             search_muted: rgb(193, 202, 215),
@@ -4260,17 +4443,43 @@ pub fn run() -> Result<(), String> {
         }
         reset_quit_requested();
         let mut message: MSG = zeroed();
+        let mut input_streak = 0u32;
         loop {
             if quit_pending() {
                 break;
             }
             // GetMessage normally prioritizes posted messages over hardware
             // input. Our self-posted frame stream must never starve mouse or
-            // keyboard events while another widget animates continuously.
-            let result = if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE | PM_QS_INPUT) != 0 {
+            // keyboard events while another widget animates continuously, while
+            // bounding consecutive input dispatches so frames/timers still run.
+            let result = if input_streak < 8
+                && PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE | PM_QS_INPUT) != 0
+            {
+                input_streak += 1;
+                if message.message == WM_QUIT { 0 } else { 1 }
+            } else if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                input_streak = 0;
                 if message.message == WM_QUIT { 0 } else { 1 }
             } else {
-                GetMessageW(&mut message, null_mut(), 0, 0)
+                input_streak = 0;
+                if let Some(handle) = crate::motion::step_pending_vsync(std::time::Instant::now()) {
+                    if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        if message.message == WM_QUIT { 0 } else { 1 }
+                    } else {
+                        MsgWaitForMultipleObjectsEx(
+                            1,
+                            &handle,
+                            INFINITE,
+                            QS_ALLINPUT,
+                            MWMO_INPUTAVAILABLE,
+                        );
+                        continue;
+                    }
+                } else if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if message.message == WM_QUIT { 0 } else { 1 }
+                } else {
+                    GetMessageW(&mut message, null_mut(), 0, 0)
+                }
             };
             if result <= 0 {
                 if result == -1 {
@@ -4322,7 +4531,7 @@ pub fn run() -> Result<(), String> {
             if (was_paint || motion_frame || paint_pumped > 0)
                 && ((GetQueueStatus(QS_PAINT) >> 16) & QS_PAINT == 0)
             {
-                crate::motion::flush_pending_vsync(std::time::Instant::now());
+                let _ = crate::motion::step_pending_vsync(std::time::Instant::now());
             }
         }
         crate::motion::clear_pending_vsync();

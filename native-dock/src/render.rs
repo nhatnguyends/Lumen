@@ -164,6 +164,19 @@ struct ShadowSurface {
 thread_local! {static GROUPS:RefCell<HashMap<(u32,u32,u32,u32),Image>>=RefCell::new(HashMap::new());}
 thread_local! {static GROUP_POLYS:RefCell<HashMap<Vec<i32>,Image>>=RefCell::new(HashMap::new());}
 thread_local! {static HOVERS:RefCell<HashMap<(u32,u32,u32,u32,bool),Image>>=RefCell::new(HashMap::new());}
+#[inline]
+pub(crate) fn stable_dim_px(delta_dip: f32, scale: f32) -> i32 {
+    (((delta_dip * 64.0).round() / 64.0) * scale).round() as i32
+}
+#[inline]
+fn group_surface_key(r: [f32; 4], radius: f32, scale: f32) -> (u32, u32, u32, u32) {
+    (
+        stable_dim_px(r[2] - r[0], scale).max(1) as u32,
+        stable_dim_px(r[3] - r[1], scale).max(1) as u32,
+        (radius * scale * 16.).round() as u32,
+        (scale * 1000.).round() as u32,
+    )
+}
 thread_local! {static GLOW_SPRITE:RefCell<Option<Image>>=RefCell::new(None);}
 thread_local! {static SHADOWS:RefCell<HashMap<(u32,u32,u32,u32,u32),ShadowSurface>>=RefCell::new(HashMap::new());}
 thread_local! {static FONTS:RefCell<HashMap<(i32,u16),CachedFont>>=RefCell::new(HashMap::new());}
@@ -298,6 +311,7 @@ pub fn clear_caches() {
     crate::surface::clear_cache();
     crate::lenses::clear_cache();
     crate::settings_ui::clear_cache();
+    crate::compositor::clear_group_rim_cache();
     SHADOWS.with(|shadows| shadows.borrow_mut().clear());
     GROUPS.with(|groups| groups.borrow_mut().clear());
     GROUP_POLYS.with(|groups| groups.borrow_mut().clear());
@@ -1037,8 +1051,8 @@ impl Batch {
             return true;
         }
         let _cost = Cost::new(3);
-        let w_px = ((r[2] - r[0]) * self.scale).round().max(1.) as u32;
-        let h_px = ((r[3] - r[1]) * self.scale).round().max(1.) as u32;
+        let w_px = stable_dim_px(r[2] - r[0], self.scale).max(1) as u32;
+        let h_px = stable_dim_px(r[3] - r[1], self.scale).max(1) as u32;
         let key = (
             w_px,
             h_px,
@@ -1051,7 +1065,7 @@ impl Batch {
         HOVERS.with(|cache| {
             let mut cache = cache.borrow_mut();
             if !cache.contains_key(&key) {
-                if cache.len() >= 16 {
+                if cache.len() >= 32 {
                     cache.clear();
                 }
                 let width = key.0 + pad * 2;
@@ -1073,10 +1087,11 @@ impl Batch {
                     cache.insert(key, image);
                 }
             }
+            let sx = ((r[0] - p) * self.scale).round() / self.scale;
             cache.get(&key).is_some_and(|image| {
                 self.blit_alpha(
                     image,
-                    [r[0] - p, r[1] - p, r[2] + p, r[3] + p],
+                    [sx, r[1] - p, sx + (r[2] - r[0]) + p * 2.0, r[3] + p],
                     amount.clamp(0., 1.),
                     false,
                 )
@@ -1163,13 +1178,15 @@ impl Batch {
             let channels = if target.opaque { 3 } else { 4 };
             let alpha_scale = alpha as f32 / 255.;
             let inv_glow_r = 64. / glow_r;
+            let glow_r2 = glow_r * glow_r;
             for y in top..bottom {
                 let py = y as f32 + 0.5;
-                let v = (py - cy) * inv_glow_r + 64. - 0.5;
-                let iy = v.floor() as i32;
-                if iy < -1 || iy >= 128 {
+                let dy = py - cy;
+                let v = dy * inv_glow_r + 64. - 0.5;
+                if v < -1.0 || v >= 128.0 {
                     continue;
                 }
+                let iy = if v < 0.0 { -1 } else { v as i32 };
                 let fy = v - iy as f32;
                 let wy0 = 1. - fy;
                 let wy1 = fy;
@@ -1177,16 +1194,20 @@ impl Batch {
                 let row_offset = y as usize * target.width * 4;
                 for x in left..right {
                     let px = x as f32 + 0.5;
+                    let dx = px - cx;
+                    if dx * dx + dy * dy >= glow_r2 {
+                        continue;
+                    }
                     let dist = crate::compositor::distance(px - rx0, local_y, rw, rh, rad, 0.);
                     let coverage = (0.5 - dist).clamp(0., 1.);
                     if coverage <= 0. {
                         continue;
                     }
-                    let u = (px - cx) * inv_glow_r + 64. - 0.5;
-                    let ix = u.floor() as i32;
-                    if ix < -1 || ix >= 128 {
+                    let u = dx * inv_glow_r + 64. - 0.5;
+                    if u < -1.0 || u >= 128.0 {
                         continue;
                     }
+                    let ix = if u < 0.0 { -1 } else { u as i32 };
                     let fx = u - ix as f32;
                     let wx0 = 1. - fx;
                     let wx1 = fx;
@@ -1201,7 +1222,7 @@ impl Batch {
                             sample_a += src[((qy as usize * 128 + qx as usize) * 4) + 3] as f32 * w;
                         }
                     }
-                    let a = (sample_a * alpha_scale * coverage).round() as u32;
+                    let a = (sample_a * alpha_scale * coverage + 0.5) as u32;
                     if a == 0 {
                         continue;
                     }
@@ -1219,18 +1240,13 @@ impl Batch {
     }
     pub fn group_surface(&self, r: [f32; 4], radius: f32, snapped: bool) -> bool {
         let _cost = Cost::new(3);
-        let key = (
-            ((r[2] - r[0]) * self.scale).round() as u32,
-            ((r[3] - r[1]) * self.scale).round() as u32,
-            (radius * self.scale * 16.).round() as u32,
-            (self.scale * 1000.).round() as u32,
-        );
+        let key = group_surface_key(r, radius, self.scale);
         let pad = (14. * self.scale).ceil() as u32;
         let p = pad as f32 / self.scale;
         GROUPS.with(|cache| {
             let mut cache = cache.borrow_mut();
             if !cache.contains_key(&key) {
-                if cache.len() >= 16 {
+                if cache.len() >= 32 {
                     cache.clear();
                 }
                 let width = key.0 + pad * 2;
@@ -1360,7 +1376,7 @@ pub fn ortho_group_polygon(spans: &[[f32; 4]]) -> Vec<[f32; 2]> {
     }
     clean
 }
-fn spans_bounds(spans: &[[f32; 4]]) -> [f32; 4] {
+pub(crate) fn spans_bounds(spans: &[[f32; 4]]) -> [f32; 4] {
     let mut b = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
     for s in spans {
         b[0] = b[0].min(s[0]);
@@ -1379,27 +1395,28 @@ fn with_cached_group_poly(
     let bounds = spans_bounds(spans);
     let pad = (14. * scale).ceil() as u32;
     let p = pad as f32 / scale;
-    let width = ((bounds[2] - bounds[0]) * scale).round().max(1.) as u32 + pad * 2;
-    let height = ((bounds[3] - bounds[1]) * scale).round().max(1.) as u32 + pad * 2;
+    let bw_dip = ((bounds[2] - bounds[0]) * 64.0).round() / 64.0;
+    let bh_dip = ((bounds[3] - bounds[1]) * 64.0).round() / 64.0;
+    let width = stable_dim_px(bounds[2] - bounds[0], scale).max(1) as u32 + pad * 2;
+    let height = stable_dim_px(bounds[3] - bounds[1], scale).max(1) as u32 + pad * 2;
     let mut key = Vec::with_capacity(3 + spans.len() * 4);
     key.push(spans.len() as i32);
     key.push((radius * scale * 16.).round() as i32);
     key.push((scale * 1000.).round() as i32);
     let mut rel_spans = Vec::with_capacity(spans.len());
     for s in spans {
-        let rel = [
-            s[0] - bounds[0] + p,
-            s[1] - bounds[1] + p,
-            s[2] - bounds[0] + p,
-            s[3] - bounds[1] + p,
-        ];
-        key.push(((s[0] - bounds[0]) * scale).round() as i32);
-        key.push(((s[1] - bounds[1]) * scale).round() as i32);
-        key.push(((s[2] - bounds[0]) * scale).round() as i32);
-        key.push(((s[3] - bounds[1]) * scale).round() as i32);
+        let rx0 = ((s[0] - bounds[0]) * 64.0).round() / 64.0;
+        let ry0 = ((s[1] - bounds[1]) * 64.0).round() / 64.0;
+        let rx1 = ((s[2] - bounds[0]) * 64.0).round() / 64.0;
+        let ry1 = ((s[3] - bounds[1]) * 64.0).round() / 64.0;
+        let rel = [rx0 + p, ry0 + p, rx1 + p, ry1 + p];
+        key.push(stable_dim_px(s[0] - bounds[0], scale));
+        key.push(stable_dim_px(s[1] - bounds[1], scale));
+        key.push(stable_dim_px(s[2] - bounds[0], scale));
+        key.push(stable_dim_px(s[3] - bounds[1], scale));
         rel_spans.push(rel);
     }
-    let rel_bounds = [p, p, p + (bounds[2] - bounds[0]), p + (bounds[3] - bounds[1])];
+    let rel_bounds = [p, p, p + bw_dip, p + bh_dip];
     let rel_verts = ortho_group_polygon(&rel_spans);
     if rel_verts.len() < 4 {
         return false;
@@ -1407,7 +1424,7 @@ fn with_cached_group_poly(
     GROUP_POLYS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(&key) {
-            if cache.len() >= 24 {
+            if cache.len() >= 48 {
                 cache.clear();
             }
             if let Some(mut image) =
@@ -1845,12 +1862,7 @@ impl Canvas {
     }
     pub fn group_surface_live(&self, r: [f32; 4], radius: f32, _live: bool) {
         let _cost = Cost::new(3);
-        let key = (
-            ((r[2] - r[0]) * self.scale).round() as u32,
-            ((r[3] - r[1]) * self.scale).round() as u32,
-            (radius * self.scale * 16.).round() as u32,
-            (self.scale * 1000.).round() as u32,
-        );
+        let key = group_surface_key(r, radius, self.scale);
         let pad = (14. * self.scale).ceil() as u32;
         let p = pad as f32 / self.scale;
         GROUPS.with(|cache| {
@@ -1873,7 +1885,7 @@ impl Canvas {
                 }
             }
             if !cache.contains_key(&key) {
-                if cache.len() >= 16 {
+                if cache.len() >= 32 {
                     cache.clear();
                 }
                 let width = key.0 + pad * 2;
@@ -1953,6 +1965,9 @@ impl Canvas {
             for x in 0..width {
                 let px = x as f32 + 0.5;
                 let (original, _, _) = sdf.signed_distance(px, py);
+                if original <= -1.5 * self.scale {
+                    continue;
+                }
                 let (shifted, _, _) = sdf.signed_distance(px - dx, py - dy_px);
                 let outside = (original / (1.5 * self.scale) + 0.5).clamp(0., 1.);
                 let alpha = 0.5 * (1. - (shifted / (sigma * 1.55)).tanh()) * outside;
@@ -3755,5 +3770,31 @@ mod tests {
         let px = trimmed._pixels.as_ref().unwrap();
         // Stored pixels are BGRA: B=20, G=30, R=240, A=255 (no R/B channel swap).
         assert_eq!([px[center], px[center + 1], px[center + 2], px[center + 3]], [20, 30, 240, 255]);
+    }
+
+    #[test]
+    fn group_cache_keys_stay_identical_across_fractional_scroll_offsets() {
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = Runtime::start().unwrap();
+        let row = 90.0f32;
+        let card_h = 86.0f32;
+        let scrolls = [0.0f32, 0.13, 0.37, 0.51, 0.89, 12.47, 57.99];
+        for dpi in [1.25f32, 1.75] {
+            clear_caches();
+            let target = unsafe { crate::compositor::Buffer::plain(800, 400, dpi).unwrap() };
+            let batch = unsafe { Batch::new(target.dc, dpi) };
+            for scroll in scrolls {
+                let single = [16.0, 100.0 - scroll, 200.0, 100.0 + card_h - scroll];
+                assert!(batch.group_surface(single, 20.0, false));
+                let l_spans = [
+                    [16.0, 100.0 - scroll, 500.0, 100.0 + card_h - scroll],
+                    [16.0, 100.0 + row - scroll, 250.0, 100.0 + row + card_h - scroll],
+                ];
+                assert!(batch.group_poly_surface(&l_spans, 20.0, false));
+                GROUPS.with(|c| assert_eq!(c.borrow().len(), 1));
+                GROUP_POLYS.with(|c| assert_eq!(c.borrow().len(), 1));
+            }
+        }
+        clear_caches();
     }
 }

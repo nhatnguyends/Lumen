@@ -1,9 +1,504 @@
 //! Premultiplied per-pixel window edges. No binary region and no screen capture.
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     mem::{size_of, zeroed},
     ptr::null_mut,
+    rc::Rc,
 };
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RimPixel {
+    lx: u16,
+    gx16: i16,
+    gy16: i16,
+    cx16: i8,
+    cy16: i8,
+    alpha: u8,
+    spec: u8,
+    weight: u8,
+    _pad: u8,
+}
+
+struct GroupRimLut {
+    w: usize,
+    h: usize,
+    interior_spans: Vec<[u16; 2]>,
+    row_interior: Vec<(u32, u32)>,
+    rim_pixels: Vec<RimPixel>,
+    row_rim: Vec<(u32, u32)>,
+}
+
+thread_local! {
+    static GROUP_RIM_CACHE: RefCell<HashMap<Vec<i32>, Rc<GroupRimLut>>> = RefCell::new(HashMap::new());
+}
+
+pub fn clear_group_rim_cache() {
+    GROUP_RIM_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+#[inline(always)]
+unsafe fn sample_ch_q4(src: *const u8, sw: usize, sh: usize, x16: i32, y16: i32, ch: usize) -> u32 {
+    let max_x16 = ((sw - 1) as i32) << 4;
+    let max_y16 = ((sh - 1) as i32) << 4;
+    let cx = x16.clamp(0, max_x16);
+    let cy = y16.clamp(0, max_y16);
+    let x0 = (cx >> 4) as usize;
+    let y0 = (cy >> 4) as usize;
+    let x1 = (x0 + 1).min(sw - 1);
+    let y1 = (y0 + 1).min(sh - 1);
+    let fx = (cx & 15) as u32;
+    let fy = (cy & 15) as u32;
+    let wx0 = 16 - fx;
+    let wy0 = 16 - fy;
+    let r0 = y0 * sw;
+    let r1 = y1 * sw;
+    let p00 = *src.add((r0 + x0) * 4 + ch) as u32;
+    let p10 = *src.add((r0 + x1) * 4 + ch) as u32;
+    let p01 = *src.add((r1 + x0) * 4 + ch) as u32;
+    let p11 = *src.add((r1 + x1) * 4 + ch) as u32;
+    let top = p00 * wx0 + p10 * fx;
+    let bot = p01 * wx0 + p11 * fx;
+    (top * wy0 + bot * fy + 128) >> 8
+}
+
+#[inline(always)]
+unsafe fn sample_bgr_q4(src: *const u8, sw: usize, sh: usize, x16: i32, y16: i32) -> [u32; 3] {
+    let max_x16 = ((sw - 1) as i32) << 4;
+    let max_y16 = ((sh - 1) as i32) << 4;
+    let cx = x16.clamp(0, max_x16);
+    let cy = y16.clamp(0, max_y16);
+    let x0 = (cx >> 4) as usize;
+    let y0 = (cy >> 4) as usize;
+    let x1 = (x0 + 1).min(sw - 1);
+    let y1 = (y0 + 1).min(sh - 1);
+    let fx = (cx & 15) as u32;
+    let fy = (cy & 15) as u32;
+    let wx0 = 16 - fx;
+    let wy0 = 16 - fy;
+    let w00 = wx0 * wy0;
+    let w10 = fx * wy0;
+    let w01 = wx0 * fy;
+    let w11 = fx * fy;
+    let i00 = (y0 * sw + x0) * 4;
+    let i10 = (y0 * sw + x1) * 4;
+    let i01 = (y1 * sw + x0) * 4;
+    let i11 = (y1 * sw + x1) * 4;
+    let b = (*src.add(i00) as u32 * w00
+        + *src.add(i10) as u32 * w10
+        + *src.add(i01) as u32 * w01
+        + *src.add(i11) as u32 * w11
+        + 128)
+        >> 8;
+    let g = (*src.add(i00 + 1) as u32 * w00
+        + *src.add(i10 + 1) as u32 * w10
+        + *src.add(i01 + 1) as u32 * w01
+        + *src.add(i11 + 1) as u32 * w11
+        + 128)
+        >> 8;
+    let r = (*src.add(i00 + 2) as u32 * w00
+        + *src.add(i10 + 2) as u32 * w10
+        + *src.add(i01 + 2) as u32 * w01
+        + *src.add(i11 + 2) as u32 * w11
+        + 128)
+        >> 8;
+    [b, g, r]
+}
+
+#[inline]
+fn push_interior_span(spans: &mut Vec<[u16; 2]>, row_start: usize, x0: u16, x1: u16) {
+    if x0 >= x1 {
+        return;
+    }
+    if spans.len() > row_start {
+        let last = spans.last_mut().unwrap();
+        if last[1] == x0 {
+            last[1] = x1;
+            return;
+        }
+    }
+    spans.push([x0, x1]);
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn push_rim_pixel(
+    rim_pixels: &mut Vec<RimPixel>,
+    lx: usize,
+    alpha: u8,
+    d: f32,
+    nx: f32,
+    ny: f32,
+    rim: f32,
+    bend: f32,
+    ca_strength: f32,
+    dpi: f32,
+) {
+    let (disp, soft_ca, spec, weight) =
+        crate::glass::card_rim_lens_params(d, nx, ny, rim, bend, ca_strength, dpi);
+    rim_pixels.push(RimPixel {
+        lx: lx as u16,
+        gx16: (nx * disp * 16.0).round().clamp(-32767.0, 32767.0) as i16,
+        gy16: (ny * disp * 16.0).round().clamp(-32767.0, 32767.0) as i16,
+        cx16: (nx * soft_ca * 16.0).round().clamp(-127.0, 127.0) as i8,
+        cy16: (ny * soft_ca * 16.0).round().clamp(-127.0, 127.0) as i8,
+        alpha,
+        spec: spec.round().clamp(0.0, 255.0) as u8,
+        weight: (weight * 255.0).round().clamp(0.0, 255.0) as u8,
+        _pad: 0,
+    });
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn scan_lut_span(
+    x0: usize,
+    x1: usize,
+    fy: f32,
+    rim: f32,
+    bend: f32,
+    ca_strength: f32,
+    dpi: f32,
+    row_start: usize,
+    interior_spans: &mut Vec<[u16; 2]>,
+    rim_pixels: &mut Vec<RimPixel>,
+    dist_fn: impl Fn(f32, f32) -> (f32, f32, f32),
+) {
+    let mut run_start: Option<u16> = None;
+    for lx in x0..x1 {
+        let fx = lx as f32 + 0.5;
+        let (d, nx, ny) = dist_fn(fx, fy);
+        let alpha = ((0.5 - d).clamp(0., 1.) * 255.).round() as u32;
+        if d <= -rim && alpha == 255 {
+            if run_start.is_none() {
+                run_start = Some(lx as u16);
+            }
+        } else {
+            if let Some(rs) = run_start.take() {
+                push_interior_span(interior_spans, row_start, rs, lx as u16);
+            }
+            if d > -rim && d <= 0.5 && alpha > 0 {
+                push_rim_pixel(
+                    rim_pixels,
+                    lx,
+                    alpha as u8,
+                    d,
+                    nx,
+                    ny,
+                    rim,
+                    bend,
+                    ca_strength,
+                    dpi,
+                );
+            }
+        }
+    }
+    if let Some(rs) = run_start {
+        push_interior_span(interior_spans, row_start, rs, x1 as u16);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poly_row_intervals(
+    sdf: &PolySdf,
+    horiz_segs: &[(f32, f32, f32)],
+    fy: f32,
+    x_start: i32,
+    x_end: i32,
+    corner_pad: f32,
+    xs: &mut Vec<f32>,
+    active: &mut Vec<[i32; 2]>,
+    safe: &mut Vec<[i32; 2]>,
+    next_safe: &mut Vec<[i32; 2]>,
+) {
+    active.clear();
+    sdf.interior_x_spans(fy, xs);
+    for pair in xs.chunks_exact(2) {
+        let x0 = (pair[0].floor() as i32 - 2).max(x_start);
+        let x1 = (pair[1].ceil() as i32 + 2).min(x_end);
+        if x0 < x1 {
+            active.push([x0, x1]);
+        }
+    }
+    for &(hy, hx0, hx1) in horiz_segs {
+        if (fy - hy).abs() <= 2.0 {
+            let x0 = (hx0.floor() as i32 - 2).max(x_start);
+            let x1 = (hx1.ceil() as i32 + 2).min(x_end);
+            if x0 < x1 {
+                active.push([x0, x1]);
+            }
+        }
+    }
+    for c in &sdf.corners {
+        if !c.convex
+            && fy >= c.v[1].min(c.c[1]) - 2.0
+            && fy <= c.v[1].max(c.c[1]) + 2.0
+        {
+            let x0 = (c.v[0].min(c.c[0]).floor() as i32 - 2).max(x_start);
+            let x1 = (c.v[0].max(c.c[0]).ceil() as i32 + 2).min(x_end);
+            if x0 < x1 {
+                active.push([x0, x1]);
+            }
+        }
+    }
+    if active.is_empty() {
+        safe.clear();
+        return;
+    }
+    active.sort_unstable_by_key(|iv| iv[0]);
+    let mut merged_len = 0usize;
+    for i in 0..active.len() {
+        let iv = active[i];
+        if merged_len > 0 && iv[0] <= active[merged_len - 1][1] {
+            active[merged_len - 1][1] = active[merged_len - 1][1].max(iv[1]);
+        } else {
+            active[merged_len] = iv;
+            merged_len += 1;
+        }
+    }
+    active.truncate(merged_len);
+
+    safe.clear();
+    for pair in xs.chunks_exact(2) {
+        let sx0 = ((pair[0] + corner_pad).ceil() as i32).max(x_start);
+        let sx1 = ((pair[1] - corner_pad).floor() as i32).min(x_end);
+        if sx0 < sx1 {
+            safe.push([sx0, sx1]);
+        }
+    }
+    if !safe.is_empty() {
+        for &(hy, hx0, hx1) in horiz_segs {
+            if (fy - hy).abs() <= corner_pad {
+                let bx0 = (hx0 - corner_pad).floor() as i32;
+                let bx1 = (hx1 + corner_pad).ceil() as i32;
+                next_safe.clear();
+                for &[sx0, sx1] in safe.iter() {
+                    if bx1 <= sx0 || bx0 >= sx1 {
+                        next_safe.push([sx0, sx1]);
+                    } else {
+                        if sx0 < bx0 {
+                            next_safe.push([sx0, bx0]);
+                        }
+                        if bx1 < sx1 {
+                            next_safe.push([bx1, sx1]);
+                        }
+                    }
+                }
+                std::mem::swap(safe, next_safe);
+                if safe.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn build_group_rim_lut(
+    spans: &[[f32; 4]],
+    bounds: [f32; 4],
+    radius: f32,
+    dpi: f32,
+) -> Option<GroupRimLut> {
+    let w = crate::render::stable_dim_px(bounds[2] - bounds[0], dpi).max(1) as usize;
+    let h = crate::render::stable_dim_px(bounds[3] - bounds[1], dpi).max(1) as usize;
+    if w > u16::MAX as usize || h > u16::MAX as usize {
+        return None;
+    }
+    let rel_spans_dip: Vec<[f32; 4]> = spans
+        .iter()
+        .map(|s| {
+            [
+                ((s[0] - bounds[0]) * 64.0).round() / 64.0,
+                ((s[1] - bounds[1]) * 64.0).round() / 64.0,
+                ((s[2] - bounds[0]) * 64.0).round() / 64.0,
+                ((s[3] - bounds[1]) * 64.0).round() / 64.0,
+            ]
+        })
+        .collect();
+    let rel_verts_dip = if spans.len() == 1 {
+        Vec::new()
+    } else {
+        let verts = crate::render::ortho_group_polygon(&rel_spans_dip);
+        if verts.len() < 4 {
+            return None;
+        }
+        verts
+    };
+    let bend = 10.0 * dpi;
+    let ca_strength = 3.5 * dpi;
+    let mut interior_spans = Vec::new();
+    let mut row_interior = Vec::with_capacity(h);
+    let mut rim_pixels = Vec::new();
+    let mut row_rim = Vec::with_capacity(h);
+
+    if spans.len() == 1 || rel_verts_dip.len() == 4 {
+        let hw = w as f32 * 0.5;
+        let hh = h as f32 * 0.5;
+        let min_dim = (w.min(h) as f32).max(1.0);
+        let r_px = (radius * dpi).min(min_dim * 0.5);
+        let rx = (hw - r_px).max(0.0);
+        let ry = (hh - r_px).max(0.0);
+        let rim = (20.0 * dpi).clamp(8.0, min_dim * 0.42);
+        let corner_pad = r_px.max(rim) + 2.0;
+        let iy0 = ((corner_pad - 0.5).ceil() as isize).clamp(0, h as isize) as usize;
+        let iy1 = ((h as f32 - corner_pad - 0.5).floor() as isize + 1).clamp(0, h as isize) as usize;
+        let ix0 = ((corner_pad - 0.5).ceil() as isize).clamp(0, w as isize) as usize;
+        let ix1 = ((w as f32 - corner_pad - 0.5).floor() as isize + 1).clamp(0, w as isize) as usize;
+        let has_interior = iy0 < iy1 && ix0 < ix1;
+        let dist = |fx: f32, fy: f32| crate::glass::rounded_rect_sdf(fx, fy, hw, hh, rx, ry, r_px);
+
+        for ly in 0..h {
+            let fy = ly as f32 + 0.5;
+            let is_off = interior_spans.len();
+            let rp_off = rim_pixels.len();
+            if has_interior && ly >= iy0 && ly < iy1 {
+                scan_lut_span(
+                    0,
+                    ix0,
+                    fy,
+                    rim,
+                    bend,
+                    ca_strength,
+                    dpi,
+                    is_off,
+                    &mut interior_spans,
+                    &mut rim_pixels,
+                    dist,
+                );
+                push_interior_span(&mut interior_spans, is_off, ix0 as u16, ix1 as u16);
+                scan_lut_span(
+                    ix1,
+                    w,
+                    fy,
+                    rim,
+                    bend,
+                    ca_strength,
+                    dpi,
+                    is_off,
+                    &mut interior_spans,
+                    &mut rim_pixels,
+                    dist,
+                );
+            } else {
+                scan_lut_span(
+                    0,
+                    w,
+                    fy,
+                    rim,
+                    bend,
+                    ca_strength,
+                    dpi,
+                    is_off,
+                    &mut interior_spans,
+                    &mut rim_pixels,
+                    dist,
+                );
+            }
+            row_interior.push((is_off as u32, (interior_spans.len() - is_off) as u32));
+            row_rim.push((rp_off as u32, (rim_pixels.len() - rp_off) as u32));
+        }
+    } else {
+        let rel_verts_px: Vec<[f32; 2]> =
+            rel_verts_dip.iter().map(|p| [p[0] * dpi, p[1] * dpi]).collect();
+        let sdf = PolySdf::new(&rel_verts_px, radius * dpi);
+        let min_span = rel_spans_dip
+            .iter()
+            .map(|s| ((s[2] - s[0]).min(s[3] - s[1])) * dpi)
+            .fold(f32::INFINITY, f32::min)
+            .max(1.0);
+        let rim = (20.0 * dpi).clamp(8.0, min_span * 0.42);
+        let corner_pad = sdf.max_radius.max(rim) + 2.0;
+        let horiz_segs: Vec<(f32, f32, f32)> = sdf
+            .segments
+            .iter()
+            .filter(|s| s.horiz)
+            .map(|s| (s.axis, s.min_full, s.max_full))
+            .collect();
+        let mut xs = Vec::with_capacity(8);
+        let mut active: Vec<[i32; 2]> = Vec::with_capacity(8);
+        let mut safe: Vec<[i32; 2]> = Vec::with_capacity(8);
+        let mut next_safe: Vec<[i32; 2]> = Vec::with_capacity(8);
+        let dist = |fx: f32, fy: f32| sdf.signed_distance(fx, fy);
+
+        for ly in 0..h {
+            let fy = ly as f32 + 0.5;
+            let is_off = interior_spans.len();
+            let rp_off = rim_pixels.len();
+            poly_row_intervals(
+                &sdf,
+                &horiz_segs,
+                fy,
+                0,
+                w as i32,
+                corner_pad,
+                &mut xs,
+                &mut active,
+                &mut safe,
+                &mut next_safe,
+            );
+            for &[lx0, lx1] in &active {
+                let mut cur = lx0;
+                for &[sx0, sx1] in &safe {
+                    if sx1 <= cur {
+                        continue;
+                    }
+                    if sx0 >= lx1 {
+                        break;
+                    }
+                    let ix0 = sx0.max(cur);
+                    let ix1 = sx1.min(lx1);
+                    if ix0 < ix1 {
+                        if cur < ix0 {
+                            scan_lut_span(
+                                cur as usize,
+                                ix0 as usize,
+                                fy,
+                                rim,
+                                bend,
+                                ca_strength,
+                                dpi,
+                                is_off,
+                                &mut interior_spans,
+                                &mut rim_pixels,
+                                dist,
+                            );
+                        }
+                        push_interior_span(&mut interior_spans, is_off, ix0 as u16, ix1 as u16);
+                        cur = ix1;
+                    }
+                }
+                if cur < lx1 {
+                    scan_lut_span(
+                        cur as usize,
+                        lx1 as usize,
+                        fy,
+                        rim,
+                        bend,
+                        ca_strength,
+                        dpi,
+                        is_off,
+                        &mut interior_spans,
+                        &mut rim_pixels,
+                        dist,
+                    );
+                }
+            }
+            row_interior.push((is_off as u32, (interior_spans.len() - is_off) as u32));
+            row_rim.push((rp_off as u32, (rim_pixels.len() - rp_off) as u32));
+        }
+    }
+
+    Some(GroupRimLut {
+        w,
+        h,
+        interior_spans,
+        row_interior,
+        rim_pixels,
+        row_rim,
+    })
+}
 
 #[inline]
 pub fn distance(x: f32, y: f32, w: f32, h: f32, r: f32, inset: f32) -> f32 {
@@ -23,6 +518,15 @@ pub(crate) struct PolySegment {
     pub tb: [f32; 2],
     pub outward: [f32; 2],
     pub horiz: bool,
+    pub axis: f32,
+    pub min_t: f32,
+    pub max_t: f32,
+    pub min_full: f32,
+    pub max_full: f32,
+    pub axis_aligned: bool,
+    pub dx: f32,
+    pub dy: f32,
+    pub inv_l2: f32,
 }
 pub(crate) struct PolyCorner {
     pub v: [f32; 2],
@@ -81,6 +585,15 @@ impl PolySdf {
             let ta = [a[0] + dir[0] * ra, a[1] + dir[1] * ra];
             let tb = [b[0] - dir[0] * rb, b[1] - dir[1] * rb];
             let horiz = (b[1] - a[1]).abs() < (b[0] - a[0]).abs();
+            let (axis, min_t, max_t, min_full, max_full, axis_aligned) = if horiz {
+                (a[1], ta[0].min(tb[0]), ta[0].max(tb[0]), a[0].min(b[0]), a[0].max(b[0]), a[1] == b[1])
+            } else {
+                (a[0], ta[1].min(tb[1]), ta[1].max(tb[1]), a[1].min(b[1]), a[1].max(b[1]), a[0] == b[0])
+            };
+            let dx = tb[0] - ta[0];
+            let dy = tb[1] - ta[1];
+            let l2 = dx * dx + dy * dy;
+            let inv_l2 = if l2 > 1e-6 { 1.0 / l2 } else { 0.0 };
             segments.push(PolySegment {
                 a,
                 b,
@@ -88,6 +601,15 @@ impl PolySdf {
                 tb,
                 outward: [dir[1], -dir[0]],
                 horiz,
+                axis,
+                min_t,
+                max_t,
+                min_full,
+                max_full,
+                axis_aligned,
+                dx,
+                dy,
+                inv_l2,
             });
         }
         Self {
@@ -124,29 +646,45 @@ impl PolySdf {
                 break;
             }
         }
-        let mut best_d = f32::INFINITY;
+        let mut best_d2 = f32::INFINITY;
         let mut best_n = [0.0f32, -1.0f32];
         for seg in &self.segments {
-            let dx = seg.tb[0] - seg.ta[0];
-            let dy = seg.tb[1] - seg.ta[1];
-            let l2 = dx * dx + dy * dy;
-            let (qx, qy) = if l2 <= 1e-6 {
-                (seg.ta[0], seg.ta[1])
+            let d2 = if seg.axis_aligned && seg.inv_l2 > 0.0 {
+                if seg.horiz {
+                    let dx = px - px.clamp(seg.min_t, seg.max_t);
+                    let dy = py - seg.axis;
+                    dx * dx + dy * dy
+                } else {
+                    let dx = px - seg.axis;
+                    let dy = py - py.clamp(seg.min_t, seg.max_t);
+                    dx * dx + dy * dy
+                }
             } else {
-                let t = (((px - seg.ta[0]) * dx + (py - seg.ta[1]) * dy) / l2).clamp(0.0, 1.0);
-                (seg.ta[0] + dx * t, seg.ta[1] + dy * t)
+                let (qx, qy) = if seg.inv_l2 == 0.0 {
+                    (seg.ta[0], seg.ta[1])
+                } else {
+                    let t = (((px - seg.ta[0]) * seg.dx + (py - seg.ta[1]) * seg.dy) * seg.inv_l2)
+                        .clamp(0.0, 1.0);
+                    (seg.ta[0] + seg.dx * t, seg.ta[1] + seg.dy * t)
+                };
+                let dx = px - qx;
+                let dy = py - qy;
+                dx * dx + dy * dy
             };
-            let d = (px - qx).hypot(py - qy);
-            if d < best_d {
-                best_d = d;
+            if d2 < best_d2 {
+                best_d2 = d2;
                 best_n = seg.outward;
             }
         }
+        let mut best_d = best_d2.sqrt();
         for c in &self.corners {
             let vx = px - c.c[0];
             let vy = py - c.c[1];
             if vx * c.sx >= 0.0 && vy * c.sy >= 0.0 {
-                let dist_c = vx.hypot(vy);
+                if vx.abs() - c.r >= best_d || vy.abs() - c.r >= best_d {
+                    continue;
+                }
+                let dist_c = (vx * vx + vy * vy).sqrt();
                 let d = (dist_c - c.r).abs();
                 if d < best_d {
                     best_d = d;
@@ -1475,29 +2013,71 @@ impl Buffer {
         if spans.is_empty() {
             return;
         }
-        if spans.len() == 1 {
-            self.restore_glass_card_impl(dc, spans[0], radius, allow_liquid);
-            return;
-        }
-        let verts_dip = crate::render::ortho_group_polygon(spans);
-        if verts_dip.len() < 4 {
-            return;
-        }
-        let verts: Vec<[f32; 2]> = verts_dip
+        let min_span = spans
             .iter()
-            .map(|p| [p[0] * self.dpi, p[1] * self.dpi])
-            .collect();
-        if verts.len() == 4 {
-            let mut rect = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
-            for v in &verts_dip {
-                rect[0] = rect[0].min(v[0]);
-                rect[1] = rect[1].min(v[1]);
-                rect[2] = rect[2].max(v[0]);
-                rect[3] = rect[3].max(v[1]);
+            .map(|s| ((s[2] - s[0]).min(s[3] - s[1])) * self.dpi)
+            .fold(f32::INFINITY, f32::min)
+            .max(1.0);
+        let liquid = allow_liquid && crate::glass::liquid_glass() && min_span >= 16.0;
+        if !liquid {
+            if spans.len() == 1 {
+                self.restore_glass_card_impl(dc, spans[0], radius, false);
+                return;
             }
-            self.restore_glass_card_impl(dc, rect, radius, allow_liquid);
+            let verts_dip = crate::render::ortho_group_polygon(spans);
+            if verts_dip.len() < 4 {
+                return;
+            }
+            if verts_dip.len() == 4 {
+                let mut rect = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+                for v in &verts_dip {
+                    rect[0] = rect[0].min(v[0]);
+                    rect[1] = rect[1].min(v[1]);
+                    rect[2] = rect[2].max(v[0]);
+                    rect[3] = rect[3].max(v[1]);
+                }
+                self.restore_glass_card_impl(dc, rect, radius, false);
+                return;
+            }
+            self.restore_glass_group_non_liquid(dc, &verts_dip, radius);
             return;
         }
+        let bounds = crate::render::spans_bounds(spans);
+        let left_px = (bounds[0] * self.dpi).round() as i32;
+        let top_px = (bounds[1] * self.dpi).round() as i32;
+        let mut key = Vec::with_capacity(3 + spans.len() * 4);
+        key.push(spans.len() as i32);
+        key.push((radius * self.dpi * 16.).round() as i32);
+        key.push((self.dpi * 1000.).round() as i32);
+        for s in spans {
+            key.push(crate::render::stable_dim_px(s[0] - bounds[0], self.dpi));
+            key.push(crate::render::stable_dim_px(s[1] - bounds[1], self.dpi));
+            key.push(crate::render::stable_dim_px(s[2] - bounds[0], self.dpi));
+            key.push(crate::render::stable_dim_px(s[3] - bounds[1], self.dpi));
+        }
+        let lut: Option<Rc<GroupRimLut>> = GROUP_RIM_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(existing) = cache.get(&key) {
+                return Some(Rc::clone(existing));
+            }
+            let built = build_group_rim_lut(spans, bounds, radius, self.dpi)?;
+            if cache.len() >= 24 {
+                cache.clear();
+            }
+            let rc = Rc::new(built);
+            cache.insert(key, Rc::clone(&rc));
+            Some(rc)
+        });
+        if let Some(lut) = lut {
+            self.apply_group_rim_lut(dc, &lut, left_px, top_px);
+        }
+    }
+    unsafe fn restore_glass_group_non_liquid(
+        &self,
+        dc: HDC,
+        verts_dip: &[[f32; 2]],
+        radius: f32,
+    ) {
         crate::render::flush(dc);
         let mut dib: DIBSECTION = zeroed();
         if GetObjectW(
@@ -1513,23 +2093,21 @@ impl Buffer {
         GetClipBox(dc, &mut clip);
         let width = dib.dsBm.bmWidth.min(self.width);
         let height = dib.dsBm.bmHeight.abs().min(self.height);
+        if width <= 0 || height <= 0 || self.width <= 0 || self.height <= 0 || dib.dsBm.bmWidth <= 0 || dib.dsBm.bmHeight == 0 {
+            return;
+        }
         let dest = std::slice::from_raw_parts_mut(
             dib.dsBm.bmBits as *mut u8,
-            (dib.dsBm.bmWidth * dib.dsBm.bmHeight.abs() * 4) as usize,
+            (dib.dsBm.bmWidth as usize) * (dib.dsBm.bmHeight.abs() as usize) * 4,
         );
-        let source = std::slice::from_raw_parts(self.bits, (self.width * self.height * 4) as usize);
+        let source = std::slice::from_raw_parts(self.bits, (self.width as usize) * (self.height as usize) * 4);
+        let verts: Vec<[f32; 2]> = verts_dip
+            .iter()
+            .map(|p| [p[0] * self.dpi, p[1] * self.dpi])
+            .collect();
         let sdf = PolySdf::new(&verts, radius * self.dpi);
         let [left, top, right, bottom] = sdf.bounds;
-        let min_span = spans
-            .iter()
-            .map(|s| ((s[2] - s[0]).min(s[3] - s[1])) * self.dpi)
-            .fold(f32::INFINITY, f32::min)
-            .max(1.0);
-        let liquid = allow_liquid && crate::glass::liquid_glass() && min_span >= 16.0;
-        let rim = (20.0 * self.dpi).clamp(8.0, min_span * 0.42);
-        let bend = 10.0 * self.dpi;
-        let ca_strength = 3.5 * self.dpi;
-        let corner_pad = sdf.max_radius.max(rim) + 2.0;
+        let corner_pad = sdf.max_radius + 2.0;
         let y_start = (top.floor() as i32).max(0).max(clip.top);
         let y_end = (bottom.ceil() as i32).min(height).min(clip.bottom);
         let x_start = (left.floor() as i32).max(0).max(clip.left);
@@ -1537,41 +2115,27 @@ impl Buffer {
         if y_start >= y_end || x_start >= x_end {
             return;
         }
-        let horiz_ys: Vec<f32> = sdf.segments.iter().filter(|s| s.horiz).map(|s| s.a[1]).collect();
+        let horiz_segs: Vec<(f32, f32, f32)> = sdf
+            .segments
+            .iter()
+            .filter(|s| s.horiz)
+            .map(|s| (s.axis, s.min_full, s.max_full))
+            .collect();
         let dest_stride = dib.dsBm.bmWidth;
         let src_stride = self.width;
-        let source_h = self.height as usize;
-        let dpi = self.dpi;
         let blend_span = |dest: &mut [u8], y: i32, x0: i32, x1: i32| {
             let fy = y as f32 + 0.5;
             let src_row = y * src_stride;
             for x in x0..x1 {
                 let fx = x as f32 + 0.5;
-                let (d, nx, ny) = sdf.signed_distance(fx, fy);
+                let (d, _, _) = sdf.signed_distance(fx, fy);
                 let alpha = ((0.5 - d).clamp(0., 1.) * 255.).round() as u32;
                 if alpha == 0 {
                     continue;
                 }
                 let dst = (x * 4) as usize;
-                let pixel = if liquid && d > -rim && d <= 0.5 {
-                    crate::glass::refract_bgra_card_pixel(
-                        source,
-                        src_stride as usize,
-                        source_h,
-                        x as f32,
-                        y as f32,
-                        d,
-                        nx,
-                        ny,
-                        rim,
-                        bend,
-                        ca_strength,
-                        dpi,
-                    )
-                } else {
-                    let src = ((src_row + x) * 4) as usize;
-                    [source[src], source[src + 1], source[src + 2]]
-                };
+                let src = ((src_row + x) * 4) as usize;
+                let pixel = [source[src], source[src + 1], source[src + 2]];
                 if alpha == 255 {
                     dest[dst] = pixel[0];
                     dest[dst + 1] = pixel[1];
@@ -1590,23 +2154,38 @@ impl Buffer {
         };
         let render_rows = |rows: Vec<(usize, &mut [u8])>| {
             let mut xs = Vec::with_capacity(8);
+            let mut active: Vec<[i32; 2]> = Vec::with_capacity(8);
+            let mut safe: Vec<[i32; 2]> = Vec::with_capacity(8);
+            let mut next_safe: Vec<[i32; 2]> = Vec::with_capacity(8);
             for (y, dest) in rows {
                 let y = y as i32;
                 let fy = y as f32 + 0.5;
-                let near_horiz = horiz_ys.iter().any(|hy| (fy - *hy).abs() <= corner_pad);
-                if !near_horiz {
-                    sdf.interior_x_spans(fy, &mut xs);
-                    for pair in xs.chunks_exact(2) {
-                        let lx0 = (pair[0].floor() as i32 - 2).max(x_start);
-                        let lx1 = (pair[1].ceil() as i32 + 2).min(x_end);
-                        if lx0 >= lx1 {
+                poly_row_intervals(
+                    &sdf,
+                    &horiz_segs,
+                    fy,
+                    x_start,
+                    x_end,
+                    corner_pad,
+                    &mut xs,
+                    &mut active,
+                    &mut safe,
+                    &mut next_safe,
+                );
+                for &[lx0, lx1] in &active {
+                    let mut cur = lx0;
+                    for &[sx0, sx1] in &safe {
+                        if sx1 <= cur {
                             continue;
                         }
-                        let ix0 = ((pair[0] + corner_pad).ceil() as i32).max(lx0);
-                        let ix1 = ((pair[1] - corner_pad).floor() as i32).min(lx1);
+                        if sx0 >= lx1 {
+                            break;
+                        }
+                        let ix0 = sx0.max(cur);
+                        let ix1 = sx1.min(lx1);
                         if ix0 < ix1 {
-                            if lx0 < ix0 {
-                                blend_span(dest, y, lx0, ix0);
+                            if cur < ix0 {
+                                blend_span(dest, y, cur, ix0);
                             }
                             let dst_start = (ix0 * 4) as usize;
                             let dst_end = (ix1 * 4) as usize;
@@ -1621,22 +2200,162 @@ impl Buffer {
                                 d[2] = s[2];
                                 d[3] = 255;
                             }
-                            if ix1 < lx1 {
-                                blend_span(dest, y, ix1, lx1);
-                            }
-                        } else {
-                            blend_span(dest, y, lx0, lx1);
+                            cur = ix1;
                         }
                     }
-                } else {
-                    blend_span(dest, y, x_start, x_end);
+                    if cur < lx1 {
+                        blend_span(dest, y, cur, lx1);
+                    }
                 }
             }
         };
-        let work_pixels = if liquid { ((x_end - x_start) * (y_end - y_start)) as usize } else { 0 };
         crate::glass::with_pixel_rows_parallel(
-            dest, dest_stride as usize * 4, y_start as usize..y_end as usize,
-            work_pixels, 32_768, render_rows,
+            dest,
+            dest_stride as usize * 4,
+            y_start as usize..y_end as usize,
+            0,
+            32_768,
+            render_rows,
+        );
+    }
+    unsafe fn apply_group_rim_lut(&self, dc: HDC, lut: &GroupRimLut, left_px: i32, top_px: i32) {
+        crate::render::flush(dc);
+        let mut dib: DIBSECTION = zeroed();
+        if GetObjectW(
+            GetCurrentObject(dc, OBJ_BITMAP as u32),
+            size_of::<DIBSECTION>() as i32,
+            &mut dib as *mut _ as _,
+        ) == 0
+            || dib.dsBm.bmBits.is_null()
+        {
+            return;
+        }
+        let mut clip: RECT = zeroed();
+        GetClipBox(dc, &mut clip);
+        let width = dib.dsBm.bmWidth.min(self.width);
+        let height = dib.dsBm.bmHeight.abs().min(self.height);
+        if width <= 0
+            || height <= 0
+            || self.width <= 0
+            || self.height <= 0
+            || dib.dsBm.bmWidth <= 0
+            || dib.dsBm.bmHeight == 0
+        {
+            return;
+        }
+        let y_start = top_px.max(0).max(clip.top);
+        let y_end = (top_px + lut.h as i32).min(height).min(clip.bottom);
+        let x_start = left_px.max(0).max(clip.left);
+        let x_end = (left_px + lut.w as i32).min(width).min(clip.right);
+        if y_start >= y_end || x_start >= x_end {
+            return;
+        }
+        let dest_stride = dib.dsBm.bmWidth;
+        let dest_h = dib.dsBm.bmHeight.abs() as usize;
+        let src_stride = self.width;
+        let source_h = self.height as usize;
+        let dest = std::slice::from_raw_parts_mut(
+            dib.dsBm.bmBits as *mut u8,
+            (dest_stride as usize) * dest_h * 4,
+        );
+        let source = std::slice::from_raw_parts(self.bits, (src_stride as usize) * source_h * 4);
+        if source.len() < (src_stride as usize) * source_h * 4
+            || dest.len() < (dest_stride as usize) * (height as usize) * 4
+        {
+            return;
+        }
+        let render_rows = |rows: Vec<(usize, &mut [u8])>| {
+            let src_ptr = source.as_ptr();
+            let sw = src_stride as usize;
+            let sh = source_h;
+            for (y, dst_row) in rows {
+                let ly = (y as i32 - top_px) as usize;
+                let (is_off, is_len) = lut.row_interior[ly];
+                for &[sx0, sx1] in &lut.interior_spans[is_off as usize..(is_off + is_len) as usize]
+                {
+                    let ix0 = (left_px + sx0 as i32).max(x_start);
+                    let ix1 = (left_px + sx1 as i32).min(x_end);
+                    if ix0 < ix1 {
+                        let dst_start = (ix0 * 4) as usize;
+                        let dst_end = (ix1 * 4) as usize;
+                        let src_start = ((y as i32 * src_stride + ix0) * 4) as usize;
+                        let src_end = ((y as i32 * src_stride + ix1) * 4) as usize;
+                        for (d, s) in dst_row[dst_start..dst_end]
+                            .chunks_exact_mut(4)
+                            .zip(source[src_start..src_end].chunks_exact(4))
+                        {
+                            d[0] = s[0];
+                            d[1] = s[1];
+                            d[2] = s[2];
+                            d[3] = 255;
+                        }
+                    }
+                }
+                let (rp_off, rp_len) = lut.row_rim[ly];
+                let y_i32 = y as i32;
+                for rp in &lut.rim_pixels[rp_off as usize..(rp_off + rp_len) as usize] {
+                    let x = left_px + rp.lx as i32;
+                    if x < x_start || x >= x_end {
+                        continue;
+                    }
+                    let gx = (x << 4) + rp.gx16 as i32;
+                    let gy = (y_i32 << 4) + rp.gy16 as i32;
+                    let [mut b, mut g, mut r] = if rp.cx16 == 0 && rp.cy16 == 0 {
+                        sample_bgr_q4(src_ptr, sw, sh, gx, gy)
+                    } else {
+                        let cx = rp.cx16 as i32;
+                        let cy = rp.cy16 as i32;
+                        [
+                            sample_ch_q4(src_ptr, sw, sh, gx + cx, gy + cy, 0),
+                            sample_ch_q4(src_ptr, sw, sh, gx, gy, 1),
+                            sample_ch_q4(src_ptr, sw, sh, gx - cx, gy - cy, 2),
+                        ]
+                    };
+                    let spec = rp.spec as u32;
+                    if spec != 0 {
+                        b = (b + spec).min(255);
+                        g = (g + spec).min(255);
+                        r = (r + spec).min(255);
+                    }
+                    let src_i = (y_i32 as usize * sw + x as usize) * 4;
+                    if rp.weight < 255 {
+                        let w = rp.weight as u32;
+                        let inv_w = 255 - w;
+                        let sb = *src_ptr.add(src_i) as u32;
+                        let sg = *src_ptr.add(src_i + 1) as u32;
+                        let sr = *src_ptr.add(src_i + 2) as u32;
+                        b = (sb * inv_w + b * w + 127) / 255;
+                        g = (sg * inv_w + g * w + 127) / 255;
+                        r = (sr * inv_w + r * w + 127) / 255;
+                    }
+                    let dst_i = (x as usize) * 4;
+                    let alpha = rp.alpha as u32;
+                    if alpha == 255 {
+                        dst_row[dst_i] = b as u8;
+                        dst_row[dst_i + 1] = g as u8;
+                        dst_row[dst_i + 2] = r as u8;
+                        dst_row[dst_i + 3] = 255;
+                    } else {
+                        let inv = 255 - alpha;
+                        dst_row[dst_i] =
+                            ((b * alpha + dst_row[dst_i] as u32 * inv + 127) / 255) as u8;
+                        dst_row[dst_i + 1] =
+                            ((g * alpha + dst_row[dst_i + 1] as u32 * inv + 127) / 255) as u8;
+                        dst_row[dst_i + 2] =
+                            ((r * alpha + dst_row[dst_i + 2] as u32 * inv + 127) / 255) as u8;
+                        dst_row[dst_i + 3] =
+                            ((255 * alpha + dst_row[dst_i + 3] as u32 * inv + 127) / 255) as u8;
+                    }
+                }
+            }
+        };
+        crate::glass::with_pixel_rows_parallel(
+            dest,
+            dest_stride as usize * 4,
+            y_start as usize..y_end as usize,
+            lut.rim_pixels.len(),
+            32_768,
+            render_rows,
         );
     }
     /// Composite opaque chrome UNDER already drawn controls. Filling only the
@@ -2672,6 +3391,291 @@ mod tests {
             assert!(result == serial.snapshot(), "parallel card must match the serial optical path");
             assert_eq!(&result[..4], &initial[..4], "clipped pixels must stay untouched");
             assert_ne!(result, initial, "test must exercise optical rendering");
+        }
+    }
+
+    #[test]
+    fn restore_glass_group_l_shape_matches_full_sdf_in_normal_and_low_power() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_liquid_glass(self.0);
+                crate::motion::set_low_power(self.1);
+                clear_group_rim_cache();
+            }
+        }
+        let _reset = Reset(crate::glass::liquid_glass(), crate::motion::low_power());
+        crate::glass::set_liquid_glass(true);
+        clear_group_rim_cache();
+        unsafe {
+            let w = 1240i32;
+            let h = 480i32;
+            let dpi = 1.75f32;
+            let spans = [
+                [16.0f32, 80.35, 680.0, 166.35],
+                [16.0f32, 170.35, 380.0, 256.35],
+            ];
+            let radius = 20.0f32;
+            let backing = Buffer::plain(w, h, dpi).unwrap();
+            let src_px = std::slice::from_raw_parts_mut(backing.bits, (w * h * 4) as usize);
+            let tri = |v: i32, p: i32| {
+                let m = v.rem_euclid(p * 2);
+                if m < p { m } else { p * 2 - m }
+            };
+            for y in 0..h {
+                for x in 0..w {
+                    let i = ((y * w + x) * 4) as usize;
+                    src_px[i] = (40 + tri((x * 2 + y) / 10, 90)) as u8;
+                    src_px[i + 1] = (55 + tri((x + y * 3) / 12, 95)) as u8;
+                    src_px[i + 2] = (70 + tri((x * 3 + y * 2) / 14, 100)) as u8;
+                    src_px[i + 3] = 255;
+                }
+            }
+            let source = backing.snapshot();
+
+            let bounds = crate::render::spans_bounds(&spans);
+            let left_px = (bounds[0] * dpi).round() as i32;
+            let top_px = (bounds[1] * dpi).round() as i32;
+            let rel_spans_dip: Vec<[f32; 4]> = spans
+                .iter()
+                .map(|s| {
+                    [
+                        ((s[0] - bounds[0]) * 64.0).round() / 64.0,
+                        ((s[1] - bounds[1]) * 64.0).round() / 64.0,
+                        ((s[2] - bounds[0]) * 64.0).round() / 64.0,
+                        ((s[3] - bounds[1]) * 64.0).round() / 64.0,
+                    ]
+                })
+                .collect();
+            let rel_verts_dip = crate::render::ortho_group_polygon(&rel_spans_dip);
+            let verts: Vec<[f32; 2]> = rel_verts_dip
+                .iter()
+                .map(|p| [left_px as f32 + p[0] * dpi, top_px as f32 + p[1] * dpi])
+                .collect();
+            let sdf = PolySdf::new(&verts, radius * dpi);
+            let min_span = rel_spans_dip
+                .iter()
+                .map(|s| ((s[2] - s[0]).min(s[3] - s[1])) * dpi)
+                .fold(f32::INFINITY, f32::min)
+                .max(1.0);
+            let rim = (20.0 * dpi).clamp(8.0, min_span * 0.42);
+            let bend = 10.0 * dpi;
+            let ca_strength = 3.5 * dpi;
+
+            let clip_rect = [36i32, 150, 1180, 440];
+            let init = [15u8, 25, 35, 80];
+            let mut snapshots = Vec::new();
+            for low_power in [false, true] {
+                crate::motion::set_low_power(low_power);
+                let frame = Buffer::plain(w, h, dpi).unwrap();
+                for px in std::slice::from_raw_parts_mut(frame.bits, (w * h * 4) as usize)
+                    .chunks_exact_mut(4)
+                {
+                    px.copy_from_slice(&init);
+                }
+                IntersectClipRect(frame.dc, clip_rect[0], clip_rect[1], clip_rect[2], clip_rect[3]);
+                backing.restore_glass_group(frame.dc, &spans, radius, true);
+                snapshots.push(frame.snapshot());
+            }
+            assert_eq!(
+                snapshots[0], snapshots[1],
+                "parallel and low_power L-shape restores must match byte-for-byte"
+            );
+            let actual = &snapshots[0];
+
+            // Verify clipped pixels outside clip_rect and L-cutout remain untouched.
+            for y in [145i32, 445] {
+                for x in [100i32, 400] {
+                    let i = ((y * w + x) * 4) as usize;
+                    assert_eq!(&actual[i..i + 4], &init, "clipped pixel ({x},{y}) modified");
+                }
+            }
+            for x in [30i32, 1185] {
+                let i = ((220 * w + x) * 4) as usize;
+                assert_eq!(&actual[i..i + 4], &init, "horizontally clipped pixel ({x},220) modified");
+            }
+            let cutout_i = ((360 * w + 800) * 4) as usize;
+            assert_eq!(&actual[cutout_i..cutout_i + 4], &init, "L-cutout pixel must stay untouched");
+
+            // Compare flat interior and optical rim against full-SDF reference.
+            let mut max_rim_diff = 0i32;
+            let mut rim_checked = 0usize;
+            let mut rim_active_diff = 0usize;
+            let mut interior_checked = 0usize;
+            for y in clip_rect[1]..clip_rect[3] {
+                let fy = y as f32 + 0.5;
+                for x in clip_rect[0]..clip_rect[2] {
+                    let fx = x as f32 + 0.5;
+                    let (d, nx, ny) = sdf.signed_distance(fx, fy);
+                    let dst = ((y * w + x) * 4) as usize;
+                    if d <= -rim {
+                        assert_eq!(&actual[dst..dst + 3], &source[dst..dst + 3]);
+                        assert_eq!(actual[dst + 3], 255);
+                        interior_checked += 1;
+                    } else if d <= -1.0 && d > -rim {
+                        let ref_px = crate::glass::refract_bgra_card_pixel(
+                            &source,
+                            w as usize,
+                            h as usize,
+                            x as f32,
+                            y as f32,
+                            d,
+                            nx,
+                            ny,
+                            rim,
+                            bend,
+                            ca_strength,
+                            dpi,
+                        );
+                        assert_eq!(actual[dst + 3], 255);
+                        for c in 0..3 {
+                            let diff = (actual[dst + c] as i32 - ref_px[c] as i32).abs();
+                            max_rim_diff = max_rim_diff.max(diff);
+                            if (actual[dst + c] as i32 - source[dst + c] as i32).abs() >= 3 {
+                                rim_active_diff += 1;
+                            }
+                        }
+                        rim_checked += 1;
+                    }
+                }
+            }
+            assert!(interior_checked > 50_000);
+            assert!(rim_checked > 5_000);
+            assert!(rim_active_diff > 1_000, "rim refraction/specular must be active");
+            assert!(max_rim_diff <= 3, "max rim channel diff {max_rim_diff} > 3");
+
+            // Verify scroll-invariance: fractional vertical scroll shifts reuse the cached LUT.
+            clear_group_rim_cache();
+            let scroll_frame = Buffer::plain(w, h, dpi).unwrap();
+            backing.restore_glass_group(scroll_frame.dc, &spans, radius, true);
+            assert_eq!(GROUP_RIM_CACHE.with(|c| c.borrow().len()), 1);
+            for step in 1..=10 {
+                let dy = step as f32 * 0.13;
+                let shifted = [
+                    [spans[0][0], spans[0][1] - dy, spans[0][2], spans[0][3] - dy],
+                    [spans[1][0], spans[1][1] - dy, spans[1][2], spans[1][3] - dy],
+                ];
+                backing.restore_glass_group(scroll_frame.dc, &shifted, radius, true);
+                assert_eq!(
+                    GROUP_RIM_CACHE.with(|c| c.borrow().len()),
+                    1,
+                    "fractional scroll offset dy={dy} rebuilt LUT"
+                );
+            }
+            crate::render::clear_caches();
+            assert_eq!(GROUP_RIM_CACHE.with(|c| c.borrow().len()), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "App Dock group restore benchmark"]
+    fn app_dock_group_restore_bench() {
+        let _ui = crate::native_ui_test_lock();
+        let _runtime = crate::render::Runtime::start().unwrap();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_liquid_glass(self.0);
+                crate::motion::set_low_power(self.1);
+                crate::render::clear_caches();
+            }
+        }
+        let _reset = Reset(crate::glass::liquid_glass(), crate::motion::low_power());
+        crate::glass::set_liquid_glass(true);
+        unsafe {
+            let dpi = 1.75f32;
+            let w = (621.0f32 * dpi).round() as i32;
+            let h = (600.0f32 * dpi).round() as i32;
+            let radius = 20.0f32;
+            // 4 groups matching a 41-item dock: 4-item, 3-item, 2-item, and 9-item 2-row L-shape.
+            let g4 = [[16.0f32, 20.35, 396.0, 106.35]];
+            let g3 = [[16.0f32, 120.35, 300.0, 206.35]];
+            let g2 = [[16.0f32, 220.35, 204.0, 306.35]];
+            let g9_l = [
+                [16.0f32, 320.35, 588.0, 406.35],
+                [16.0f32, 410.35, 300.0, 496.35],
+            ];
+            let groups: [&[[f32; 4]]; 4] = [&g4, &g3, &g2, &g9_l];
+
+            let backing = Buffer::plain(w, h, dpi).unwrap();
+            let src_px = std::slice::from_raw_parts_mut(backing.bits, (w * h * 4) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = ((y * w + x) * 4) as usize;
+                    src_px[i] = ((x * 3 + y) & 0xff) as u8;
+                    src_px[i + 1] = ((x + y * 5) & 0xff) as u8;
+                    src_px[i + 2] = (((x ^ y) * 7) & 0xff) as u8;
+                    src_px[i + 3] = 255;
+                }
+            }
+            let frame = Buffer::plain(w, h, dpi).unwrap();
+
+            for low_power in [false, true] {
+                crate::motion::set_low_power(low_power);
+                clear_group_rim_cache();
+                let t_cold = std::time::Instant::now();
+                for g in groups {
+                    backing.restore_glass_group(frame.dc, g, radius, true);
+                }
+                let cold_4groups_ms = t_cold.elapsed().as_secs_f64() * 1000.0;
+                for _ in 0..3 {
+                    for g in groups {
+                        backing.restore_glass_group(frame.dc, g, radius, true);
+                    }
+                }
+                let iters = 50;
+                let mut total_ms = 0.0f64;
+                let mut per_group_ms = [0.0f64; 4];
+                for _ in 0..iters {
+                    let t_frame = std::time::Instant::now();
+                    for (idx, g) in groups.iter().enumerate() {
+                        let tg = std::time::Instant::now();
+                        backing.restore_glass_group(frame.dc, g, radius, true);
+                        per_group_ms[idx] += tg.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    total_ms += t_frame.elapsed().as_secs_f64() * 1000.0;
+                }
+                println!(
+                    "BENCH_RESTORE_GLASS_GROUP low_power={} dpi={:.2} liquid_glass=true | cold_4groups={:.3}ms warm_4groups={:.3}ms/frame (g4={:.3}ms g3={:.3}ms g2={:.3}ms g9_L={:.3}ms)",
+                    low_power,
+                    dpi,
+                    cold_4groups_ms,
+                    total_ms / iters as f64,
+                    per_group_ms[0] / iters as f64,
+                    per_group_ms[1] / iters as f64,
+                    per_group_ms[2] / iters as f64,
+                    per_group_ms[3] / iters as f64,
+                );
+            }
+
+            let batch = crate::render::Batch::new(frame.dc, dpi);
+            let cold_iters = 20;
+            let mut cold_ms = 0.0f64;
+            for _ in 0..cold_iters {
+                crate::render::clear_caches();
+                let t = std::time::Instant::now();
+                assert!(batch.group_poly_surface(&g9_l, radius, false));
+                cold_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            let warm_iters = 200;
+            let mut warm_ms = 0.0f64;
+            for i in 0..warm_iters {
+                let dy = (i as f32 * 0.13) % 7.0;
+                let shifted = [
+                    [g9_l[0][0], g9_l[0][1] - dy, g9_l[0][2], g9_l[0][3] - dy],
+                    [g9_l[1][0], g9_l[1][1] - dy, g9_l[1][2], g9_l[1][3] - dy],
+                ];
+                let t = std::time::Instant::now();
+                assert!(batch.group_poly_surface(&shifted, radius, false));
+                warm_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            println!(
+                "BENCH_GROUP_POLY_SURFACE dpi={:.2} | cold={:.3}ms warm={:.3}ms",
+                dpi,
+                cold_ms / cold_iters as f64,
+                warm_ms / warm_iters as f64,
+            );
         }
     }
 }

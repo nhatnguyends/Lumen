@@ -394,8 +394,19 @@ impl Target {
             self.translate(source, size, [r[0], r[1]], opacity);
             return;
         }
-        if (transform[2] - 1.).abs() < 0.00001 && transform[3].abs() < 0.00001 {
-            self.axis_aligned(source, size, r, opacity);
+        if transform[3].abs() < 0.00001 && transform[2] > 0.00001 {
+            let [cx, cy, scale, _] = transform;
+            let scaled = if (scale - 1.).abs() < 0.00001 {
+                r
+            } else {
+                [
+                    cx + (r[0] - cx) * scale,
+                    cy + (r[1] - cy) * scale,
+                    cx + (r[2] - cx) * scale,
+                    cy + (r[3] - cy) * scale,
+                ]
+            };
+            self.axis_aligned(source, size, scaled, opacity);
             return;
         }
         let [cx, cy, scale, angle] = transform;
@@ -559,6 +570,44 @@ mod tests {
                         .zip(&reference)
                         .all(|(a, b)| a.abs_diff(*b) <= 2));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_axis_aligned_sprite_matches_general_affine_sampler() {
+        let source: Vec<u8> = (0..48)
+            .flat_map(|n| {
+                let a = ((n * 29) % 256) as u8;
+                [a / 3, a / 2, a, a]
+            })
+            .collect();
+        for origin in [[2.0, 2.0], [3.25, 1.75], [2.999, 2.001]] {
+            for opaque in [false, true] {
+                let mut fast = vec![31u8; 24 * 24 * 4];
+                let mut reference = fast.clone();
+                let r = [origin[0], origin[1], origin[0] + 8.0, origin[1] + 6.0];
+                let cx = origin[0] + 4.0;
+                let cy = origin[1] + 3.0;
+                unsafe {
+                    let target = Target {
+                        bits: fast.as_mut_ptr(),
+                        width: 24,
+                        height: 24,
+                        clip: [1, 1, 23, 22],
+                        opaque,
+                    };
+                    target.draw(&source, [8, 6], r, [cx, cy, 1.055, 0.], 0.85, None);
+                    Target {
+                        bits: reference.as_mut_ptr(),
+                        ..target
+                    }
+                    .draw(&source, [8, 6], r, [cx, cy, 1.055, 0.0001], 0.85, None);
+                }
+                assert!(fast
+                    .iter()
+                    .zip(&reference)
+                    .all(|(a, b)| a.abs_diff(*b) <= 2));
             }
         }
     }
