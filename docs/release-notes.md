@@ -1,8 +1,7 @@
-Lumen 0.1.12 refines App Dock pointer responsiveness and YouTube Music 120Hz frame pacing:
+Lumen 0.1.13 fixes secondary-display widget duplication switches in General Settings:
 
-- **Live Cursor-Following Hover During App Dock Scroll**: Hover state updates continuously underneath the cursor while scrolling the App Dock so items respond immediately without stale or frozen highlights.
-- **16.16 Fixed-Point Incremental Affine Sampling**: Rotated sprite blitting uses 16.16 fixed-point incremental affine sampling for fast, smooth sub-pixel rotation.
-- **YouTube Music `spin_base` Caching & `AlphaTargetScope`**: Static-layer caching via `spin_base` paired with `AlphaTargetScope` keeps YouTube Music rendering fast to preserve 120Hz across animations, scroll, and hover while music is playing.
+- **Secondary Display Duplication Toggle Fix**: Bounded widget-package control ID ranges (`1000..2000`) in `Host::apply_changes` so secondary display toggle IDs (`2000+`, such as `2001` and `2002`) are no longer intercepted by modulo-3 widget pin/toggle arms and reliably update `duplicate_displays` and emit `Action::SyncMultiMonitor`.
+- **Regression Test Coverage**: Added unit test coverage verifying display toggle IDs across all mod-3 residues (`2000..=2003`) update config and emit sync actions cleanly.
 
 Optional Python entry points remain available:
 
@@ -14,7 +13,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.12-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.13-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

@@ -391,7 +391,7 @@ impl Host {
         let mut dirty = false;
         for change in changes {
             match (change.id, change.value) {
-                (id, Value::Bool(open)) if id >= 1000 && (id - 1000) % 3 == 0 => {
+                (id, Value::Bool(open)) if (1000..2000).contains(&id) && (id - 1000) % 3 == 0 => {
                     if let Some(widget) = self.packages.get(((id - 1000) / 3) as usize) {
                         actions.push(if open {
                             Action::Show(widget.id.clone())
@@ -400,12 +400,12 @@ impl Host {
                         });
                     }
                 }
-                (id, Value::Action) if id >= 1001 && (id - 1001) % 3 == 0 => {
+                (id, Value::Action) if (1001..2000).contains(&id) && (id - 1001) % 3 == 0 => {
                     if let Some(widget) = self.packages.get(((id - 1001) / 3) as usize) {
                         actions.push(Action::Settings(widget.id.clone()));
                     }
                 }
-                (id, Value::Bool(pin)) if id >= 1002 && (id - 1002) % 3 == 0 => {
+                (id, Value::Bool(pin)) if (1002..2000).contains(&id) && (id - 1002) % 3 == 0 => {
                     if let Some(widget) = self.packages.get(((id - 1002) / 3) as usize) {
                         if pin {
                             if !self.pinned.iter().any(|p| p == &widget.id) {
@@ -928,5 +928,66 @@ mod tests {
             crate::fusion::shutdown();
         }
         assert!(!root.join("config/native-general.json").exists());
+    }
+    #[test]
+    fn duplicate_display_toggles_across_all_mod3_ids_update_config_and_sync() {
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = crate::render::Runtime::start().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("lumen-display-toggles-{}", std::process::id()));
+        let make_display = |index: usize, primary: bool| crate::displays::DisplayInfo {
+            id: format!("display-{index}"),
+            source: format!("\\\\.\\DISPLAY{}", index + 1),
+            monitor_path: format!("path-{index}"),
+            name: format!("Monitor {index}"),
+            enabled: true,
+            primary,
+            bounds: Some([index as i32 * 1920, 0, index as i32 * 1920 + 1920, 1080]),
+            work: Some([index as i32 * 1920, 0, index as i32 * 1920 + 1920, 1040]),
+        };
+        unsafe {
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            let mut host = Host::create(std::ptr::null_mut(), &root, glass, true).unwrap();
+            host.displays = vec![
+                make_display(0, false),
+                make_display(1, false),
+                make_display(2, false),
+                make_display(3, false),
+            ];
+            let enable_changes = (0..4)
+                .map(|i| Change {
+                    id: 2000 + i as u32,
+                    value: Value::Bool(true),
+                })
+                .collect();
+            assert_eq!(
+                host.apply_changes(enable_changes),
+                vec![Action::SyncMultiMonitor; 4]
+            );
+            assert_eq!(
+                host.config.duplicate_displays,
+                vec![
+                    "display-0".to_string(),
+                    "display-1".to_string(),
+                    "display-2".to_string(),
+                    "display-3".to_string(),
+                ]
+            );
+            let disable_changes = (0..4)
+                .map(|i| Change {
+                    id: 2000 + i as u32,
+                    value: Value::Bool(false),
+                })
+                .collect();
+            assert_eq!(
+                host.apply_changes(disable_changes),
+                vec![Action::SyncMultiMonitor; 4]
+            );
+            assert!(host.config.duplicate_displays.is_empty());
+            host.hide();
+            drop(host);
+            crate::multi_monitor::configure(false, vec![]);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
