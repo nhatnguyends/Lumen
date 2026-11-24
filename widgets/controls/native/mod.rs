@@ -1507,7 +1507,7 @@ impl State {
             };
             let palette_fallback = crate::surface::color(
                 &self.config.palette,
-                self.glass.borrow().wallpaper_accent(),
+                self.glass.borrow().wallpaper_accent_for(self.hwnd),
             );
             let hwnd = self.hwnd;
             frame.paint_frosted_chrome_for(hwnd, frosted, |chrome_dc| {
@@ -1574,11 +1574,11 @@ impl State {
         } else if self.config.design == "cloud" {
             crate::accent::vivid(rgb(66, 186, 198))
         } else if self.config.palette == crate::accent::THEME {
-            self.glass.borrow().wallpaper_accent()
+            self.glass.borrow().wallpaper_accent_for(self.hwnd)
         } else {
             crate::accent::vivid(crate::surface::color(
                 &self.config.palette,
-                self.glass.borrow().wallpaper_accent(),
+                self.glass.borrow().wallpaper_accent_for(self.hwnd),
             ))
         };
         self.picker = None;

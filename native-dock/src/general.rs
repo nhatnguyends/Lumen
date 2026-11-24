@@ -783,6 +783,7 @@ mod tests {
     }
     #[test]
     fn general_config_round_trips_and_rejects_corruption() {
+        let _lock = crate::native_ui_test_lock();
         assert!(Config::default().start_with_windows);
         let root = std::env::temp_dir().join(format!("lumen-general-model-{}", std::process::id()));
         let c = Config {

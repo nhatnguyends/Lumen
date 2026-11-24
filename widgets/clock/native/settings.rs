@@ -20,7 +20,10 @@ impl State {
         if self.config.palette == "theme" {
             face::color(&self.config.theme)
         } else {
-            crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent())
+            crate::surface::color(
+                &self.config.palette,
+                self.glass.borrow().wallpaper_accent_for(self.hwnd),
+            )
         }
     }
     fn palette_choices(&self) -> Vec<Choice> {
@@ -32,7 +35,7 @@ impl State {
         choices.extend(crate::settings_ui::palette_choices());
         for item in &mut choices {
             if item.key == crate::accent::THEME {
-                item.color = Some(self.glass.borrow().wallpaper_accent());
+                item.color = Some(self.glass.borrow().wallpaper_accent_for(self.hwnd));
             }
         }
         choices

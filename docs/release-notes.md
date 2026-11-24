@@ -1,7 +1,7 @@
-Lumen 0.1.13 fixes secondary-display widget duplication switches in General Settings:
+Lumen 0.1.14 dramatically reduces frosted/liquid glass memory usage and adds full per-monitor wallpaper support:
 
-- **Secondary Display Duplication Toggle Fix**: Bounded widget-package control ID ranges (`1000..2000`) in `Host::apply_changes` so secondary display toggle IDs (`2000+`, such as `2001` and `2002`) are no longer intercepted by modulo-3 widget pin/toggle arms and reliably update `duplicate_displays` and emit `Action::SyncMultiMonitor`.
-- **Regression Test Coverage**: Added unit test coverage verifying display toggle IDs across all mod-3 residues (`2000..=2003`) update config and emit sync actions cleanly.
+- **Low-Memory Frosted & Liquid Glass Pipeline**: Added adaptive pre-blur downsampling in `prepare_blurred_bytes`, aspect-preserving capped preview (`960px`) and sharp (`1920px`) wallpaper surfaces with automatic sharp-bitmap release when Liquid Glass is disabled, replaced full-monitor `NATIVE_LAYERS` DIB caches with direct fixed-point integer bilinear sampling (`blit_placed_bilinear`), enabled immediate stale wallpaper cache eviction (`prune_caches`), and shared idle-released scratch buffers (~50% RAM reduction on dual-4K setups).
+- **Per-Monitor & Multi-Monitor Wallpaper Support**: Added independent per-monitor wallpaper resolution and rendering across shared, Span, Fit, Center, and Tile modes, live wallpaper detection, seamless cross-monitor straddling, and per-monitor adaptive accent colors (`wallpaper_accent_for`) across all widgets and Fusion bridges.
 
 Optional Python entry points remain available:
 
@@ -13,7 +13,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.13-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.14-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

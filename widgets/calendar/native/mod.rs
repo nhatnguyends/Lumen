@@ -281,8 +281,10 @@ impl Host {
         if IsWindowVisible(s.hwnd) != 0 {
             InvalidateRect(s.hwnd, null(), 0);
         }
-        let surface =
-            crate::surface::color(&s.config.palette, s.glass.borrow().wallpaper_accent());
+        let surface = crate::surface::color(
+            &s.config.palette,
+            s.glass.borrow().wallpaper_accent_for(s.hwnd),
+        );
         if let Some(host) = &mut s.settings_host {
             host.set_surface(surface, crate::contrast::luminance(surface) > 0.42);
         }
@@ -405,8 +407,10 @@ impl State {
                 }
             }
         }
-        let surface =
-            crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent());
+        let surface = crate::surface::color(
+            &self.config.palette,
+            self.glass.borrow().wallpaper_accent_for(self.hwnd),
+        );
         if let Some(host) = &mut self.settings_host {
             host.set_rows(rows);
             host.set_surface(surface, crate::contrast::luminance(surface) > 0.42);
@@ -460,8 +464,10 @@ impl State {
         }
         SetTimer(self.hwnd, 99, 180, None);
         let rows = structural.then(|| self.settings_rows());
-        let surface =
-            crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent());
+        let surface = crate::surface::color(
+            &self.config.palette,
+            self.glass.borrow().wallpaper_accent_for(self.hwnd),
+        );
         if let Some(host) = &mut self.settings_host {
             if let Some(rows) = rows {
                 host.set_rows(rows);
@@ -517,7 +523,7 @@ impl State {
             let rows = self.settings_rows();
             let surface = crate::surface::color(
                 &self.config.palette,
-                self.glass.borrow().wallpaper_accent(),
+                self.glass.borrow().wallpaper_accent_for(self.hwnd),
             );
             if let Some(host) = &mut self.settings_host {
                 host.set_rows(rows);
@@ -733,7 +739,7 @@ impl State {
         };
         let position = crate::fusion::window_rect(self.hwnd);
         let theme = self.config.theme.as_str();
-        let wallpaper_accent = self.glass.borrow().wallpaper_accent();
+        let wallpaper_accent = self.glass.borrow().wallpaper_accent_for(self.hwnd);
         let accent = if self.config.palette == crate::accent::THEME {
             wallpaper_accent
         } else {

@@ -1600,12 +1600,27 @@ pub(crate) unsafe fn refresh() {
                 let ref_hwnd = ps[0].id as HWND;
                 let (desk, accent, has_wallpaper) = {
                     let glass = s.glass.borrow();
-                    let area = glass.monitor_origin_size(ref_hwnd);
-                    let synced = if crate::gpu::wallpaper_revision_synced(wallpaper, area) {
+                    let mon_area = glass.monitor_origin_size(ref_hwnd);
+                    let fits_monitor = l >= mon_area[0]
+                        && t >= mon_area[1]
+                        && l + w <= mon_area[0] + mon_area[2]
+                        && t + h <= mon_area[1] + mon_area[3];
+                    let target_area = if fits_monitor { mon_area } else { [l, t, w, h] };
+                    let synced = if crate::gpu::wallpaper_revision_synced(wallpaper, target_area) {
                         true
-                    } else if let Some((pair_area, blurred, sharp)) =
+                    } else if let Some((pair_area, blurred, sharp)) = if fits_monitor {
                         glass.gpu_wallpaper_pair_for(ref_hwnd)
-                    {
+                    } else {
+                        glass.gpu_wallpaper_pair_for_rect(
+                            ref_hwnd,
+                            RECT {
+                                left: l,
+                                top: t,
+                                right: l + w,
+                                bottom: t + h,
+                            },
+                        )
+                    } {
                         crate::gpu::sync_wallpaper_pair(
                             wallpaper,
                             pair_area,
@@ -1615,7 +1630,7 @@ pub(crate) unsafe fn refresh() {
                     } else {
                         false
                     };
-                    (area, glass.wallpaper_accent(), synced)
+                    (target_area, glass.wallpaper_accent_for(ref_hwnd), synced)
                 };
                 let mut constants = crate::gpu::FusionBridgeConstants {
                     bridge_rect: [l as f32, t as f32, w as f32, h as f32],
@@ -1746,7 +1761,7 @@ pub(crate) unsafe fn refresh() {
                 h,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
             );
-            let brush = CreateSolidBrush(s.glass.borrow().wallpaper_accent());
+            let brush = CreateSolidBrush(s.glass.borrow().wallpaper_accent_for(hwnd));
             let rr = RECT {
                 left: 0,
                 top: 0,

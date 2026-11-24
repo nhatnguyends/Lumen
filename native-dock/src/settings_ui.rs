@@ -273,7 +273,7 @@ impl Host {
             fitted[2] - fitted[0],
             fitted[3] - fitted[1],
         );
-        let surface = glass.borrow().wallpaper_accent();
+        let surface = glass.borrow().wallpaper_accent_for(owner);
         let _light = crate::contrast::luminance(surface) > 0.42;
         let mut state = Box::new(RefCell::new(State {
             hwnd: null_mut(),

@@ -78,14 +78,14 @@ impl State {
         if self.board.palette != crate::accent::THEME {
             return crate::surface::color(
                 &self.board.palette,
-                self.glass.borrow().wallpaper_accent(),
+                self.glass.borrow().wallpaper_accent_for(self.hwnd),
             );
         }
         match self.board.design.as_str() {
             "notebook" => rgb(235, 226, 207),
             "index" => rgb(15, 41, 42),
             "honey" => rgb(255, 195, 59),
-            _ => self.glass.borrow().wallpaper_accent(),
+            _ => self.glass.borrow().wallpaper_accent_for(self.hwnd),
         }
     }
     pub(super) fn source_glass(&self) -> Rc<RefCell<Glass>> {

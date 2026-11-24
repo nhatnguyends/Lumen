@@ -5,7 +5,10 @@ pub const NOTIFY: u32 = WM_APP + 83;
 pub const FLUSH_TIMER: usize = 92;
 impl State {
     pub(super) fn surface_color(&self) -> u32 {
-        crate::surface::color(&self.config.palette, self.glass.borrow().wallpaper_accent())
+        crate::surface::color(
+            &self.config.palette,
+            self.glass.borrow().wallpaper_accent_for(self.hwnd),
+        )
     }
     pub(super) fn settings_rows(&self) -> Vec<Row> {
         vec![

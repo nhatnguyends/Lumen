@@ -1990,7 +1990,7 @@ impl State {
             }
             let search = self.search_rect();
             let search_radius = (search[3] - search[1]) * 0.5;
-            let search_accent = source_glass.borrow().raw_wallpaper_accent();
+            let search_accent = source_glass.borrow().raw_wallpaper_accent_for(self.hwnd);
             let search_light = paper || crate::contrast::luminance(ink) < 0.5;
             crate::widget_interaction::draw_search_glass(
                 frame.dc,

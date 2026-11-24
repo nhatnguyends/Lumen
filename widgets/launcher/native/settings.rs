@@ -109,7 +109,7 @@ impl App {
         } else {
             owner
         };
-        let accent = self.glass.borrow().wallpaper_accent();
+        let accent = self.glass.borrow().wallpaper_accent_for(target);
         self.set_accent(accent);
         if !self.settings.hwnd.is_null() {
             let shwnd = self.settings.hwnd;

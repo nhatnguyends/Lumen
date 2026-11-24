@@ -1026,7 +1026,7 @@ impl App {
         }
         self.packages.refresh();
         crate::fusion::refresh();
-        let color = self.glass.borrow().wallpaper_accent();
+        let color = self.glass.borrow().wallpaper_accent_for(hwnd);
         self.set_accent(color);
         self.background_key.clear();
         self.sync_duplicate_appearance();
@@ -1040,7 +1040,6 @@ impl App {
             return;
         }
         let dock = self.dock.clone();
-        let accent = self.accent_color;
         let floating = self.dock.floating;
         let inspect = self.inspect;
         for dup in self.duplicate_docks.values() {
@@ -1061,7 +1060,10 @@ impl App {
                 d.dock.columns = dock.columns;
                 d.dock.icon_size = dock.icon_size;
                 d.dock.floating = floating;
-                d.accent_color = accent;
+                d.accent_color = self.glass.borrow().wallpaper_accent_for(d_hwnd);
+                if d.dock.theme == crate::accent::THEME {
+                    d.dock.light = crate::accent::light(d.accent_color);
+                }
                 d.background_key.clear();
                 d.frame = None;
                 d.background = None;
@@ -2061,7 +2063,7 @@ impl App {
         } else {
         if self.search_visible() || self.group_selection.is_some() {
             let rect = [16., 14., w as f32 - 16., 60.];
-            let search_accent = self.glass.borrow().raw_wallpaper_accent();
+            let search_accent = self.glass.borrow().raw_wallpaper_accent_for(hwnd);
             let search_light = crate::contrast::luminance(self.search_ink) < 0.5;
             crate::widget_interaction::draw_search_glass(
                 dc,
@@ -2850,6 +2852,7 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
         let dpi_changed = (prev_dpi - dpi).abs() > 0.005;
         app.dpi = dpi;
         if !is_dup {
+            crate::glass::invalidate_query_cache();
             let blur = app.glass.borrow().blur();
             app.glass.borrow_mut().set_blur(blur, dpi);
             app.glass.borrow_mut().refresh();
@@ -2969,7 +2972,7 @@ unsafe extern "system" fn wndproc(
             } else {
                 app.dpi = crate::geometry::window_dpi(hwnd);
             }
-            let accent = app.glass.borrow().wallpaper_accent();
+            let accent = app.glass.borrow().wallpaper_accent_for(hwnd);
             app.accent_color = accent;
             if app.dock.theme == crate::accent::THEME {
                 app.dock.light = crate::accent::light(app.accent_color);
@@ -3199,6 +3202,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             if !app.is_duplicate {
+                crate::glass::invalidate_query_cache();
                 let refreshed = app.glass.borrow_mut().refresh();
                 if refreshed {
                     app.notify_wallpaper_changed(hwnd);
@@ -3462,6 +3466,8 @@ unsafe extern "system" fn wndproc(
                 ]);
                 app.save_bounds();
             }
+            let accent = app.glass.borrow().wallpaper_accent_for(hwnd);
+            app.set_accent(accent);
             app.background_key.clear();
             InvalidateRect(hwnd, null(), 0);
             0
@@ -3741,7 +3747,7 @@ unsafe extern "system" fn wndproc(
         }
         WALLPAPER_READY => {
             if !app.is_duplicate && app.glass.borrow_mut().finish_async() {
-                let accent = app.glass.borrow().wallpaper_accent();
+                let accent = app.glass.borrow().wallpaper_accent_for(hwnd);
                 app.accent_color = accent;
                 if app.dock.theme == crate::accent::THEME {
                     app.dock.light = crate::accent::light(app.accent_color);

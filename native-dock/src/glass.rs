@@ -4,19 +4,30 @@ use image::{imageops, DynamicImage, ImageDecoder, ImageReader};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    ffi::c_void,
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
-    ptr::null_mut,
+    ptr::{null, null_mut},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
-use windows_sys::Win32::{
-    Foundation::*, Graphics::Gdi::*, System::Registry::*, System::Threading::*,
-    UI::WindowsAndMessaging::*,
+use windows_sys::{
+    core::GUID,
+    Win32::{
+        Foundation::*,
+        Graphics::Gdi::*,
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_LOCAL_SERVER,
+            COINIT_MULTITHREADED,
+        },
+        System::Registry::*,
+        System::Threading::*,
+        UI::WindowsAndMessaging::*,
+    },
 };
 
 fn vertical_offset(viewport: f32, drawn: f32, style: u32, tile: bool) -> f32 {
@@ -55,11 +66,41 @@ impl Drop for OwnedBitmap {
     }
 }
 
+const SHARP_MAX_DIM: u32 = 1920;
+const PREVIEW_MAX_DIM: u32 = 960;
+
+fn fit_dimensions(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w <= max_w && h <= max_h {
+        return (w, h);
+    }
+    let scale = (max_w as f32 / w.max(1) as f32).min(max_h as f32 / h.max(1) as f32);
+    (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    )
+}
+
+fn build_sharp_bytes(rgba: &image::RgbaImage) -> (Vec<u8>, i32, i32) {
+    let (sw, sh) = fit_dimensions(rgba.width(), rgba.height(), SHARP_MAX_DIM, SHARP_MAX_DIM);
+    let mut sharp_bytes = if sw == rgba.width() && sh == rgba.height() {
+        rgba.as_raw().clone()
+    } else {
+        imageops::thumbnail(rgba, sw, sh).into_raw()
+    };
+    for p in sharp_bytes.chunks_exact_mut(4) {
+        p.swap(0, 2);
+        p[3] = 255;
+    }
+    (sharp_bytes, sw as i32, sh as i32)
+}
+
 struct WallpaperSource {
     path: PathBuf,
+    cap: Option<(u32, u32)>,
     small: RefCell<Option<image::RgbaImage>>,
     preview: image::RgbaImage,
     sharp: Cell<HBITMAP>,
+    sharp_size: Cell<(i32, i32)>,
     width: i32,
     height: i32,
     natural: [f32; 2],
@@ -77,45 +118,62 @@ impl Drop for WallpaperSource {
 }
 impl WallpaperSource {
     fn make_preview(small: &image::RgbaImage) -> image::RgbaImage {
-        if small.width() <= 1920 && small.height() <= 1920 {
+        let (pw, ph) =
+            fit_dimensions(small.width(), small.height(), PREVIEW_MAX_DIM, PREVIEW_MAX_DIM);
+        if pw == small.width() && ph == small.height() {
             small.clone()
         } else {
-            imageops::thumbnail(small, 1920, 1920)
+            imageops::thumbnail(small, pw, ph)
         }
     }
     fn release_large(&self) {
-        if self.width > 1280 {
-            self.small.borrow_mut().take();
-        }
+        self.small.borrow_mut().take();
     }
     fn has_full_preview(&self) -> bool {
         self.preview.width() as i32 == self.width && self.preview.height() as i32 == self.height
+    }
+    fn sharp_dimensions(&self) -> (i32, i32) {
+        let (sw, sh) = self.sharp_size.get();
+        if sw > 0 && sh > 0 {
+            (sw, sh)
+        } else {
+            (self.width, self.height)
+        }
+    }
+    unsafe fn clear_sharp(&self) {
+        let sharp = self.sharp.replace(null_mut());
+        if !sharp.is_null() {
+            DeleteObject(sharp);
+        }
+        self.sharp_size.set((0, 0));
     }
     unsafe fn sharp_bitmap(&self) -> HBITMAP {
         let existing = self.sharp.get();
         if !existing.is_null() {
             return existing;
         }
-        let guard = self.small.borrow_mut();
-        let temp;
-        let rgba = if let Some(small) = guard.as_ref() {
-            small
-        } else if self.has_full_preview() {
-            &self.preview
-        } else if let Some((decoded, _)) = Glass::decode_small(&self.path, Glass::wallpaper_cap()) {
-            temp = decoded;
-            &temp
-        } else {
-            return null_mut();
+        let (sharp_bytes, sw, sh) = {
+            let guard = self.small.borrow();
+            if let Some(small) = guard.as_ref() {
+                build_sharp_bytes(small)
+            } else if self.has_full_preview() {
+                build_sharp_bytes(&self.preview)
+            } else {
+                drop(guard);
+                let sharp_cap = self
+                    .cap
+                    .or_else(|| Glass::wallpaper_cap())
+                    .map(|(cw, ch)| (cw.min(SHARP_MAX_DIM), ch.min(SHARP_MAX_DIM)))
+                    .or(Some((SHARP_MAX_DIM, SHARP_MAX_DIM)));
+                let Some((decoded, _)) = Glass::decode_small(&self.path, sharp_cap) else {
+                    return null_mut();
+                };
+                build_sharp_bytes(&decoded)
+            }
         };
-        let mut sharp_bytes = rgba.as_raw().clone();
-        drop(guard);
-        for p in sharp_bytes.chunks_exact_mut(4) {
-            p.swap(0, 2);
-            p[3] = 255;
-        }
-        if let Some(bitmap) = dib(self.width, self.height, &sharp_bytes) {
+        if let Some(bitmap) = dib(sw, sh, &sharp_bytes) {
             self.sharp.set(bitmap);
+            self.sharp_size.set((sw, sh));
             bitmap
         } else {
             null_mut()
@@ -123,42 +181,153 @@ impl WallpaperSource {
     }
 }
 
-type SourceKey = (PathBuf, Option<SystemTime>);
-type BlurKey = (PathBuf, Option<SystemTime>, i32, i32);
-type NativeLayerKey = (PathBuf, u64, usize, [i32; 4], u32, bool, u32, (i32, i32), [u32; 2]);
+pub(crate) fn normalize_path_key(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let trimmed = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    };
+    trimmed.replace('/', "\\").to_ascii_lowercase()
+}
 
-struct PendingWallpaper {
-    path: PathBuf,
-    modified: Option<SystemTime>,
-    style: u32,
-    tile: bool,
-    blur: f32,
-    dpi: f32,
-    small: image::RgbaImage,
+type SourceKey = (String, Option<SystemTime>, u64);
+type BlurKey = (SourceKey, i32, i32);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WallpaperSpec {
+    pub path: PathBuf,
+    pub key: SourceKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MonitorWallpaperSpec {
+    pub rect: [i32; 4],
+    pub slot: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DesktopWallpaperSpec {
+    pub unique_sources: Vec<WallpaperSpec>,
+    pub monitors: Vec<MonitorWallpaperSpec>,
+    pub shared: bool,
+    pub style: u32,
+    pub tile: bool,
+    pub bg_color: u32,
+}
+
+impl DesktopWallpaperSpec {
+    fn virtual_bounds(&self) -> Option<RECT> {
+        let first = self.monitors.first()?;
+        let mut l = first.rect[0];
+        let mut t = first.rect[1];
+        let mut r = first.rect[2];
+        let mut b = first.rect[3];
+        for m in &self.monitors[1..] {
+            l = l.min(m.rect[0]);
+            t = t.min(m.rect[1]);
+            r = r.max(m.rect[2]);
+            b = b.max(m.rect[3]);
+        }
+        (r > l && b > t).then_some(RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct LoadedWallpaper {
+    spec: WallpaperSpec,
+    bitmap: Rc<OwnedBitmap>,
+    source: Rc<WallpaperSource>,
+    blur_width: i32,
+    blur_height: i32,
+}
+
+struct PendingSlot {
+    spec: WallpaperSpec,
+    width: i32,
+    height: i32,
+    preview: image::RgbaImage,
+    cap: Option<(u32, u32)>,
     natural: [f32; 2],
     accent: u32,
     blurred_bytes: Vec<u8>,
     blur_w: i32,
     blur_h: i32,
+    sharp_bytes: Option<(Vec<u8>, i32, i32)>,
 }
 
-static PENDING_WALLPAPER: Mutex<Option<PendingWallpaper>> = Mutex::new(None);
-static LOADING_KEY: Mutex<Option<SourceKey>> = Mutex::new(None);
+struct PendingDesktopWallpaper {
+    spec: DesktopWallpaperSpec,
+    blur: f32,
+    dpi: f32,
+    low_power: bool,
+    slots: Vec<(usize, PendingSlot)>,
+}
+
+static PENDING_WALLPAPER: Mutex<Option<PendingDesktopWallpaper>> = Mutex::new(None);
+static LOADING_KEY: Mutex<Option<Vec<SourceKey>>> = Mutex::new(None);
 
 thread_local! {
     static WALLPAPER_SOURCES: RefCell<HashMap<SourceKey, Rc<WallpaperSource>>> = RefCell::new(HashMap::new());
     static BLURRED_CACHE: RefCell<HashMap<BlurKey, (Rc<OwnedBitmap>, i32, i32)>> = RefCell::new(HashMap::new());
     static PATH_BUF: RefCell<Vec<u16>> = RefCell::new(vec![0u16; 32768]);
-    static NATIVE_LAYERS: RefCell<Vec<(NativeLayerKey, crate::compositor::Buffer)>> = const { RefCell::new(Vec::new()) };
+    static LIQUID_SRC: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static BLIT_XS: RefCell<Vec<(usize, usize, u32)>> = const { RefCell::new(Vec::new()) };
+    static BLIT_YS: RefCell<Vec<(usize, usize, u32)>> = const { RefCell::new(Vec::new()) };
+    static LAST_QUERY: RefCell<Option<(Instant, DesktopWallpaperSpec)>> = const { RefCell::new(None) };
+    static LIVE_WP_CACHE: RefCell<Option<(Instant, Option<DesktopWallpaperSpec>)>> = const { RefCell::new(None) };
 }
+
+pub fn invalidate_query_cache() {
+    LAST_QUERY.with(|c| *c.borrow_mut() = None);
+}
+
 pub fn clear_cache() {
-    NATIVE_LAYERS.with(|cache| cache.borrow_mut().clear());
     WALLPAPER_SOURCES.with(|cache| cache.borrow_mut().clear());
     BLURRED_CACHE.with(|cache| cache.borrow_mut().clear());
+    LIQUID_SRC.with(|buf| *buf.borrow_mut() = Vec::new());
+    BLIT_XS.with(|buf| *buf.borrow_mut() = Vec::new());
+    BLIT_YS.with(|buf| *buf.borrow_mut() = Vec::new());
+    LAST_QUERY.with(|c| *c.borrow_mut() = None);
+    LIVE_WP_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+fn prune_caches(active_keys: &[SourceKey]) -> bool {
+    let mut evicted = false;
+    WALLPAPER_SOURCES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let before = cache.len();
+        cache.retain(|k, _| active_keys.contains(k));
+        if cache.len() < before {
+            evicted = true;
+        }
+    });
+    let blur_cap = active_keys.len().max(1) * 4;
+    BLURRED_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let before = cache.len();
+        cache.retain(|(k, _, _), _| active_keys.contains(k));
+        if cache.len() > blur_cap {
+            cache.clear();
+        }
+        if cache.len() < before {
+            evicted = true;
+        }
+    });
+    evicted
 }
 
 pub(crate) fn trim_working_set() {
-    NATIVE_LAYERS.with(|cache| cache.borrow_mut().clear());
+    LIQUID_SRC.with(|buf| *buf.borrow_mut() = Vec::new());
+    BLIT_XS.with(|buf| *buf.borrow_mut() = Vec::new());
+    BLIT_YS.with(|buf| *buf.borrow_mut() = Vec::new());
     unsafe {
         windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -177,6 +346,15 @@ static LIQUID_GLASS_REVISION: AtomicU64 = AtomicU64::new(0);
 pub fn set_liquid_glass(enabled: bool) {
     if LIQUID_GLASS.swap(enabled, Ordering::Relaxed) != enabled {
         LIQUID_GLASS_REVISION.fetch_add(1, Ordering::Relaxed);
+        if !enabled && frosted_glass() {
+            WALLPAPER_SOURCES.with(|cache| {
+                for source in cache.borrow().values() {
+                    unsafe {
+                        source.clear_sharp();
+                    }
+                }
+            });
+        }
     }
 }
 pub fn liquid_glass() -> bool {
@@ -185,6 +363,15 @@ pub fn liquid_glass() -> bool {
 pub fn set_frosted_glass(enabled: bool) {
     if FROSTED_GLASS.swap(enabled, Ordering::Relaxed) != enabled {
         LIQUID_GLASS_REVISION.fetch_add(1, Ordering::Relaxed);
+        if enabled && !liquid_glass() {
+            WALLPAPER_SOURCES.with(|cache| {
+                for source in cache.borrow().values() {
+                    unsafe {
+                        source.clear_sharp();
+                    }
+                }
+            });
+        }
     }
 }
 pub fn frosted_glass() -> bool {
@@ -252,7 +439,6 @@ fn paint_due(hwnd: HWND, is_move: bool) -> bool {
 
 pub struct Glass {
     blend_buffer: RefCell<Option<(HWND, crate::compositor::Buffer)>>,
-    liquid_src: RefCell<Vec<u8>>,
     generation: u64,
     accent: Cell<u32>,
     bitmap: Option<Rc<OwnedBitmap>>,
@@ -269,12 +455,117 @@ pub struct Glass {
     low_power: bool,
     blur: f32,
     dpi: f32,
+    slots: Vec<LoadedWallpaper>,
+    monitors: Vec<MonitorWallpaperSpec>,
+    shared: bool,
+    bg_color: u32,
+    desktop_spec: Option<DesktopWallpaperSpec>,
 }
+
+unsafe fn fill_solid_bg(dc: HDC, width: i32, height: i32, colorref: u32) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    if colorref == 0 {
+        PatBlt(dc, 0, 0, width, height, BLACKNESS);
+    } else {
+        let brush = CreateSolidBrush(colorref);
+        let rr = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        FillRect(dc, &rr, brush);
+        DeleteObject(brush);
+    }
+}
+
+fn colorref_to_bgr_f32(colorref: u32) -> [f32; 3] {
+    [
+        ((colorref >> 16) & 0xff) as f32,
+        ((colorref >> 8) & 0xff) as f32,
+        (colorref & 0xff) as f32,
+    ]
+}
+
+fn rect_intersect(a: RECT, b: RECT) -> Option<RECT> {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    (right > left && bottom > top).then_some(RECT {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn pick_best_monitor_index(monitors: &[MonitorWallpaperSpec], target: RECT) -> Option<usize> {
+    if monitors.is_empty() {
+        return None;
+    }
+    let has_area = target.right > target.left && target.bottom > target.top;
+    if has_area {
+        let mut best_area = 0i64;
+        let mut best_idx = None;
+        for (idx, m) in monitors.iter().enumerate() {
+            let mr = RECT {
+                left: m.rect[0],
+                top: m.rect[1],
+                right: m.rect[2],
+                bottom: m.rect[3],
+            };
+            if let Some(inter) = rect_intersect(mr, target) {
+                let area = (inter.right - inter.left) as i64 * (inter.bottom - inter.top) as i64;
+                if area > best_area {
+                    best_area = area;
+                    best_idx = Some(idx);
+                }
+            }
+        }
+        if best_idx.is_some() {
+            return best_idx;
+        }
+    }
+    let cx = if has_area {
+        (target.left as i64 + target.right as i64) / 2
+    } else {
+        target.left as i64
+    };
+    let cy = if has_area {
+        (target.top as i64 + target.bottom as i64) / 2
+    } else {
+        target.top as i64
+    };
+    monitors
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, m)| {
+            let dx = if cx < m.rect[0] as i64 {
+                m.rect[0] as i64 - cx
+            } else if cx > m.rect[2] as i64 {
+                cx - m.rect[2] as i64
+            } else {
+                0
+            };
+            let dy = if cy < m.rect[1] as i64 {
+                m.rect[1] as i64 - cy
+            } else if cy > m.rect[3] as i64 {
+                cy - m.rect[3] as i64
+            } else {
+                0
+            };
+            dx * dx + dy * dy
+        })
+        .map(|(i, _)| i)
+}
+
 impl Glass {
     pub fn new(blur: f32, dpi: f32) -> Self {
         Self {
             blend_buffer: RefCell::new(None),
-            liquid_src: RefCell::new(Vec::new()),
             generation: 0,
             accent: Cell::new(crate::accent::FALLBACK),
             bitmap: None,
@@ -291,6 +582,11 @@ impl Glass {
             low_power: crate::motion::low_power(),
             blur,
             dpi,
+            slots: Vec::new(),
+            monitors: Vec::new(),
+            shared: true,
+            bg_color: 0,
+            desktop_spec: None,
         }
     }
     pub fn wallpaper_accent(&self) -> u32 {
@@ -300,8 +596,71 @@ impl Glass {
     pub fn raw_wallpaper_accent(&self) -> u32 {
         self.accent.get()
     }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_shared_wallpaper(&self) -> bool {
+        self.shared
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn unique_wallpaper_count(&self) -> usize {
+        if !self.slots.is_empty() {
+            self.slots.len()
+        } else if self.bitmap.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+    unsafe fn slot_index_for_hwnd(&self, hwnd: HWND) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        if self.shared || self.monitors.is_empty() {
+            return Some(0);
+        }
+        let mut wr = if !hwnd.is_null() {
+            crate::fusion::window_rect(hwnd)
+        } else {
+            zeroed()
+        };
+        if wr.right <= wr.left || wr.bottom <= wr.top {
+            let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info: MONITORINFO = zeroed();
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmon, &mut info) != 0 {
+                wr = info.rcMonitor;
+            }
+        }
+        let idx = pick_best_monitor_index(&self.monitors, wr)?;
+        self.monitors[idx].slot
+    }
+    pub fn raw_wallpaper_accent_for(&self, hwnd: HWND) -> u32 {
+        if self.slots.is_empty() {
+            return if !self.monitors.is_empty() && self.bitmap.is_none() {
+                self.bg_color
+            } else {
+                self.accent.get()
+            };
+        }
+        if self.shared
+            || (self.slots.len() <= 1 && self.monitors.iter().all(|m| m.slot.is_some()))
+        {
+            return self.accent.get();
+        }
+        unsafe {
+            match self.slot_index_for_hwnd(hwnd) {
+                Some(idx) => self
+                    .slots
+                    .get(idx)
+                    .map_or_else(|| self.accent.get(), |s| s.source.accent),
+                None => self.bg_color,
+            }
+        }
+    }
+    pub fn wallpaper_accent_for(&self, hwnd: HWND) -> u32 {
+        crate::accent::vivid(self.raw_wallpaper_accent_for(hwnd))
+    }
     pub fn available(&self) -> bool {
-        self.bitmap.is_some()
+        !self.slots.is_empty() || self.bitmap.is_some()
     }
     pub fn dpi(&self) -> f32 {
         self.dpi
@@ -314,6 +673,29 @@ impl Glass {
             .wrapping_add(LIQUID_GLASS_REVISION.load(Ordering::Relaxed))
     }
     pub fn desktop_origin_size(&self) -> [i32; 4] {
+        if let Some(vb) = self
+            .desktop_spec
+            .as_ref()
+            .and_then(|s| s.virtual_bounds())
+            .or_else(|| {
+                let spec = DesktopWallpaperSpec {
+                    unique_sources: Vec::new(),
+                    monitors: self.monitors.clone(),
+                    shared: self.shared,
+                    style: self.style,
+                    tile: self.tile,
+                    bg_color: self.bg_color,
+                };
+                spec.virtual_bounds()
+            })
+        {
+            return [
+                vb.left,
+                vb.top,
+                (vb.right - vb.left).max(1),
+                (vb.bottom - vb.top).max(1),
+            ];
+        }
         unsafe {
             let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -331,18 +713,49 @@ impl Glass {
             }
         }
     }
+    fn virtual_bounds_rect(&self) -> RECT {
+        let [vx, vy, vw, vh] = self.desktop_origin_size();
+        RECT {
+            left: vx,
+            top: vy,
+            right: vx + vw,
+            bottom: vy + vh,
+        }
+    }
     pub fn monitor_origin_size(&self, hwnd: HWND) -> [i32; 4] {
         unsafe {
-            if self.style == 22 {
-                return self.desktop_origin_size();
+            let wr = if !hwnd.is_null() {
+                crate::fusion::window_rect(hwnd)
+            } else {
+                zeroed()
+            };
+            if !self.monitors.is_empty() {
+                let target = if wr.right > wr.left && wr.bottom > wr.top {
+                    wr
+                } else {
+                    let mut info: MONITORINFO = zeroed();
+                    info.cbSize = size_of::<MONITORINFO>() as u32;
+                    if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info)
+                        != 0
+                    {
+                        info.rcMonitor
+                    } else {
+                        wr
+                    }
+                };
+                if let Some(idx) = pick_best_monitor_index(&self.monitors, target) {
+                    let r = self.monitors[idx].rect;
+                    return [r[0], r[1], (r[2] - r[0]).max(1), (r[3] - r[1]).max(1)];
+                }
             }
             let mut monitor: MONITORINFO = zeroed();
             monitor.cbSize = size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(
-                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                &mut monitor,
-            ) != 0
-            {
+            let hmon = if wr.right > wr.left && wr.bottom > wr.top {
+                MonitorFromRect(&wr, MONITOR_DEFAULTTONEAREST)
+            } else {
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            };
+            if GetMonitorInfoW(hmon, &mut monitor) != 0 {
                 let r = monitor.rcMonitor;
                 [r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)]
             } else {
@@ -354,83 +767,63 @@ impl Glass {
         &self,
         hwnd: HWND,
     ) -> Option<([i32; 4], Vec<u8>, Option<Vec<u8>>)> {
+        let [vx, vy, vw, vh] = self.monitor_origin_size(hwnd);
+        self.gpu_wallpaper_pair_for_rect(
+            hwnd,
+            RECT {
+                left: vx,
+                top: vy,
+                right: vx + vw,
+                bottom: vy + vh,
+            },
+        )
+    }
+    pub fn gpu_wallpaper_pair_for_rect(
+        &self,
+        hwnd: HWND,
+        rect: RECT,
+    ) -> Option<([i32; 4], Vec<u8>, Option<Vec<u8>>)> {
         unsafe {
-            let area = self.monitor_origin_size(hwnd);
-            let [vx, vy, vw, vh] = area;
+            let vw = rect.right - rect.left;
+            let vh = rect.bottom - rect.top;
             if vw <= 0 || vh <= 0 || (vw as i64) * (vh as i64) > 32_000_000 {
                 return None;
             }
-            let blurred_bmp = self.bitmap.as_ref()?.0;
+            if !self.available() && self.monitors.is_empty() {
+                return None;
+            }
+            let area = [rect.left, rect.top, vw, vh];
             let mut buffer = crate::compositor::Buffer::plain(vw, vh, 1.0)?;
-            let render_bmp =
-                |buffer: &mut crate::compositor::Buffer, bmp: HBITMAP, src_size: (i32, i32)| {
-                    let rr = RECT {
-                        left: 0,
-                        top: 0,
-                        right: vw,
-                        bottom: vh,
-                    };
-                    if self.style == 0 || self.style == 6 {
-                        PatBlt(buffer.dc, 0, 0, vw, vh, BLACKNESS);
-                    } else {
-                        let brush = CreateSolidBrush(self.wallpaper_accent());
-                        FillRect(buffer.dc, &rr, brush);
-                        DeleteObject(brush);
-                    }
-                    let monitor_rect = RECT {
-                        left: vx,
-                        top: vy,
-                        right: vx + vw,
-                        bottom: vy + vh,
-                    };
-                    self.draw_layer(buffer.dc, hwnd, vw, vh, bmp, src_size, monitor_rect, false);
-                    let pixels = buffer.pixels_mut();
-                    for p in pixels.chunks_exact_mut(4) {
-                        p[3] = 255;
-                    }
-                    pixels.to_vec()
-                };
-            let blurred = render_bmp(&mut buffer, blurred_bmp, self.blur_size());
+            let fallback_accent = self.wallpaper_accent_for(hwnd);
+            let render_pass = |buffer: &mut crate::compositor::Buffer, want_sharp: bool| {
+                if self.style == 0 || self.style == 6 {
+                    fill_solid_bg(buffer.dc, vw, vh, self.bg_color);
+                } else {
+                    fill_solid_bg(buffer.dc, vw, vh, fallback_accent);
+                }
+                self.draw_rect_layer(buffer.dc, hwnd, vw, vh, rect, want_sharp, false);
+                let pixels = buffer.pixels_mut();
+                for p in pixels.chunks_exact_mut(4) {
+                    p[3] = 255;
+                }
+                pixels.to_vec()
+            };
+            let blurred = render_pass(&mut buffer, false);
             let sharp = self
-                .source
-                .as_ref()
-                .map(|s| s.sharp_bitmap())
-                .filter(|b| !b.is_null())
-                .map(|bmp| render_bmp(&mut buffer, bmp, (self.width, self.height)));
+                .has_any_sharp_for_rect(hwnd, rect)
+                .then(|| render_pass(&mut buffer, true));
             Some((area, blurred, sharp))
         }
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn gpu_wallpaper_bgra(&self) -> Option<(i32, i32, Vec<u8>)> {
         unsafe {
             let [vx, vy, vw, vh] = self.desktop_origin_size();
             if vw <= 0 || vh <= 0 || (vw as i64) * (vh as i64) > 32_000_000 {
                 return None;
             }
-            let sharp = self
-                .source
-                .as_ref()
-                .map(|s| s.sharp_bitmap())
-                .filter(|b| !b.is_null());
-            let (bmp, src_size) = if let Some(sharp) = sharp {
-                (sharp, (self.width, self.height))
-            } else if let Some(blurred) = self.bitmap.as_ref() {
-                (blurred.0, self.blur_size())
-            } else {
+            if !self.available() {
                 return None;
-            };
-            let mut buffer = crate::compositor::Buffer::plain(vw, vh, 1.0)?;
-            let rr = RECT {
-                left: 0,
-                top: 0,
-                right: vw,
-                bottom: vh,
-            };
-            if self.style == 0 || self.style == 6 {
-                PatBlt(buffer.dc, 0, 0, vw, vh, BLACKNESS);
-            } else {
-                let brush = CreateSolidBrush(self.wallpaper_accent());
-                FillRect(buffer.dc, &rr, brush);
-                DeleteObject(brush);
             }
             let desktop_rect = RECT {
                 left: vx,
@@ -438,14 +831,20 @@ impl Glass {
                 right: vx + vw,
                 bottom: vy + vh,
             };
-            self.draw_layer(
+            let want_sharp = self.has_any_sharp_for_rect(GetDesktopWindow(), desktop_rect);
+            let mut buffer = crate::compositor::Buffer::plain(vw, vh, 1.0)?;
+            if self.style == 0 || self.style == 6 {
+                fill_solid_bg(buffer.dc, vw, vh, self.bg_color);
+            } else {
+                fill_solid_bg(buffer.dc, vw, vh, self.wallpaper_accent());
+            }
+            self.draw_rect_layer(
                 buffer.dc,
                 GetDesktopWindow(),
                 vw,
                 vh,
-                bmp,
-                src_size,
                 desktop_rect,
+                want_sharp,
                 false,
             );
             let pixels = buffer.pixels_mut();
@@ -459,17 +858,14 @@ impl Glass {
     #[cfg(test)]
     pub(crate) unsafe fn fixture_file(path: &Path, blur: f32, dpi: f32) -> Self {
         let mut glass = Self::new(blur, dpi);
-        glass.path = path.into();
+        let spec = file_spec(path.to_path_buf());
+        glass.path = spec.path.clone();
         glass.style = 2;
-        let (bitmap, blur_w, blur_h, source) = glass.load().expect("fixture wallpaper");
-        glass.bitmap = Some(bitmap);
-        glass.blur_width = blur_w;
-        glass.blur_height = blur_h;
-        glass.width = source.width;
-        glass.height = source.height;
-        glass.natural = source.natural;
-        glass.accent.set(source.accent);
-        glass.source = Some(source);
+        let loaded = Self::load_slot(&spec, blur, dpi, Self::wallpaper_cap())
+            .expect("fixture wallpaper");
+        glass.apply_legacy_from_slot(&loaded);
+        glass.slots = vec![loaded];
+        glass.shared = true;
         glass.generation = 1;
         glass
     }
@@ -480,15 +876,158 @@ impl Glass {
         glass.style = 0;
         glass
     }
+    #[cfg(test)]
+    pub(crate) unsafe fn fixture_multi_monitor(
+        entries: Vec<([i32; 4], Option<PathBuf>)>,
+        style: u32,
+        tile: bool,
+        bg_color: u32,
+        blur: f32,
+        dpi: f32,
+    ) -> Self {
+        let mut glass = Self::new(blur, dpi);
+        let spec = dedup_monitors(entries, style, tile, bg_color);
+        glass.apply_spec_sync(&spec);
+        glass
+    }
+    unsafe fn apply_legacy_from_slot(&mut self, slot: &LoadedWallpaper) {
+        self.bitmap = Some(slot.bitmap.clone());
+        self.blur_width = slot.blur_width;
+        self.blur_height = slot.blur_height;
+        self.width = slot.source.width;
+        self.height = slot.source.height;
+        self.natural = slot.source.natural;
+        self.accent.set(slot.source.accent);
+        self.source = Some(slot.source.clone());
+        self.path = slot.spec.path.clone();
+        self.modified = slot.spec.key.1;
+    }
+    unsafe fn clear_legacy_slot(&mut self) {
+        self.bitmap = None;
+        self.source = None;
+        self.blur_width = 0;
+        self.blur_height = 0;
+        self.width = 0;
+        self.height = 0;
+        self.natural = [0.0; 2];
+        self.path = PathBuf::new();
+        self.modified = None;
+        self.accent.set(if !self.monitors.is_empty() {
+            self.bg_color
+        } else {
+            crate::accent::FALLBACK
+        });
+    }
+    fn primary_slot_from_monitors(&self) -> Option<usize> {
+        self.monitors
+            .iter()
+            .find(|m| m.rect[0] <= 0 && m.rect[2] > 0 && m.rect[1] <= 0 && m.rect[3] > 0)
+            .or_else(|| self.monitors.first())
+            .and_then(|m| m.slot)
+            .or_else(|| (!self.slots.is_empty()).then_some(0))
+    }
+    unsafe fn commit_loaded(
+        &mut self,
+        raw_spec: DesktopWallpaperSpec,
+        effective_monitors: Vec<MonitorWallpaperSpec>,
+        slots: Vec<LoadedWallpaper>,
+        low_power: bool,
+    ) {
+        self.style = raw_spec.style;
+        self.tile = raw_spec.tile;
+        self.bg_color = raw_spec.bg_color;
+        self.monitors = effective_monitors;
+        self.slots = slots;
+        self.shared = if let Some(first) = self.monitors.first() {
+            self.slots.len() <= 1 && self.monitors.iter().all(|m| m.slot == first.slot)
+        } else {
+            self.slots.len() <= 1
+        };
+        self.low_power = low_power;
+        if let Some(slot) = self
+            .primary_slot_from_monitors()
+            .and_then(|idx| self.slots.get(idx).cloned())
+            .or_else(|| self.slots.first().cloned())
+        {
+            self.apply_legacy_from_slot(&slot);
+        } else {
+            self.clear_legacy_slot();
+        }
+        let active_keys: Vec<SourceKey> =
+            self.slots.iter().map(|s| s.spec.key.clone()).collect();
+        if prune_caches(&active_keys) {
+            windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                usize::MAX,
+                usize::MAX,
+                0,
+            );
+        }
+        self.desktop_spec = Some(raw_spec);
+        self.generation += 1;
+        self.log_wallpaper_state();
+    }
+    fn log_wallpaper_state(&self) {
+        let mode = if self.style == 22 {
+            "span"
+        } else if self.slots.is_empty() && !self.monitors.is_empty() {
+            "solid"
+        } else if self.shared {
+            "shared"
+        } else {
+            "per-monitor"
+        };
+        crate::logger::info(
+            "glass",
+            format!(
+                "wallpaper mode={mode} unique_sources={} monitors={} style={} tile={} bg={:06x}",
+                self.slots.len(),
+                self.monitors.len(),
+                self.style,
+                self.tile,
+                self.bg_color,
+            ),
+        );
+    }
     pub unsafe fn set_blur(&mut self, blur: f32, dpi: f32) {
         if (self.blur - blur).abs() < 0.01 && (self.dpi - dpi).abs() < 0.01 {
             return;
         }
         self.blur = blur;
         self.dpi = dpi;
-        if let Some(source) = &self.source {
+        if !self.slots.is_empty() {
+            let mut ok = true;
+            for slot in &mut self.slots {
+                if let Some((bitmap, bw, bh)) =
+                    Self::get_or_build_blurred(&slot.spec, &slot.source, blur, dpi)
+                {
+                    slot.bitmap = bitmap;
+                    slot.blur_width = bw;
+                    slot.blur_height = bh;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                if let Some(primary) = self
+                    .primary_slot_from_monitors()
+                    .and_then(|idx| self.slots.get(idx))
+                    .or_else(|| self.slots.first())
+                    .cloned()
+                {
+                    self.apply_legacy_from_slot(&primary);
+                }
+                self.generation += 1;
+                return;
+            }
+        } else if let Some(source) = &self.source {
+            let spec = WallpaperSpec {
+                path: self.path.clone(),
+                key: (normalize_path_key(&self.path), self.modified, 0),
+            };
             if let Some((bitmap, bw, bh)) =
-                Self::get_or_build_blurred(&self.path, self.modified, source, blur, dpi)
+                Self::get_or_build_blurred(&spec, source, blur, dpi)
             {
                 self.bitmap = Some(bitmap);
                 self.blur_width = bw;
@@ -497,33 +1036,27 @@ impl Glass {
                 return;
             }
         }
+        self.desktop_spec = None;
         self.modified = None;
         self.refresh();
     }
-    unsafe fn query_wallpaper() -> Option<(PathBuf, Option<SystemTime>, u32, bool)> {
-        if let Some(live_path) = resolve_live_wallpaper_file() {
-            let modified = std::fs::metadata(&live_path).and_then(|m| m.modified()).ok();
-            return Some((live_path, modified, 10, false));
+    pub(crate) unsafe fn query_desktop_wallpaper() -> Option<DesktopWallpaperSpec> {
+        let now = Instant::now();
+        if let Some(cached) = LAST_QUERY.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|(t, _)| now.duration_since(*t) < Duration::from_millis(50))
+                .map(|(_, spec)| spec.clone())
+        }) {
+            return Some(cached);
         }
-        let spi_path = PATH_BUF.with(|buf| {
-            let mut name = buf.borrow_mut();
-            if SystemParametersInfoW(
-                SPI_GETDESKWALLPAPER,
-                name.len() as u32,
-                name.as_mut_ptr() as _,
-                0,
-            ) == 0
-            {
-                return None;
-            }
-            let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-            Some(PathBuf::from(String::from_utf16_lossy(&name[..len])))
-        })?;
-        let path = resolve_wallpaper_path(spi_path);
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let style = registry_number("WallpaperStyle", 10);
-        let tile = registry_number("TileWallpaper", 0) != 0;
-        Some((path, modified, style, tile))
+        let resolved = resolve_live_wallpaper_spec()
+            .or_else(|| query_desktop_wallpaper_com())
+            .or_else(|| query_desktop_wallpaper_legacy());
+        if let Some(ref spec) = resolved {
+            LAST_QUERY.with(|c| *c.borrow_mut() = Some((now, spec.clone())));
+        }
+        resolved
     }
     /// Compute the decoded wallpaper dimension cap for a desktop size and power mode.
     fn wallpaper_cap_for_screen(w: i32, h: i32, low_power: bool) -> Option<(u32, u32)> {
@@ -541,6 +1074,43 @@ impl Glass {
         } else {
             None
         }
+    }
+    fn wallpaper_cap_for_mode(w: i32, h: i32, low_power: bool, span: bool) -> Option<(u32, u32)> {
+        if low_power || !span {
+            Self::wallpaper_cap_for_screen(w, h, low_power)
+        } else if w > 0 && h > 0 {
+            Some(((w as u32).clamp(1920, 5120), (h as u32).clamp(1080, 2160)))
+        } else {
+            None
+        }
+    }
+    unsafe fn cap_for_spec(spec: &DesktopWallpaperSpec, slot_idx: usize, low_power: bool) -> Option<(u32, u32)> {
+        if spec.style == 22 {
+            if let Some(vb) = spec.virtual_bounds() {
+                return Self::wallpaper_cap_for_mode(
+                    vb.right - vb.left,
+                    vb.bottom - vb.top,
+                    low_power,
+                    true,
+                );
+            }
+            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(GetSystemMetrics(SM_CXSCREEN));
+            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(GetSystemMetrics(SM_CYSCREEN));
+            return Self::wallpaper_cap_for_mode(w, h, low_power, true);
+        }
+        let mut mw = 0i32;
+        let mut mh = 0i32;
+        for m in &spec.monitors {
+            if m.slot == Some(slot_idx) {
+                mw = mw.max(m.rect[2] - m.rect[0]);
+                mh = mh.max(m.rect[3] - m.rect[1]);
+            }
+        }
+        if mw <= 0 || mh <= 0 {
+            mw = GetSystemMetrics(SM_CXSCREEN);
+            mh = GetSystemMetrics(SM_CYSCREEN);
+        }
+        Self::wallpaper_cap_for_screen(mw, mh, low_power)
     }
     unsafe fn wallpaper_cap() -> Option<(u32, u32)> {
         let w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(GetSystemMetrics(SM_CXSCREEN));
@@ -561,65 +1131,85 @@ impl Glass {
     /// Non-blocking startup refresh: decodes and blurs the wallpaper on a background
     /// thread and posts `message` to `notify` when ready.
     pub unsafe fn refresh_async(&mut self, notify: HWND, message: u32) -> bool {
-        let Some((path, modified, style, tile)) = Self::query_wallpaper() else {
+        let Some(spec) = Self::query_desktop_wallpaper() else {
             return false;
         };
-        if self.bitmap.is_some()
-            && path == self.path
-            && modified == self.modified
-            && style == self.style
-            && tile == self.tile
-            && self.low_power == crate::motion::low_power()
-        {
+        let low_power = crate::motion::low_power();
+        if self.desktop_spec.as_ref() == Some(&spec) && self.low_power == low_power {
             return false;
         }
-        let key: SourceKey = (path.clone(), modified);
-        if WALLPAPER_SOURCES.with(|c| c.borrow().contains_key(&key)) {
+        let all_cached = WALLPAPER_SOURCES.with(|c| {
+            let cache = c.borrow();
+            spec.unique_sources.iter().enumerate().all(|(idx, u)| {
+                let cap = Self::cap_for_spec(&spec, idx, low_power);
+                cache.get(&u.key).is_some_and(|s| s.cap == cap)
+            })
+        });
+        if all_cached {
             return self.refresh();
         }
+        let loading_keys: Vec<SourceKey> =
+            spec.unique_sources.iter().map(|u| u.key.clone()).collect();
         {
             let mut loading = LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner());
-            if loading.as_ref() == Some(&key) {
+            if loading.as_ref() == Some(&loading_keys) {
                 return false;
             }
-            *loading = Some(key);
+            *loading = Some(loading_keys);
         }
-        self.path = path.clone();
-        self.modified = modified;
-        self.style = style;
-        self.tile = tile;
-        self.low_power = crate::motion::low_power();
         let blur = self.blur;
         let dpi = self.dpi;
-        let cap = Self::wallpaper_cap();
+        let caps: Vec<Option<(u32, u32)>> = (0..spec.unique_sources.len())
+            .map(|idx| Self::cap_for_spec(&spec, idx, low_power))
+            .collect();
         let notify_addr = notify as usize;
         std::thread::spawn(move || {
-            let loaded = (|| {
-                let (small, natural) = Self::decode_small(&path, cap)?;
+            let mut slots = Vec::with_capacity(spec.unique_sources.len());
+            let need_sharp = liquid_glass() || !frosted_glass();
+            for (idx, (src_spec, cap)) in spec.unique_sources.iter().zip(caps).enumerate() {
+                let Some((small, natural)) = Self::decode_small(&src_spec.path, cap) else {
+                    crate::logger::warn(
+                        "glass",
+                        format!("wallpaper decode failed for {}", src_spec.path.display()),
+                    );
+                    continue;
+                };
+                let width = small.width() as i32;
+                let height = small.height() as i32;
                 let palette = imageops::thumbnail(&small, 128, 128);
                 let accent = crate::accent::dominant(palette.as_raw());
                 let (blurred_bytes, blur_w, blur_h) =
                     Self::prepare_blurred_bytes(&small, blur, dpi, natural[0]);
-                Some(PendingWallpaper {
-                    path,
-                    modified,
-                    style,
-                    tile,
-                    blur,
-                    dpi,
-                    small,
-                    natural,
-                    accent,
-                    blurred_bytes,
-                    blur_w,
-                    blur_h,
-                })
-            })();
-            *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            if let Some(pending) = loaded {
-                *PENDING_WALLPAPER.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending);
-                PostMessageW(notify_addr as HWND, message, 0, 0);
+                let sharp_bytes = need_sharp.then(|| build_sharp_bytes(&small));
+                let preview = WallpaperSource::make_preview(&small);
+                drop(small);
+                slots.push((
+                    idx,
+                    PendingSlot {
+                        spec: src_spec.clone(),
+                        width,
+                        height,
+                        preview,
+                        cap,
+                        natural,
+                        accent,
+                        blurred_bytes,
+                        blur_w,
+                        blur_h,
+                        sharp_bytes,
+                    },
+                ));
             }
+            let pending = PendingDesktopWallpaper {
+                spec,
+                blur,
+                dpi,
+                low_power,
+                slots,
+            };
+            *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *PENDING_WALLPAPER.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending);
+            PostMessageW(notify_addr as HWND, message, 0, 0);
         });
         false
     }
@@ -631,73 +1221,82 @@ impl Glass {
         else {
             return false;
         };
-        let source_key: SourceKey = (pending.path.clone(), pending.modified);
-        let w = pending.small.width() as i32;
-        let h = pending.small.height() as i32;
-        let preview = WallpaperSource::make_preview(&pending.small);
-        let source = Rc::new(WallpaperSource {
-            path: pending.path.clone(),
-            small: RefCell::new(Some(pending.small)),
-            preview,
-            sharp: Cell::new(null_mut()),
-            width: w,
-            height: h,
-            natural: pending.natural,
-            accent: pending.accent,
-        });
-        WALLPAPER_SOURCES.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.len() >= 2 {
-                cache.clear();
+        let mut remap = vec![None; pending.spec.unique_sources.len()];
+        let mut loaded_slots = Vec::with_capacity(pending.slots.len());
+        let mut trim_mem = false;
+        for (orig_idx, slot) in pending.slots {
+            let source_key = slot.spec.key.clone();
+            let w = slot.width;
+            let h = slot.height;
+            if w > 1280 {
+                trim_mem = true;
             }
-            cache.insert(source_key, source.clone());
-        });
-        let Some(bitmap) = dib(pending.blur_w, pending.blur_h, &pending.blurred_bytes) else {
-            return false;
-        };
-        let owned = Rc::new(OwnedBitmap(bitmap));
-        let blur_key: BlurKey = (
-            pending.path.clone(),
-            pending.modified,
-            (pending.blur * 100.).round() as i32,
-            (pending.dpi * 100.).round() as i32,
-        );
-        BLURRED_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.len() >= 4 {
-                cache.clear();
+            let sharp_cell = Cell::new(null_mut());
+            let sharp_size_cell = Cell::new((0, 0));
+            if let Some((ref sharp_bytes, sw, sh)) = slot.sharp_bytes {
+                if let Some(sharp_bmp) = dib(sw, sh, sharp_bytes) {
+                    sharp_cell.set(sharp_bmp);
+                    sharp_size_cell.set((sw, sh));
+                }
             }
-            cache.insert(blur_key, (owned.clone(), pending.blur_w, pending.blur_h));
-        });
-        let (final_bitmap, bw, bh) = if (self.blur - pending.blur).abs() < 0.01
-            && (self.dpi - pending.dpi).abs() < 0.01
-        {
-            (owned, pending.blur_w, pending.blur_h)
-        } else if let Some(built) = Self::get_or_build_blurred(
-            &pending.path,
-            pending.modified,
-            &source,
-            self.blur,
-            self.dpi,
-        ) {
-            built
-        } else {
-            (owned, pending.blur_w, pending.blur_h)
-        };
-        self.path = pending.path;
-        self.modified = pending.modified;
-        self.style = pending.style;
-        self.tile = pending.tile;
-        self.low_power = crate::motion::low_power();
-        self.bitmap = Some(final_bitmap);
-        self.blur_width = bw;
-        self.blur_height = bh;
-        self.width = source.width;
-        self.height = source.height;
-        self.natural = source.natural;
-        self.accent.set(source.accent);
-        source.release_large();
-        if source.width > 1280 {
+            let source = Rc::new(WallpaperSource {
+                path: slot.spec.path.clone(),
+                cap: slot.cap,
+                small: RefCell::new(None),
+                preview: slot.preview,
+                sharp: sharp_cell,
+                sharp_size: sharp_size_cell,
+                width: w,
+                height: h,
+                natural: slot.natural,
+                accent: slot.accent,
+            });
+            WALLPAPER_SOURCES.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                cache.insert(source_key.clone(), source.clone());
+            });
+            BLURRED_CACHE.with(|cache| {
+                cache.borrow_mut().retain(|(k, _, _), _| k != &source_key);
+            });
+            let Some(bitmap) = dib(slot.blur_w, slot.blur_h, &slot.blurred_bytes) else {
+                source.release_large();
+                continue;
+            };
+            let owned = Rc::new(OwnedBitmap(bitmap));
+            let blur_key: BlurKey = (
+                source_key,
+                (pending.blur * 100.).round() as i32,
+                (pending.dpi * 100.).round() as i32,
+            );
+            BLURRED_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .insert(blur_key, (owned.clone(), slot.blur_w, slot.blur_h));
+            });
+            let (final_bitmap, bw, bh) = if (self.blur - pending.blur).abs() < 0.01
+                && (self.dpi - pending.dpi).abs() < 0.01
+            {
+                (owned, slot.blur_w, slot.blur_h)
+            } else if let Some(built) =
+                Self::get_or_build_blurred(&slot.spec, &source, self.blur, self.dpi)
+            {
+                built
+            } else {
+                (owned, slot.blur_w, slot.blur_h)
+            };
+            source.release_large();
+            if let Some(target) = remap.get_mut(orig_idx) {
+                *target = Some(loaded_slots.len());
+            }
+            loaded_slots.push(LoadedWallpaper {
+                spec: slot.spec,
+                bitmap: final_bitmap,
+                source,
+                blur_width: bw,
+                blur_height: bh,
+            });
+        }
+        if trim_mem {
             windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(
                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
                 usize::MAX,
@@ -705,71 +1304,76 @@ impl Glass {
                 0,
             );
         }
-        self.source = Some(source);
-        self.generation += 1;
+        let effective_monitors: Vec<MonitorWallpaperSpec> = pending
+            .spec
+            .monitors
+            .iter()
+            .map(|m| MonitorWallpaperSpec {
+                rect: m.rect,
+                slot: m.slot.and_then(|old| remap.get(old).copied().flatten()),
+            })
+            .collect();
+        self.commit_loaded(pending.spec, effective_monitors, loaded_slots, pending.low_power);
         true
     }
     /// Windows writes into our owned UTF-16 buffer. We only read the returned
-    /// wallpaper file and two desktop appearance values; no registry writes.
+    /// wallpaper state and files; no registry writes.
     pub unsafe fn refresh(&mut self) -> bool {
-        let Some((path, modified, style, tile)) = Self::query_wallpaper() else {
+        let Some(spec) = Self::query_desktop_wallpaper() else {
             return false;
         };
-        if self.bitmap.is_some()
-            && path == self.path
-            && modified == self.modified
-            && style == self.style
-            && tile == self.tile
+        if self.desktop_spec.as_ref() == Some(&spec)
             && self.low_power == crate::motion::low_power()
         {
             return false;
         }
-        let key: SourceKey = (path.clone(), modified);
+        let loading_keys: Vec<SourceKey> =
+            spec.unique_sources.iter().map(|u| u.key.clone()).collect();
         if LOADING_KEY
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            == Some(&key)
+            == Some(&loading_keys)
         {
             return false;
         }
-        self.path = path;
-        self.generation += 1;
-        self.modified = modified;
-        self.style = style;
-        self.tile = tile;
-        self.low_power = crate::motion::low_power();
-        match self.load() {
-            Some((bitmap, bw, bh, source)) => {
-                self.bitmap = Some(bitmap);
-                self.blur_width = bw;
-                self.blur_height = bh;
-                self.width = source.width;
-                self.height = source.height;
-                self.natural = source.natural;
-                self.accent.set(source.accent);
-                self.source = Some(source);
-                true
-            }
-            None => {
-                self.source = None;
-                self.bitmap = None;
-                self.blur_width = 0;
-                self.blur_height = 0;
-                true
+        self.apply_spec_sync(&spec);
+        true
+    }
+    unsafe fn apply_spec_sync(&mut self, spec: &DesktopWallpaperSpec) {
+        let low_power = crate::motion::low_power();
+        let mut remap = vec![None; spec.unique_sources.len()];
+        let mut loaded_slots = Vec::with_capacity(spec.unique_sources.len());
+        for (idx, src_spec) in spec.unique_sources.iter().enumerate() {
+            let cap = Self::cap_for_spec(spec, idx, low_power);
+            if let Some(loaded) = Self::load_slot(src_spec, self.blur, self.dpi, cap) {
+                remap[idx] = Some(loaded_slots.len());
+                loaded_slots.push(loaded);
+            } else {
+                crate::logger::warn(
+                    "glass",
+                    format!("wallpaper decode failed for {}", src_spec.path.display()),
+                );
             }
         }
+        let effective_monitors: Vec<MonitorWallpaperSpec> = spec
+            .monitors
+            .iter()
+            .map(|m| MonitorWallpaperSpec {
+                rect: m.rect,
+                slot: m.slot.and_then(|old| remap.get(old).copied().flatten()),
+            })
+            .collect();
+        self.commit_loaded(spec.clone(), effective_monitors, loaded_slots, low_power);
     }
     unsafe fn get_or_build_blurred(
-        path: &Path,
-        modified: Option<SystemTime>,
+        spec: &WallpaperSpec,
         source: &WallpaperSource,
         blur: f32,
         dpi: f32,
     ) -> Option<(Rc<OwnedBitmap>, i32, i32)> {
         let key: BlurKey = (
-            path.to_path_buf(),
-            modified,
+            spec.key.clone(),
             (blur * 100.).round() as i32,
             (dpi * 100.).round() as i32,
         );
@@ -781,13 +1385,14 @@ impl Glass {
         } else if blur > 0.05 || source.has_full_preview() {
             Self::build_blurred(&source.preview, blur, dpi, source.natural[0])?
         } else {
-            let (decoded, _) = Self::decode_small(&source.path, Self::wallpaper_cap())?;
+            let (decoded, _) =
+                Self::decode_small(&source.path, source.cap.or_else(|| Self::wallpaper_cap()))?;
             Self::build_blurred(&decoded, blur, dpi, source.natural[0])?
         };
         let owned = Rc::new(OwnedBitmap(bitmap));
         BLURRED_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache.len() >= 4 {
+            if cache.len() >= 12 {
                 cache.clear();
             }
             cache.insert(key, (owned.clone(), bw, bh));
@@ -800,13 +1405,32 @@ impl Glass {
         dpi: f32,
         natural_w: f32,
     ) -> (Vec<u8>, i32, i32) {
-        let sigma = (blur * dpi * small.width() as f32 / natural_w.max(1.0)).clamp(0.0, 40.0);
-        let mut blurred = if sigma <= 0.05 {
-            small.clone()
-        } else if sigma < 3.5 {
-            imageops::blur(small, sigma)
+        let sigma_src = (blur * dpi * small.width() as f32 / natural_w.max(1.0)).clamp(0.0, 40.0);
+        let (work, sigma) = if sigma_src > 0.05 && (small.width() > 320 || small.height() > 180) {
+            let scale = (sigma_src / 2.2).clamp(1.0, 6.0);
+            let min_w = 256u32.min(small.width());
+            let min_h = 144u32.min(small.height());
+            let target_w = ((small.width() as f32 / scale).round() as u32).clamp(min_w, small.width());
+            let target_h =
+                ((small.height() as f32 / scale).round() as u32).clamp(min_h, small.height());
+            if target_w < small.width() || target_h < small.height() {
+                let resized =
+                    imageops::resize(small, target_w, target_h, imageops::FilterType::Triangle);
+                let scaled_sigma =
+                    (sigma_src * (resized.width() as f32 / small.width().max(1) as f32)).clamp(0.0, 40.0);
+                (std::borrow::Cow::Owned(resized), scaled_sigma)
+            } else {
+                (std::borrow::Cow::Borrowed(small), sigma_src)
+            }
         } else {
-            imageops::fast_blur(small, sigma)
+            (std::borrow::Cow::Borrowed(small), sigma_src)
+        };
+        let mut blurred = if sigma <= 0.05 {
+            work.into_owned()
+        } else if sigma < 3.5 {
+            imageops::blur(&*work, sigma)
+        } else {
+            imageops::fast_blur(&*work, sigma)
         };
         let w = blurred.width();
         let h = blurred.height();
@@ -835,15 +1459,22 @@ impl Glass {
         let bitmap = dib(w, h, &bytes)?;
         Some((bitmap, w, h))
     }
-    unsafe fn load(&self) -> Option<(Rc<OwnedBitmap>, i32, i32, Rc<WallpaperSource>)> {
-        let source_key: SourceKey = (self.path.clone(), self.modified);
-        let source = if let Some(cached) =
-            WALLPAPER_SOURCES.with(|cache| cache.borrow().get(&source_key).cloned())
-        {
+    unsafe fn load_slot(
+        spec: &WallpaperSpec,
+        blur: f32,
+        dpi: f32,
+        cap: Option<(u32, u32)>,
+    ) -> Option<LoadedWallpaper> {
+        let source = if let Some(cached) = WALLPAPER_SOURCES.with(|cache| {
+            cache
+                .borrow()
+                .get(&spec.key)
+                .filter(|s| s.cap == cap)
+                .cloned()
+        }) {
             cached
         } else {
-            let cap = Self::wallpaper_cap();
-            let (small, natural) = Self::decode_small(&self.path, cap)?;
+            let (small, natural) = Self::decode_small(&spec.path, cap)?;
             let palette = imageops::thumbnail(&small, 128, 128);
             let accent = crate::accent::dominant(palette.as_raw());
             if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
@@ -853,28 +1484,39 @@ impl Glass {
             let h = small.height() as i32;
             let preview = WallpaperSource::make_preview(&small);
             let source = Rc::new(WallpaperSource {
-                path: self.path.clone(),
+                path: spec.path.clone(),
+                cap,
                 small: RefCell::new(Some(small)),
                 preview,
                 sharp: Cell::new(null_mut()),
+                sharp_size: Cell::new((0, 0)),
                 width: w,
                 height: h,
                 natural,
                 accent,
             });
+            BLURRED_CACHE.with(|cache| {
+                cache.borrow_mut().retain(|(k, _, _), _| k != &spec.key);
+            });
             WALLPAPER_SOURCES.with(|cache| {
                 let mut cache = cache.borrow_mut();
-                if cache.len() >= 2 {
+                if cache.len() >= 8 {
                     cache.clear();
                 }
-                cache.insert(source_key, source.clone());
+                cache.insert(spec.key.clone(), source.clone());
             });
             source
         };
-        let (bitmap, blur_w, blur_h) =
-            Self::get_or_build_blurred(&self.path, self.modified, &source, self.blur, self.dpi)?;
+        let (bitmap, blur_width, blur_height) =
+            Self::get_or_build_blurred(spec, &source, blur, dpi)?;
         source.release_large();
-        Some((bitmap, blur_w, blur_h, source))
+        Some(LoadedWallpaper {
+            spec: spec.clone(),
+            bitmap,
+            source,
+            blur_width,
+            blur_height,
+        })
     }
     pub unsafe fn draw(&self, dc: HDC, hwnd: HWND, width: i32, height: i32) {
         self.draw_blended(dc, hwnd, width, height, 255);
@@ -899,25 +1541,11 @@ impl Glass {
         fallback_amount: u8,
         frost_at: impl Fn(i32, i32) -> f32,
     ) -> bool {
-        let Some(bitmap) = self.bitmap.as_ref().map(|b| b.0) else {
+        if !self.available() && self.monitors.is_empty() {
             return false;
-        };
-        if let Some(sharp) = self
-            .source
-            .as_ref()
-            .map(|s| s.sharp_bitmap())
-            .filter(|b| !b.is_null())
-        {
-            self.draw_layer(
-                dc,
-                hwnd,
-                width,
-                height,
-                sharp,
-                (self.width, self.height),
-                window,
-                low_moving,
-            );
+        }
+        if self.has_any_sharp_for_rect(hwnd, window) {
+            self.draw_rect_layer(dc, hwnd, width, height, window, true, low_moving);
             let mut scratch = self.blend_buffer.borrow_mut();
             if scratch
                 .as_ref()
@@ -927,18 +1555,9 @@ impl Glass {
             }
             if let Some((_, buffer)) = scratch.as_mut() {
                 if self.style == 0 || self.style == 6 {
-                    PatBlt(buffer.dc, 0, 0, width, height, BLACKNESS);
+                    fill_solid_bg(buffer.dc, width, height, self.bg_color);
                 }
-                self.draw_layer(
-                    buffer.dc,
-                    hwnd,
-                    width,
-                    height,
-                    bitmap,
-                    self.blur_size(),
-                    window,
-                    moving,
-                );
+                self.draw_rect_layer(buffer.dc, hwnd, width, height, window, false, moving);
                 let hbmp = GetCurrentObject(dc, OBJ_BITMAP as u32);
                 let mut ds: DIBSECTION = zeroed();
                 let is_dib = !hbmp.is_null()
@@ -997,21 +1616,12 @@ impl Glass {
                     );
                 }
             }
-            if crate::motion::low_power() && !moving {
+            if !moving {
                 scratch.take();
             }
             true
         } else {
-            self.draw_layer(
-                dc,
-                hwnd,
-                width,
-                height,
-                bitmap,
-                self.blur_size(),
-                window,
-                moving,
-            );
+            self.draw_rect_layer(dc, hwnd, width, height, window, false, moving);
             true
         }
     }
@@ -1023,7 +1633,7 @@ impl Glass {
         height: i32,
         frost_at: impl Fn(i32, i32) -> f32,
     ) {
-        if self.bitmap.is_none()
+        if (!self.available() && self.monitors.is_empty())
             || width <= 0
             || height <= 0
             || width as i64 * height as i64 > 32_000_000
@@ -1034,7 +1644,7 @@ impl Glass {
         let moving = crate::fusion::is_moving(hwnd) || is_resizing(hwnd);
         let low_moving = moving && crate::motion::low_power();
         if self.style == 0 || self.style == 6 {
-            PatBlt(dc, 0, 0, width, height, BLACKNESS);
+            fill_solid_bg(dc, width, height, self.bg_color);
         }
         self.draw_sharp_blur_field(
             dc,
@@ -1049,10 +1659,11 @@ impl Glass {
         );
     }
     pub unsafe fn draw_blended(&self, dc: HDC, hwnd: HWND, width: i32, height: i32, amount: u8) {
-        let Some(bitmap) = self.bitmap.as_ref().map(|b| b.0) else {
-            return;
-        };
-        if width <= 0 || height <= 0 || width as i64 * height as i64 > 32_000_000 {
+        if (!self.available() && self.monitors.is_empty())
+            || width <= 0
+            || height <= 0
+            || width as i64 * height as i64 > 32_000_000
+        {
             return;
         }
         if !crate::fusion::is_surface(hwnd) {
@@ -1068,7 +1679,7 @@ impl Glass {
         let low_moving = moving && crate::motion::low_power();
         let apply_liquid = liquid_glass() && !low_moving && !crate::fusion::is_surface(hwnd);
         if self.style == 0 || self.style == 6 {
-            PatBlt(dc, 0, 0, width, height, BLACKNESS);
+            fill_solid_bg(dc, width, height, self.bg_color);
         }
         if let Some(ref fb) = frost_blend {
             self.draw_sharp_blur_field(
@@ -1101,33 +1712,12 @@ impl Glass {
             if scratch.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
                 scratch.take();
             }
-            self.draw_layer(
-                dc,
-                hwnd,
-                width,
-                height,
-                bitmap,
-                self.blur_size(),
-                window,
-                moving,
-            );
+            self.draw_rect_layer(dc, hwnd, width, height, window, false, moving);
             self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid, amount, None);
             return;
         }
-        if let Some(source) = &self.source {
-            let sharp = source.sharp_bitmap();
-            if !sharp.is_null() {
-                self.draw_layer(
-                    dc,
-                    hwnd,
-                    width,
-                    height,
-                    sharp,
-                    (self.width, self.height),
-                    window,
-                    low_moving,
-                );
-            }
+        if self.has_any_sharp_for_rect(hwnd, window) {
+            self.draw_rect_layer(dc, hwnd, width, height, window, true, low_moving);
         }
         if amount == 0 {
             let mut scratch = self.blend_buffer.borrow_mut();
@@ -1145,17 +1735,8 @@ impl Glass {
             *scratch = crate::compositor::Buffer::plain(width, height, 1.).map(|b| (hwnd, b));
         }
         if let Some((_, buffer)) = scratch.as_ref() {
-            PatBlt(buffer.dc, 0, 0, width, height, BLACKNESS);
-            self.draw_layer(
-                buffer.dc,
-                hwnd,
-                width,
-                height,
-                bitmap,
-                self.blur_size(),
-                window,
-                moving,
-            );
+            fill_solid_bg(buffer.dc, width, height, self.bg_color);
+            self.draw_rect_layer(buffer.dc, hwnd, width, height, window, false, moving);
             AlphaBlend(
                 dc,
                 0,
@@ -1190,21 +1771,7 @@ impl Glass {
         if tw == 0 || th == 0 || tw > 512 || th > 512 {
             return None;
         }
-        let bmp = self.bitmap.as_ref()?.0;
-        let (buf, bw, bh, stride) = self.dib_slice(bmp)?;
-        let (left_f, top_f, dw, dh, _) = self.wallpaper_placement(hwnd, window);
-        let placed = SharpPlacement {
-            buf,
-            w: bw,
-            h: bh,
-            stride,
-            left_f,
-            top_f,
-            dw,
-            dh,
-            tile: self.tile,
-            style: self.style,
-        };
+        let placed = self.build_placed_surface(hwnd, window, false)?;
         let win_w = (window.right - window.left).max(1) as f32;
         let win_h = (window.bottom - window.top).max(1) as f32;
         let mut tile = Vec::with_capacity(tw * th);
@@ -1212,13 +1779,16 @@ impl Glass {
             let ly = (ty as f32 + 0.5) / th as f32 * win_h;
             for tx in 0..tw {
                 let lx = (tx as f32 + 0.5) / tw as f32 * win_w;
-                let b = sample_placed_channel(&placed, lx, ly, 0)
+                let b = placed
+                    .sample_channel(lx, ly, 0)
                     .round()
                     .clamp(0.0, 255.0) as u8;
-                let g = sample_placed_channel(&placed, lx, ly, 1)
+                let g = placed
+                    .sample_channel(lx, ly, 1)
                     .round()
                     .clamp(0.0, 255.0) as u8;
-                let r = sample_placed_channel(&placed, lx, ly, 2)
+                let r = placed
+                    .sample_channel(lx, ly, 2)
                     .round()
                     .clamp(0.0, 255.0) as u8;
                 tile.push([b, g, r]);
@@ -1249,6 +1819,109 @@ impl Glass {
             h as usize,
             stride,
         ))
+    }
+    unsafe fn build_placed_surface(
+        &self,
+        hwnd: HWND,
+        window: RECT,
+        want_sharp: bool,
+    ) -> Option<PlacedSurface<'_>> {
+        if !self.available() && self.monitors.is_empty() {
+            return None;
+        }
+        if want_sharp && !self.has_any_sharp_for_rect(hwnd, window) {
+            return None;
+        }
+        let bg_bgr = colorref_to_bgr_f32(self.bg_color);
+        let shift = if liquid_glass() {
+            6.0 * self.dpi.max(1.0)
+        } else {
+            0.0
+        };
+        let slot_placement = |slot_idx: Option<usize>, canvas: RECT| -> Option<SharpPlacement<'_>> {
+            let idx = slot_idx?;
+            let (bmp, natural) = if !self.slots.is_empty() {
+                let slot = self.slots.get(idx)?;
+                let bmp = if want_sharp {
+                    let sharp = slot.source.sharp_bitmap();
+                    if !sharp.is_null() {
+                        sharp
+                    } else {
+                        slot.bitmap.0
+                    }
+                } else {
+                    slot.bitmap.0
+                };
+                (bmp, slot.source.natural)
+            } else {
+                let bmp = if want_sharp {
+                    self.source
+                        .as_ref()
+                        .map(|s| s.sharp_bitmap())
+                        .filter(|b| !b.is_null())?
+                } else {
+                    self.bitmap.as_ref()?.0
+                };
+                (bmp, self.natural)
+            };
+            let (buf, bw, bh, stride) = self.dib_slice(bmp)?;
+            let pl = compute_placement(canvas, natural, window, self.style, self.tile, shift);
+            Some(SharpPlacement {
+                buf,
+                w: bw,
+                h: bh,
+                stride,
+                left_f: pl.left_f,
+                top_f: pl.top_f,
+                dw: pl.dw,
+                dh: pl.dh,
+                tile: self.tile,
+                style: self.style,
+                bg_bgr,
+            })
+        };
+        let mons = self.active_monitors_for_rect(hwnd, window);
+        if self.style == 22 {
+            let canvas = self.virtual_bounds_rect();
+            let slot_idx = mons
+                .iter()
+                .find_map(|(_, s)| *s)
+                .or_else(|| (!self.slots.is_empty() || self.bitmap.is_some()).then_some(0));
+            return Some(
+                slot_placement(slot_idx, canvas)
+                    .map(PlacedSurface::Single)
+                    .unwrap_or(PlacedSurface::Solid(bg_bgr)),
+            );
+        }
+        if self.tile && self.shared && !self.monitors.is_empty() {
+            let canvas = self.shared_tile_canvas(&mons);
+            let slot_idx = mons
+                .iter()
+                .find_map(|(_, s)| *s)
+                .or_else(|| (!self.slots.is_empty() || self.bitmap.is_some()).then_some(0));
+            return Some(
+                slot_placement(slot_idx, canvas)
+                    .map(PlacedSurface::Single)
+                    .unwrap_or(PlacedSurface::Solid(bg_bgr)),
+            );
+        }
+        if mons.len() <= 1 {
+            let (mon_rect, slot_idx) = mons.into_iter().next()?;
+            return Some(
+                slot_placement(slot_idx, mon_rect)
+                    .map(PlacedSurface::Single)
+                    .unwrap_or(PlacedSurface::Solid(bg_bgr)),
+            );
+        }
+        let regions = mons
+            .into_iter()
+            .map(|(mon_rect, slot_idx)| (mon_rect, slot_placement(slot_idx, mon_rect)))
+            .collect();
+        Some(PlacedSurface::Multi {
+            window,
+            regions,
+            bg_bgr,
+        })
     }
     #[allow(clippy::too_many_arguments)]
     unsafe fn finish_liquid_glass(
@@ -1285,43 +1958,8 @@ impl Glass {
         amount: u8,
         frost_blend: Option<&crate::fusion::FrostBlend>,
     ) {
-        let (left_f, top_f, dw, dh, _) = self.wallpaper_placement(hwnd, window);
-        let sharp = self
-            .source
-            .as_ref()
-            .map(|s| s.sharp_bitmap())
-            .filter(|b| !b.is_null())
-            .and_then(|bmp| self.dib_slice(bmp))
-            .map(|(buf, w, h, stride)| SharpPlacement {
-                buf,
-                w,
-                h,
-                stride,
-                left_f,
-                top_f,
-                dw,
-                dh,
-                tile: self.tile,
-                style: self.style,
-            });
-        let blur = self
-            .bitmap
-            .as_ref()
-            .map(|b| b.0)
-            .filter(|b| !b.is_null())
-            .and_then(|bmp| self.dib_slice(bmp))
-            .map(|(buf, w, h, stride)| SharpPlacement {
-                buf,
-                w,
-                h,
-                stride,
-                left_f,
-                top_f,
-                dw,
-                dh,
-                tile: self.tile,
-                style: self.style,
-            });
+        let sharp = self.build_placed_surface(hwnd, window, true);
+        let blur = self.build_placed_surface(hwnd, window, false);
         let sharp_input = match sharp {
             Some(ref placed) => SharpInput::Placed(placed),
             None => SharpInput::None,
@@ -1337,6 +1975,7 @@ impl Glass {
             frost_blend,
         );
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn apply_bridge_refraction(
         &self,
@@ -1368,12 +2007,7 @@ impl Glass {
             return;
         }
         let dpi = dpi.max(1.0);
-        let blur = self
-            .bitmap
-            .as_ref()
-            .map(|b| b.0)
-            .and_then(|bmp| self.dib_slice(bmp));
-        let Some((blur_buf, blur_w, blur_h, blur_stride)) = blur else {
+        let Some(blur_placed) = self.build_placed_surface(hwnd, window, false) else {
             for &(x, y, _d, _nx, _ny, a, edge, spec) in samples {
                 let i = ((y * w + x) * 4) as usize;
                 for c in 0..3 {
@@ -1384,36 +2018,7 @@ impl Glass {
             }
             return;
         };
-        let (left_f, top_f, dw, dh, _) = self.wallpaper_placement(hwnd, window);
-        let blur_placed = SharpPlacement {
-            buf: blur_buf,
-            w: blur_w,
-            h: blur_h,
-            stride: blur_stride,
-            left_f,
-            top_f,
-            dw,
-            dh,
-            tile: self.tile,
-            style: self.style,
-        };
-        let sharp_placed = self
-            .source
-            .as_ref()
-            .map(|s| s.sharp_bitmap())
-            .and_then(|bmp| self.dib_slice(bmp))
-            .map(|(buf, sw, sh, stride)| SharpPlacement {
-                buf,
-                w: sw,
-                h: sh,
-                stride,
-                left_f,
-                top_f,
-                dw,
-                dh,
-                tile: self.tile,
-                style: self.style,
-            });
+        let sharp_placed = self.build_placed_surface(hwnd, window, true);
         let rim = (40.0 * dpi).clamp(12.0, (w.min(h) as f32) * 0.40);
         let bend = 12.5 * dpi;
         let ca_strength = 4.5 * dpi;
@@ -1426,16 +2031,16 @@ impl Glass {
             let fx = x as f32 + 0.5;
             let fy = y as f32 + 0.5;
 
-            let fb = sample_placed_disp_2d(&blur_placed, fx, fy, nx, ny, disp, ca, dpi, 0);
-            let fg = sample_placed_disp_2d(&blur_placed, fx, fy, nx, ny, disp, 0.0, dpi, 1);
-            let fr = sample_placed_disp_2d(&blur_placed, fx, fy, nx, ny, disp, -ca, dpi, 2);
+            let fb = blur_placed.sample_disp_2d(fx, fy, nx, ny, disp, ca, dpi, 0);
+            let fg = blur_placed.sample_disp_2d(fx, fy, nx, ny, disp, 0.0, dpi, 1);
+            let fr = blur_placed.sample_disp_2d(fx, fy, nx, ny, disp, -ca, dpi, 2);
 
             let local_frost = frost_at(x, y).clamp(0.0, 1.0);
             let (fb, fg, fr) = if local_frost < 0.999 {
                 if let Some(ref sp) = sharp_placed {
-                    let sb0 = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, ca, dpi, 0);
-                    let sg0 = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, 0.0, dpi, 1);
-                    let sr0 = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, -ca, dpi, 2);
+                    let sb0 = sp.sample_disp_2d(fx, fy, nx, ny, disp, ca, dpi, 0);
+                    let sg0 = sp.sample_disp_2d(fx, fy, nx, ny, disp, 0.0, dpi, 1);
+                    let sr0 = sp.sample_disp_2d(fx, fy, nx, ny, disp, -ca, dpi, 2);
                     (
                         sb0 + (fb - sb0) * local_frost,
                         sg0 + (fg - sg0) * local_frost,
@@ -1451,9 +2056,9 @@ impl Glass {
             let (b, g, r) = if let Some(ref sp) = sharp_placed {
                 if clarity > 0.001 {
                     let ca_s = ca * 0.45;
-                    let sb = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, ca_s, dpi, 0);
-                    let sg = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, 0.0, dpi, 1);
-                    let sr = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, -ca_s, dpi, 2);
+                    let sb = sp.sample_disp_2d(fx, fy, nx, ny, disp, ca_s, dpi, 0);
+                    let sg = sp.sample_disp_2d(fx, fy, nx, ny, disp, 0.0, dpi, 1);
+                    let sr = sp.sample_disp_2d(fx, fy, nx, ny, disp, -ca_s, dpi, 2);
                     (
                         fb + (sb - fb) * clarity,
                         fg + (sg - fg) * clarity,
@@ -1488,7 +2093,7 @@ impl Glass {
         &self,
         dc: HDC,
         sharp_input: SharpInput<'_>,
-        blur_placed: Option<&SharpPlacement<'_>>,
+        blur_placed: Option<&PlacedSurface<'_>>,
         amount: u8,
         width: i32,
         height: i32,
@@ -1520,51 +2125,55 @@ impl Glass {
         let h = height as usize;
         let stride = ds.dsBm.bmWidthBytes.max(width * 4) as usize;
         let bits = ds.dsBm.bmBits as *mut u8;
-        let mut src_guard = self.liquid_src.borrow_mut();
-        let needed = w * h * 4;
-        if src_guard.len() < needed {
-            src_guard.resize(needed, 0);
-        }
-        let src = &mut src_guard[..needed];
-        if stride == w * 4 {
-            src.copy_from_slice(std::slice::from_raw_parts(bits, needed));
-        } else {
-            for y in 0..h {
-                std::ptr::copy_nonoverlapping(
-                    bits.add(y * stride),
-                    src.as_mut_ptr().add(y * w * 4),
-                    w * 4,
-                );
+        let moving = fusion_owner
+            .is_some_and(|(hwnd, _)| crate::fusion::is_moving(hwnd) || is_resizing(hwnd));
+        LIQUID_SRC.with(|src_cell| {
+            let mut src_guard = src_cell.borrow_mut();
+            let needed = w * h * 4;
+            if src_guard.len() < needed {
+                src_guard.resize(needed, 0);
             }
-        }
-        let dst_buf = std::slice::from_raw_parts_mut(bits, h * stride);
-        let (fusion, pane_radius) = match fusion_owner {
-            Some((hwnd, window)) => (
-                crate::fusion::group(hwnd)
-                    .filter(|panes| panes.len() > 1)
-                    .map(|panes| (panes, [window.left as f32, window.top as f32])),
-                crate::fusion::pane_radius(hwnd),
-            ),
-            None => (None, None),
-        };
-        apply_liquid_glass_pixels(
-            dst_buf,
-            stride,
-            w,
-            h,
-            src,
-            sharp_input,
-            blur_placed,
-            amount,
-            self.dpi,
-            true,
-            pane_radius,
-            fusion,
-            frost_blend,
-        );
-        if crate::motion::low_power() {
-            *src_guard = Vec::new();
-        }
+            let src = &mut src_guard[..needed];
+            if stride == w * 4 {
+                src.copy_from_slice(std::slice::from_raw_parts(bits, needed));
+            } else {
+                for y in 0..h {
+                    std::ptr::copy_nonoverlapping(
+                        bits.add(y * stride),
+                        src.as_mut_ptr().add(y * w * 4),
+                        w * 4,
+                    );
+                }
+            }
+            let dst_buf = std::slice::from_raw_parts_mut(bits, h * stride);
+            let (fusion, pane_radius) = match fusion_owner {
+                Some((hwnd, window)) => (
+                    crate::fusion::group(hwnd)
+                        .filter(|panes| panes.len() > 1)
+                        .map(|panes| (panes, [window.left as f32, window.top as f32])),
+                    crate::fusion::pane_radius(hwnd),
+                ),
+                None => (None, None),
+            };
+            apply_liquid_glass_pixels(
+                dst_buf,
+                stride,
+                w,
+                h,
+                src,
+                sharp_input,
+                blur_placed,
+                amount,
+                self.dpi,
+                true,
+                pane_radius,
+                fusion,
+                frost_blend,
+            );
+            if !moving {
+                *src_guard = Vec::new();
+            }
+        });
     }
 }
 
@@ -1580,9 +2189,99 @@ struct SharpPlacement<'a> {
     dh: f32,
     tile: bool,
     style: u32,
+    bg_bgr: [f32; 3],
 }
 
-#[derive(Clone, Copy)]
+enum PlacedSurface<'a> {
+    Single(SharpPlacement<'a>),
+    Solid([f32; 3]),
+    Multi {
+        window: RECT,
+        regions: Vec<(RECT, Option<SharpPlacement<'a>>)>,
+        bg_bgr: [f32; 3],
+    },
+}
+
+#[inline]
+fn find_region<'a, 'b>(
+    regions: &'b [(RECT, Option<SharpPlacement<'a>>)],
+    gx: f32,
+    gy: f32,
+) -> Option<&'b (RECT, Option<SharpPlacement<'a>>)> {
+    if let Some(exact) = regions.iter().find(|(r, _)| {
+        gx >= r.left as f32 && gx < r.right as f32 && gy >= r.top as f32 && gy < r.bottom as f32
+    }) {
+        return Some(exact);
+    }
+    regions.iter().min_by(|(a, _), (b, _)| {
+        let dist = |r: &RECT| {
+            let dx = if gx < r.left as f32 {
+                r.left as f32 - gx
+            } else if gx >= r.right as f32 {
+                gx - (r.right as f32 - 1.0)
+            } else {
+                0.0
+            };
+            let dy = if gy < r.top as f32 {
+                r.top as f32 - gy
+            } else if gy >= r.bottom as f32 {
+                gy - (r.bottom as f32 - 1.0)
+            } else {
+                0.0
+            };
+            dx * dx + dy * dy
+        };
+        dist(a).total_cmp(&dist(b))
+    })
+}
+
+impl<'a> PlacedSurface<'a> {
+    #[inline]
+    fn sample_channel(&self, lx: f32, ly: f32, ch: usize) -> f32 {
+        match self {
+            Self::Single(p) => sample_placed_channel(p, lx, ly, ch),
+            Self::Solid(bgr) => bgr[ch],
+            Self::Multi {
+                window,
+                regions,
+                bg_bgr,
+            } => {
+                let gx = window.left as f32 + lx;
+                let gy = window.top as f32 + ly;
+                match find_region(regions, gx, gy) {
+                    Some((_, Some(p))) => sample_placed_channel(p, lx, ly, ch),
+                    _ => bg_bgr[ch],
+                }
+            }
+        }
+    }
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn sample_disp_2d(
+        &self,
+        bx: f32,
+        by: f32,
+        nx: f32,
+        ny: f32,
+        disp: f32,
+        signed_ca: f32,
+        dpi: f32,
+        ch: usize,
+    ) -> f32 {
+        match self {
+            Self::Single(p) => {
+                sample_placed_disp_2d(p, bx, by, nx, ny, disp, signed_ca, dpi, ch)
+            }
+            Self::Solid(bgr) => bgr[ch],
+            Self::Multi { .. } => {
+                sample_refracted_channel(bx, by, nx, ny, disp, signed_ca, dpi, [1., 1.], |x, y| {
+                    self.sample_channel(x, y, ch)
+                })
+            }
+        }
+    }
+}
+
 enum SharpInput<'a> {
     None,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1592,7 +2291,7 @@ enum SharpInput<'a> {
         h: usize,
         pad_f: f32,
     },
-    Placed(&'a SharpPlacement<'a>),
+    Placed(&'a PlacedSurface<'a>),
 }
 
 /// Applies static Liquid Glass edge refraction, chromatic aberration, and a
@@ -1856,7 +2555,7 @@ fn sample_placed_channel(p: &SharpPlacement<'_>, lx: f32, ly: f32, ch: usize) ->
     let (nu, nv) = if p.tile {
         (u.rem_euclid(1.0), v.rem_euclid(1.0))
     } else if (p.style == 0 || p.style == 6) && (u < 0.0 || u >= 1.0 || v < 0.0 || v >= 1.0) {
-        return 0.0;
+        return p.bg_bgr[ch];
     } else {
         (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0))
     };
@@ -2105,7 +2804,7 @@ fn apply_liquid_glass_pixels(
     h: usize,
     frosted: &[u8],
     sharp_input: SharpInput<'_>,
-    blur_placed: Option<&SharpPlacement<'_>>,
+    blur_placed: Option<&PlacedSurface<'_>>,
     amount: u8,
     dpi: f32,
     bgra: bool,
@@ -2155,14 +2854,14 @@ fn apply_liquid_glass_pixels(
             {
                 let fx = x as f32 + 0.5;
                 let fy = y as f32 + 0.5;
-                let bb = sample_placed_disp_2d(bp, fx, fy, nx, ny, disp, ca, dpi, ch_b);
-                let bg = sample_placed_disp_2d(bp, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
-                let br = sample_placed_disp_2d(bp, fx, fy, nx, ny, disp, -ca, dpi, ch_r);
+                let bb = bp.sample_disp_2d(fx, fy, nx, ny, disp, ca, dpi, ch_b);
+                let bg = bp.sample_disp_2d(fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
+                let br = bp.sample_disp_2d(fx, fy, nx, ny, disp, -ca, dpi, ch_r);
                 if local_blur < 0.999 {
                     if let Some(sp) = sharp_placed {
-                        let sb = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, ca, dpi, ch_b);
-                        let sg = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
-                        let sr = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, -ca, dpi, ch_r);
+                        let sb = sp.sample_disp_2d(fx, fy, nx, ny, disp, ca, dpi, ch_b);
+                        let sg = sp.sample_disp_2d(fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
+                        let sr = sp.sample_disp_2d(fx, fy, nx, ny, disp, -ca, dpi, ch_r);
                         (
                             sb + (bb - sb) * local_blur,
                             sg + (bg - sg) * local_blur,
@@ -2201,9 +2900,9 @@ fn apply_liquid_glass_pixels(
                     SharpInput::Placed(p) => {
                         let fx = x as f32 + 0.5;
                         let fy = y as f32 + 0.5;
-                        let sb = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, ca_s, dpi, ch_b);
-                        let sg = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
-                        let sr = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, -ca_s, dpi, ch_r);
+                        let sb = p.sample_disp_2d(fx, fy, nx, ny, disp, ca_s, dpi, ch_b);
+                        let sg = p.sample_disp_2d(fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
+                        let sr = p.sample_disp_2d(fx, fy, nx, ny, disp, -ca_s, dpi, ch_r);
                         (
                             fb + (sb - fb) * clarity,
                             fg + (sg - fg) * clarity,
@@ -2485,108 +3184,237 @@ pub(crate) fn with_pixel_rows_parallel<F>(
     let _wait = WaitGuard { inner: &pool.inner };
     render_rows(ui_rows);
 }
+struct Placement {
+    left_f: f32,
+    top_f: f32,
+    dw: f32,
+    dh: f32,
+    shift: f32,
+}
+
+fn compute_placement(
+    canvas: RECT,
+    natural: [f32; 2],
+    window: RECT,
+    style: u32,
+    tile: bool,
+    shift: f32,
+) -> Placement {
+    let aw = (canvas.right - canvas.left).max(1) as f32;
+    let ah = (canvas.bottom - canvas.top).max(1) as f32;
+    let nw = natural[0].max(1.0);
+    let nh = natural[1].max(1.0);
+    let (dw, dh) = if style == 2 {
+        (aw, ah)
+    } else if style == 0 || tile {
+        (nw, nh)
+    } else {
+        let ratio = if style == 6 {
+            (aw / nw).min(ah / nh)
+        } else {
+            (aw / nw).max(ah / nh)
+        };
+        (nw * ratio, nh * ratio)
+    };
+    let left_f = canvas.left as f32
+        + if tile { 0.0 } else { (aw - dw) / 2.0 }
+        - window.left as f32
+        + shift;
+    let top_f = canvas.top as f32
+        + vertical_offset(ah, dh, style, tile)
+        - window.top as f32
+        + shift;
+    Placement {
+        left_f,
+        top_f,
+        dw,
+        dh,
+        shift,
+    }
+}
+
 impl Glass {
-    unsafe fn wallpaper_placement(&self, hwnd: HWND, window: RECT) -> (f32, f32, f32, f32, f32) {
+    unsafe fn active_monitors_for_rect(&self, hwnd: HWND, window: RECT) -> Vec<(RECT, Option<usize>)> {
+        if !self.monitors.is_empty() {
+            let mut hits: Vec<(RECT, Option<usize>)> = self
+                .monitors
+                .iter()
+                .filter_map(|m| {
+                    let mr = RECT {
+                        left: m.rect[0],
+                        top: m.rect[1],
+                        right: m.rect[2],
+                        bottom: m.rect[3],
+                    };
+                    rect_intersect(mr, window).map(|_| (mr, m.slot))
+                })
+                .collect();
+            if hits.is_empty() {
+                if let Some(idx) = pick_best_monitor_index(&self.monitors, window) {
+                    let m = &self.monitors[idx];
+                    hits.push((
+                        RECT {
+                            left: m.rect[0],
+                            top: m.rect[1],
+                            right: m.rect[2],
+                            bottom: m.rect[3],
+                        },
+                        m.slot,
+                    ));
+                }
+            }
+            return hits;
+        }
         let mut monitor: MONITORINFO = zeroed();
         monitor.cbSize = size_of::<MONITORINFO>() as u32;
-        GetMonitorInfoW(
-            MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-            &mut monitor,
-        );
-        let area = if self.style == 22 {
-            RECT {
-                left: GetSystemMetrics(SM_XVIRTUALSCREEN),
-                top: GetSystemMetrics(SM_YVIRTUALSCREEN),
-                right: GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                bottom: GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            }
+        let hmon = if window.right > window.left && window.bottom > window.top {
+            MonitorFromRect(&window, MONITOR_DEFAULTTONEAREST)
         } else {
+            MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        };
+        let rect = if GetMonitorInfoW(hmon, &mut monitor) != 0 {
             monitor.rcMonitor
-        };
-        let aw = (area.right - area.left) as f32;
-        let ah = (area.bottom - area.top) as f32;
-        let (dw, dh) = if self.style == 2 {
-            (aw, ah)
-        } else if self.style == 0 || self.tile {
-            (self.natural[0], self.natural[1])
         } else {
-            let ratio = if self.style == 6 {
-                (aw / self.natural[0]).min(ah / self.natural[1])
-            } else {
-                (aw / self.natural[0]).max(ah / self.natural[1])
-            };
-            (self.natural[0] * ratio, self.natural[1] * ratio)
+            self.virtual_bounds_rect()
         };
-        let shift = if liquid_glass() { 6.0 * self.dpi.max(1.0) } else { 0.0 };
-        let left_f = area.left as f32
-            + if self.tile { 0.0 } else { (aw - dw) / 2.0 }
-            - window.left as f32
-            + shift;
-        let top_f = area.top as f32
-            + vertical_offset(ah, dh, self.style, self.tile)
-            - window.top as f32
-            + shift;
-        (left_f, top_f, dw, dh, shift)
+        let slot = (!self.slots.is_empty() || self.bitmap.is_some()).then_some(0);
+        vec![(rect, slot)]
     }
-    unsafe fn draw_layer(
+    fn shared_tile_canvas(&self, mons: &[(RECT, Option<usize>)]) -> RECT {
+        let base = mons.first().map(|(r, _)| *r).unwrap_or(RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        });
+        RECT {
+            left: 0,
+            top: 0,
+            right: (base.right - base.left).max(1),
+            bottom: (base.bottom - base.top).max(1),
+        }
+    }
+    unsafe fn slot_resources(
+        &self,
+        slot_idx: Option<usize>,
+        want_sharp: bool,
+    ) -> Option<(HBITMAP, (i32, i32), [f32; 2])> {
+        let idx = slot_idx?;
+        if !self.slots.is_empty() {
+            let slot = self.slots.get(idx)?;
+            let (bmp, size) = if want_sharp {
+                let sharp = slot.source.sharp_bitmap();
+                if !sharp.is_null() {
+                    (sharp, slot.source.sharp_dimensions())
+                } else {
+                    (
+                        slot.bitmap.0,
+                        (slot.blur_width.max(1), slot.blur_height.max(1)),
+                    )
+                }
+            } else {
+                (
+                    slot.bitmap.0,
+                    (slot.blur_width.max(1), slot.blur_height.max(1)),
+                )
+            };
+            Some((bmp, size, slot.source.natural))
+        } else if want_sharp {
+            let src = self.source.as_ref()?;
+            let sharp = src.sharp_bitmap();
+            if sharp.is_null() {
+                return None;
+            }
+            Some((sharp, src.sharp_dimensions(), self.natural))
+        } else {
+            let bmp = self.bitmap.as_ref()?.0;
+            Some((bmp, self.blur_size(), self.natural))
+        }
+    }
+    unsafe fn has_any_sharp_for_rect(&self, hwnd: HWND, window: RECT) -> bool {
+        if !self.slots.is_empty() {
+            let mons = self.active_monitors_for_rect(hwnd, window);
+            mons.iter().any(|(_, slot_idx)| {
+                slot_idx
+                    .and_then(|idx| self.slots.get(idx))
+                    .is_some_and(|slot| !slot.source.sharp_bitmap().is_null())
+            })
+        } else {
+            self.source
+                .as_ref()
+                .is_some_and(|s| !s.sharp_bitmap().is_null())
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_rect_layer(
         &self,
         dc: HDC,
         hwnd: HWND,
         width: i32,
         height: i32,
-        bitmap: HBITMAP,
-        src_size: (i32, i32),
         window: RECT,
+        want_sharp: bool,
         fast: bool,
     ) {
-        let area = self.monitor_origin_size(hwnd);
-        let [ax, ay, aw, ah] = area;
-        let bytes = aw.max(0) as usize * ah.max(0) as usize * 4;
-        // Cache the shared wallpaper at monitor resolution, not a frozen
-        // widget frame. Every paint crops the CURRENT desktop coordinates and
-        // applies the current lens afterwards. Straddling/off-screen windows
-        // retain the original placement path.
-        if bitmap.is_null() || aw <= 0 || ah <= 0 || bytes > 32 * 1024 * 1024
-            || window.left < ax || window.top < ay
-            || window.left as i64 + width as i64 > ax as i64 + aw as i64
-            || window.top as i64 + height as i64 > ay as i64 + ah as i64
-        {
-            self.draw_layer_uncached(dc, hwnd, width, height, bitmap, src_size, window, fast);
+        let shift = if liquid_glass() {
+            6.0 * self.dpi.max(1.0)
+        } else {
+            0.0
+        };
+        let mons = self.active_monitors_for_rect(hwnd, window);
+        if self.style == 22 || (self.tile && self.shared && !self.monitors.is_empty()) {
+            let canvas = if self.style == 22 {
+                self.virtual_bounds_rect()
+            } else {
+                self.shared_tile_canvas(&mons)
+            };
+            let slot_idx = mons
+                .iter()
+                .find_map(|(_, s)| *s)
+                .or_else(|| (!self.slots.is_empty() || self.bitmap.is_some()).then_some(0));
+            let Some((bmp, src_size, natural)) = self.slot_resources(slot_idx, want_sharp) else {
+                fill_solid_bg(dc, width, height, self.bg_color);
+                return;
+            };
+            self.draw_layer_uncached_at(
+                dc, width, height, window, canvas, natural, bmp, src_size, shift, fast,
+            );
             return;
         }
-        let key = (
-            self.path.clone(), self.revision(), bitmap as usize, area, self.style,
-            self.tile, self.dpi.to_bits(), src_size, self.natural.map(f32::to_bits),
-        );
-        NATIVE_LAYERS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let index = if let Some(index) = cache.iter().position(|(k, _)| *k == key) {
-                index
-            } else {
-                let Some(layer) = crate::compositor::Buffer::plain(aw, ah, 1.) else {
-                    self.draw_layer_uncached(dc, hwnd, width, height, bitmap, src_size, window, fast);
-                    return;
-                };
-                PatBlt(layer.dc, 0, 0, aw, ah, BLACKNESS);
-                self.draw_layer_uncached(
-                    layer.dc, hwnd, aw, ah, bitmap, src_size,
-                    RECT { left: ax, top: ay, right: ax + aw, bottom: ay + ah }, false,
-                );
-                GdiFlush();
-                while !cache.is_empty() && (cache.len() >= 6
-                    || cache.iter().map(|(_, b)| b.width as usize * b.height as usize * 4).sum::<usize>() + bytes > 64 * 1024 * 1024)
-                {
-                    cache.remove(0);
-                }
-                cache.push((key, layer));
-                cache.len() - 1
+        if mons.len() <= 1 {
+            let Some((m, slot_idx)) = mons.into_iter().next() else {
+                return;
             };
-            let layer = cache.remove(index);
-            BitBlt(dc, 0, 0, width, height, layer.1.dc, window.left - ax, window.top - ay, SRCCOPY);
-            cache.push(layer);
-        });
+            let Some((bmp, src_size, natural)) = self.slot_resources(slot_idx, want_sharp) else {
+                fill_solid_bg(dc, width, height, self.bg_color);
+                return;
+            };
+            self.draw_layer_uncached_at(
+                dc, width, height, window, m, natural, bmp, src_size, shift, fast,
+            );
+            return;
+        }
+        fill_solid_bg(dc, width, height, self.bg_color);
+        for (m, slot_idx) in mons {
+            let Some(inter) = rect_intersect(m, window) else {
+                continue;
+            };
+            let dx = inter.left - window.left;
+            let dy = inter.top - window.top;
+            let iw = inter.right - inter.left;
+            let ih = inter.bottom - inter.top;
+            if let Some((bmp, src_size, natural)) = self.slot_resources(slot_idx, want_sharp) {
+                let saved = SaveDC(dc);
+                IntersectClipRect(dc, dx, dy, dx + iw, dy + ih);
+                self.draw_layer_uncached_at(
+                    dc, width, height, window, m, natural, bmp, src_size, shift, fast,
+                );
+                RestoreDC(dc, saved);
+            }
+        }
     }
-
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_layer_uncached(
         &self,
         dc: HDC,
@@ -2598,12 +3426,197 @@ impl Glass {
         window: RECT,
         fast: bool,
     ) {
-        if bitmap.is_null() {
+        let shift = if liquid_glass() {
+            6.0 * self.dpi.max(1.0)
+        } else {
+            0.0
+        };
+        let canvas = if self.style == 22 {
+            self.virtual_bounds_rect()
+        } else {
+            let mut monitor: MONITORINFO = zeroed();
+            monitor.cbSize = size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            );
+            monitor.rcMonitor
+        };
+        self.draw_layer_uncached_at(
+            dc,
+            width,
+            height,
+            window,
+            canvas,
+            self.natural,
+            bitmap,
+            src_size,
+            shift,
+            fast,
+        );
+    }
+
+    unsafe fn blit_placed_bilinear(
+        &self,
+        dc: HDC,
+        width: i32,
+        height: i32,
+        bitmap: HBITMAP,
+        pl: &Placement,
+    ) -> bool {
+        let hbmp = GetCurrentObject(dc, OBJ_BITMAP as u32);
+        if hbmp.is_null() {
+            return false;
+        }
+        let mut ds: DIBSECTION = zeroed();
+        if GetObjectW(hbmp, size_of::<DIBSECTION>() as i32, &mut ds as *mut _ as _)
+            < size_of::<BITMAP>() as i32
+        {
+            return false;
+        }
+        if ds.dsBm.bmBits.is_null()
+            || ds.dsBm.bmBitsPixel != 32
+            || ds.dsBmih.biHeight >= 0
+            || ds.dsBm.bmWidth < width
+            || ds.dsBm.bmHeight < height
+        {
+            return false;
+        }
+        let mut clip: RECT = zeroed();
+        match GetClipBox(dc, &mut clip) {
+            1 => return true,  // NULLREGION
+            2 => {}            // SIMPLEREGION
+            _ => return false, // COMPLEXREGION or ERROR
+        }
+        let Some((src, sw, sh, src_stride)) = self.dib_slice(bitmap) else {
+            return false;
+        };
+        if sw == 0 || sh == 0 {
+            return false;
+        }
+        let mut x0 = clip.left.max(0);
+        let mut y0 = clip.top.max(0);
+        let mut x1 = clip.right.min(width);
+        let mut y1 = clip.bottom.min(height);
+        if !self.tile && (self.style == 0 || self.style == 6) {
+            x0 = x0.max(pl.left_f.round() as i32);
+            y0 = y0.max(pl.top_f.round() as i32);
+            x1 = x1.min((pl.left_f + pl.dw).round() as i32);
+            y1 = y1.min((pl.top_f + pl.dh).round() as i32);
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return true;
+        }
+        GdiFlush();
+        let dst_stride = ds.dsBm.bmWidthBytes.max(width * 4) as usize;
+        let dst = std::slice::from_raw_parts_mut(
+            ds.dsBm.bmBits as *mut u8,
+            height as usize * dst_stride,
+        );
+        let dw = pl.dw.max(1.0);
+        let dh = pl.dh.max(1.0);
+        let tile = self.tile;
+        let build_axis = |start: i32,
+                          end: i32,
+                          origin: f32,
+                          span: f32,
+                          src_dim: usize,
+                          out: &mut Vec<(usize, usize, u32)>| {
+            out.clear();
+            let max_s = (src_dim - 1) as f32;
+            let inv_span = 1.0 / span;
+            let dim_f = src_dim as f32;
+            let dim_i = src_dim as i32;
+            for p in start..end {
+                let u = ((p as f32 + 0.5) - origin) * inv_span;
+                if tile {
+                    let s = u.rem_euclid(1.0) * dim_f - 0.5;
+                    let f = s.floor();
+                    let i0 = (f as i32).rem_euclid(dim_i) as usize;
+                    let i1 = (i0 + 1) % src_dim;
+                    let frac = ((s - f) * 256.0).round() as u32;
+                    out.push((i0, i1, frac.min(256)));
+                } else {
+                    let s = (u * dim_f - 0.5).clamp(0.0, max_s);
+                    let i0 = s as usize;
+                    let i1 = (i0 + 1).min(src_dim - 1);
+                    let frac = ((s - i0 as f32) * 256.0).round() as u32;
+                    out.push((i0, i1, frac.min(256)));
+                }
+            }
+        };
+        BLIT_XS.with(|xs_cell| {
+            BLIT_YS.with(|ys_cell| {
+                let mut xs = xs_cell.borrow_mut();
+                let mut ys = ys_cell.borrow_mut();
+                build_axis(x0, x1, pl.left_f, dw, sw, &mut xs);
+                build_axis(y0, y1, pl.top_f, dh, sh, &mut ys);
+                let x_byte_off = x0 as usize * 4;
+                let row_bytes = (x1 - x0) as usize * 4;
+                for (yy, &(sy0, sy1, fy)) in ys.iter().enumerate() {
+                    let wy0 = 256 - fy;
+                    let wy1 = fy;
+                    let srow0 = &src[sy0 * src_stride..sy0 * src_stride + sw * 4];
+                    let srow1 = &src[sy1 * src_stride..sy1 * src_stride + sw * 4];
+                    let d_off = (y0 as usize + yy) * dst_stride + x_byte_off;
+                    let drow = &mut dst[d_off..d_off + row_bytes];
+                    for (dpx, &(sx0, sx1, fx)) in drow.chunks_exact_mut(4).zip(xs.iter()) {
+                        let wx0 = 256 - fx;
+                        let w00 = wx0 * wy0;
+                        let w10 = fx * wy0;
+                        let w01 = wx0 * wy1;
+                        let w11 = fx * wy1;
+                        let i00 = sx0 * 4;
+                        let i10 = sx1 * 4;
+                        dpx[0] = ((srow0[i00] as u32 * w00
+                            + srow0[i10] as u32 * w10
+                            + srow1[i00] as u32 * w01
+                            + srow1[i10] as u32 * w11
+                            + 32768)
+                            >> 16) as u8;
+                        dpx[1] = ((srow0[i00 + 1] as u32 * w00
+                            + srow0[i10 + 1] as u32 * w10
+                            + srow1[i00 + 1] as u32 * w01
+                            + srow1[i10 + 1] as u32 * w11
+                            + 32768)
+                            >> 16) as u8;
+                        dpx[2] = ((srow0[i00 + 2] as u32 * w00
+                            + srow0[i10 + 2] as u32 * w10
+                            + srow1[i00 + 2] as u32 * w01
+                            + srow1[i10 + 2] as u32 * w11
+                            + 32768)
+                            >> 16) as u8;
+                        dpx[3] = 255;
+                    }
+                }
+            });
+        });
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_layer_uncached_at(
+        &self,
+        dc: HDC,
+        width: i32,
+        height: i32,
+        window: RECT,
+        canvas: RECT,
+        natural: [f32; 2],
+        bitmap: HBITMAP,
+        src_size: (i32, i32),
+        shift: f32,
+        fast: bool,
+    ) {
+        if bitmap.is_null() || width <= 0 || height <= 0 {
             return;
         }
-        let (left_f, top_f, dw, dh, shift) = self.wallpaper_placement(hwnd, window);
-        let left = left_f.round() as i32;
-        let top = top_f.round() as i32;
+        let pl = compute_placement(canvas, natural, window, self.style, self.tile, shift);
+        if self.blit_placed_bilinear(dc, width, height, bitmap, &pl) {
+            return;
+        }
+        let left = pl.left_f.round() as i32;
+        let top = pl.top_f.round() as i32;
         let source = CreateCompatibleDC(dc);
         let previous = SelectObject(source, bitmap);
         SetStretchBltMode(dc, if fast { COLORONCOLOR } else { HALFTONE });
@@ -2611,8 +3624,8 @@ impl Glass {
             SetBrushOrgEx(dc, 0, 0, null_mut());
         }
         if self.tile {
-            let step_x = (dw.round() as i32).max(1);
-            let step_y = (dh.round() as i32).max(1);
+            let step_x = (pl.dw.round() as i32).max(1);
+            let step_y = (pl.dh.round() as i32).max(1);
             for y in ((top.rem_euclid(step_y) - step_y)..height).step_by(step_y as usize) {
                 for x in ((left.rem_euclid(step_x) - step_x)..width).step_by(step_x as usize) {
                     StretchBlt(
@@ -2631,9 +3644,9 @@ impl Glass {
                 }
             }
         } else {
-            let right = (left_f + dw).round() as i32;
-            let bottom = (top_f + dh).round() as i32;
-            if shift > 0.0 && self.style != 6 && self.style != 0 {
+            let right = (pl.left_f + pl.dw).round() as i32;
+            let bottom = (pl.top_f + pl.dh).round() as i32;
+            if pl.shift > 0.0 && self.style != 6 && self.style != 0 {
                 if left > 0 {
                     StretchBlt(
                         dc,
@@ -2683,6 +3696,50 @@ impl Glass {
         DeleteDC(source);
     }
 }
+fn file_spec(path: PathBuf) -> WallpaperSpec {
+    let meta = std::fs::metadata(&path).ok();
+    let modified = meta.as_ref().and_then(|m| m.modified().ok());
+    let size = meta.as_ref().map_or(0, |m| m.len());
+    let key = (normalize_path_key(&path), modified, size);
+    WallpaperSpec { path, key }
+}
+
+fn dedup_monitors(
+    mut entries: Vec<([i32; 4], Option<PathBuf>)>,
+    style: u32,
+    tile: bool,
+    bg_color: u32,
+) -> DesktopWallpaperSpec {
+    entries.sort_by_key(|(rect, _)| *rect);
+    let mut unique_sources: Vec<WallpaperSpec> = Vec::new();
+    let mut monitors = Vec::with_capacity(entries.len());
+    for (rect, path_opt) in entries {
+        let slot = path_opt.map(|path| {
+            let spec = file_spec(path);
+            if let Some(existing) = unique_sources.iter().position(|u| u.key == spec.key) {
+                existing
+            } else {
+                unique_sources.push(spec);
+                unique_sources.len() - 1
+            }
+        });
+        monitors.push(MonitorWallpaperSpec { rect, slot });
+    }
+    let shared = if let Some(first) = monitors.first() {
+        unique_sources.len() <= 1 && monitors.iter().all(|m| m.slot == first.slot)
+    } else {
+        unique_sources.len() <= 1
+    };
+    DesktopWallpaperSpec {
+        unique_sources,
+        monitors,
+        shared,
+        style,
+        tile,
+        bg_color,
+    }
+}
+
 unsafe fn registry_number(name: &str, default: u32) -> u32 {
     let mut buffer = [0u16; 32];
     let mut bytes = 64;
@@ -2704,11 +3761,11 @@ unsafe fn registry_number(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn parse_transcoded_cache_path(raw: &[u8]) -> Option<PathBuf> {
-    if raw.len() < 26 {
+fn parse_utf16le_at(raw: &[u8], offset: usize) -> Option<PathBuf> {
+    if raw.len() < offset + 2 {
         return None;
     }
-    let words: Vec<u16> = raw[24..]
+    let words: Vec<u16> = raw[offset..]
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&w| w != 0)
@@ -2719,24 +3776,109 @@ fn parse_transcoded_cache_path(raw: &[u8]) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(&words)))
 }
 
-unsafe fn resolve_wallpaper_path(spi_path: PathBuf) -> PathBuf {
+fn parse_transcoded_cache_path(raw: &[u8]) -> Option<PathBuf> {
+    parse_utf16le_at(raw, 24)
+}
+
+fn parse_transcoded_meta_path(raw: &[u8]) -> Option<PathBuf> {
+    parse_utf16le_at(raw, 20)
+}
+
+fn is_decodable_image_file(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 12];
+    let Ok(n) = std::io::Read::read(&mut f, &mut hdr) else {
+        return false;
+    };
+    (n >= 3 && hdr[..3] == [0xFF, 0xD8, 0xFF])
+        || (n >= 8 && hdr[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        || (n >= 2 && hdr[..2] == [b'B', b'M'])
+}
+
+unsafe fn read_desktop_binary(name: &str) -> Option<Vec<u8>> {
     let mut buffer = vec![0u8; 2048];
     let mut bytes = buffer.len() as u32;
     if RegGetValueW(
         HKEY_CURRENT_USER,
         wide("Control Panel\\Desktop").as_ptr(),
-        wide("TranscodedImageCache").as_ptr(),
+        wide(name).as_ptr(),
         RRF_RT_REG_BINARY,
         null_mut(),
         buffer.as_mut_ptr() as _,
         &mut bytes,
     ) == 0
     {
-        if let Some(cached_source) = parse_transcoded_cache_path(&buffer[..bytes as usize]) {
-            if cached_source
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&spi_path.to_string_lossy())
+        buffer.truncate(bytes as usize);
+        Some(buffer)
+    } else {
+        None
+    }
+}
+
+unsafe fn resolve_per_monitor_path(raw: PathBuf) -> PathBuf {
+    if is_decodable_image_file(&raw) {
+        return raw;
+    }
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return raw;
+    };
+    let themes_dir = PathBuf::from(appdata).join("Microsoft\\Windows\\Themes");
+    let target_key = normalize_path_key(&raw);
+
+    for idx in 0..16 {
+        let reg_name = format!("TranscodedImageCache_{idx:03}");
+        if let Some(bytes) = read_desktop_binary(&reg_name) {
+            if let Some(cached_source) = parse_transcoded_cache_path(&bytes) {
+                if normalize_path_key(&cached_source) == target_key {
+                    let cand = themes_dir.join(format!("Transcoded_{idx:03}"));
+                    if is_decodable_image_file(&cand) {
+                        return cand;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(bytes) = read_desktop_binary("TranscodedImageCache") {
+        if let Some(cached_source) = parse_transcoded_cache_path(&bytes) {
+            if normalize_path_key(&cached_source) == target_key {
+                let cand = themes_dir.join("TranscodedWallpaper");
+                if is_decodable_image_file(&cand) {
+                    return cand;
+                }
+            }
+        }
+    }
+    let cache_dir = themes_dir.join("TranscodedWallpaperCache");
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path();
+            if meta_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("meta"))
             {
+                if let Ok(bytes) = std::fs::read(&meta_path) {
+                    if let Some(cached_source) = parse_transcoded_meta_path(&bytes) {
+                        if normalize_path_key(&cached_source) == target_key {
+                            let img_path = meta_path.with_extension("");
+                            if is_decodable_image_file(&img_path) {
+                                return img_path;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    raw
+}
+
+unsafe fn resolve_wallpaper_path(spi_path: PathBuf) -> PathBuf {
+    if let Some(bytes) = read_desktop_binary("TranscodedImageCache") {
+        if let Some(cached_source) = parse_transcoded_cache_path(&bytes) {
+            if normalize_path_key(&cached_source) == normalize_path_key(&spi_path) {
                 if let Some(appdata) = std::env::var_os("APPDATA") {
                     let transcoded = PathBuf::from(appdata)
                         .join("Microsoft\\Windows\\Themes\\TranscodedWallpaper");
@@ -2748,6 +3890,322 @@ unsafe fn resolve_wallpaper_path(spi_path: PathBuf) -> PathBuf {
         }
     }
     spi_path
+}
+
+unsafe extern "system" fn collect_active_monitor(
+    hmon: HMONITOR,
+    _: HDC,
+    _: *mut RECT,
+    param: LPARAM,
+) -> BOOL {
+    let list = &mut *(param as *mut Vec<(String, [i32; 4])>);
+    let mut info: MONITORINFOEXW = zeroed();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    if GetMonitorInfoW(hmon, &mut info as *mut _ as _) != 0 {
+        let len = info
+            .szDevice
+            .iter()
+            .position(|v| *v == 0)
+            .unwrap_or(info.szDevice.len());
+        let name = String::from_utf16_lossy(&info.szDevice[..len]);
+        let r = info.monitorInfo.rcMonitor;
+        if r.right > r.left && r.bottom > r.top {
+            list.push((name, [r.left, r.top, r.right, r.bottom]));
+        }
+    }
+    1
+}
+
+unsafe fn enumerate_active_monitors() -> Vec<(String, [i32; 4])> {
+    let mut list: Vec<(String, [i32; 4])> = Vec::new();
+    EnumDisplayMonitors(
+        null_mut(),
+        null(),
+        Some(collect_active_monitor),
+        &mut list as *mut _ as isize,
+    );
+    list
+}
+
+const RPC_E_CHANGED_MODE_HR: i32 = 0x8001_0106u32 as i32;
+const CLSID_DESKTOP_WALLPAPER: GUID = GUID::from_u128(0xc2cf3110_460e_4fc1_b9d0_8a1c0c9cc4bd);
+const IID_IDESKTOP_WALLPAPER: GUID = GUID::from_u128(0xb92b56a9_8b55_4e14_9a89_0199bbb6f93b);
+
+struct ComInitGuard {
+    uninit: bool,
+}
+impl ComInitGuard {
+    unsafe fn enter_mta() -> Option<Self> {
+        let hr = CoInitializeEx(null(), COINIT_MULTITHREADED as u32);
+        if hr >= 0 {
+            Some(Self { uninit: true })
+        } else if hr == RPC_E_CHANGED_MODE_HR {
+            Some(Self { uninit: false })
+        } else {
+            None
+        }
+    }
+}
+impl Drop for ComInitGuard {
+    fn drop(&mut self) {
+        if self.uninit {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+struct DesktopWallpaperPtr(*mut c_void);
+impl DesktopWallpaperPtr {
+    #[inline]
+    unsafe fn vtable(&self) -> *const *const c_void {
+        *(self.0 as *const *const *const c_void)
+    }
+}
+impl Drop for DesktopWallpaperPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let release: extern "system" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*self.vtable().add(2));
+                release(self.0);
+            }
+        }
+    }
+}
+
+struct CoTaskWStr(*mut u16);
+impl CoTaskWStr {
+    unsafe fn to_string(&self) -> String {
+        if self.0.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        while *self.0.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(self.0, len))
+    }
+}
+impl Drop for CoTaskWStr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CoTaskMemFree(self.0 as _);
+            }
+        }
+    }
+}
+
+unsafe fn query_spi_wallpaper_path() -> Option<PathBuf> {
+    PATH_BUF.with(|buf| {
+        let mut name = buf.borrow_mut();
+        if SystemParametersInfoW(
+            SPI_GETDESKWALLPAPER,
+            name.len() as u32,
+            name.as_mut_ptr() as _,
+            0,
+        ) == 0
+        {
+            return None;
+        }
+        let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+        if len == 0 {
+            return None;
+        }
+        Some(PathBuf::from(String::from_utf16_lossy(&name[..len])))
+    })
+}
+
+unsafe fn query_desktop_wallpaper_com_inner() -> Option<DesktopWallpaperSpec> {
+    let mut raw_ptr = null_mut();
+    let hr = CoCreateInstance(
+        &CLSID_DESKTOP_WALLPAPER,
+        null_mut(),
+        CLSCTX_LOCAL_SERVER,
+        &IID_IDESKTOP_WALLPAPER,
+        &mut raw_ptr,
+    );
+    if hr < 0 || raw_ptr.is_null() {
+        return None;
+    }
+    let wp = DesktopWallpaperPtr(raw_ptr);
+    let vt = wp.vtable();
+
+    let get_wallpaper: extern "system" fn(*mut c_void, *const u16, *mut *mut u16) -> i32 =
+        std::mem::transmute(*vt.add(4));
+    let get_path_at: extern "system" fn(*mut c_void, u32, *mut *mut u16) -> i32 =
+        std::mem::transmute(*vt.add(5));
+    let get_count: extern "system" fn(*mut c_void, *mut u32) -> i32 =
+        std::mem::transmute(*vt.add(6));
+    let get_monitor_rect: extern "system" fn(*mut c_void, *const u16, *mut RECT) -> i32 =
+        std::mem::transmute(*vt.add(7));
+    let get_bg_color: extern "system" fn(*mut c_void, *mut u32) -> i32 =
+        std::mem::transmute(*vt.add(9));
+    let get_position: extern "system" fn(*mut c_void, *mut i32) -> i32 =
+        std::mem::transmute(*vt.add(11));
+
+    let mut pos = -1i32;
+    let (style, tile) = if get_position(wp.0, &mut pos) >= 0 {
+        match pos {
+            0 => (0, false),
+            1 => (0, true),
+            2 => (2, false),
+            3 => (6, false),
+            4 => (10, false),
+            5 => (22, false),
+            _ => (
+                registry_number("WallpaperStyle", 10),
+                registry_number("TileWallpaper", 0) != 0,
+            ),
+        }
+    } else {
+        (
+            registry_number("WallpaperStyle", 10),
+            registry_number("TileWallpaper", 0) != 0,
+        )
+    };
+    let mut bg_color = 0u32;
+    if get_bg_color(wp.0, &mut bg_color) < 0 {
+        bg_color = 0;
+    }
+    let mut count = 0u32;
+    if get_count(wp.0, &mut count) < 0 || count == 0 {
+        return None;
+    }
+    let mut active_mons: Vec<(CoTaskWStr, [i32; 4])> = Vec::new();
+    for idx in 0..count.min(64) {
+        let mut mid_ptr = null_mut();
+        if get_path_at(wp.0, idx, &mut mid_ptr) < 0 || mid_ptr.is_null() {
+            continue;
+        }
+        let mid = CoTaskWStr(mid_ptr);
+        let mut r: RECT = zeroed();
+        if get_monitor_rect(wp.0, mid.0, &mut r) == 0 && r.right > r.left && r.bottom > r.top {
+            active_mons.push((mid, [r.left, r.top, r.right, r.bottom]));
+        }
+    }
+    if active_mons.is_empty() {
+        return None;
+    }
+
+    let mut global_ptr = null_mut();
+    let hr_global = get_wallpaper(wp.0, null(), &mut global_ptr);
+    let global_ws = CoTaskWStr(global_ptr);
+    let global_str = if hr_global == 0 {
+        global_ws.to_string()
+    } else {
+        String::new()
+    };
+
+    if !global_str.is_empty() && style != 22 {
+        let resolved = resolve_per_monitor_path(PathBuf::from(global_str));
+        let entries = active_mons
+            .into_iter()
+            .map(|(_, rect)| (rect, Some(resolved.clone())))
+            .collect();
+        return Some(dedup_monitors(entries, style, tile, bg_color));
+    }
+
+    if style == 22 {
+        let mut span_path = if !global_str.is_empty() {
+            Some(PathBuf::from(global_str))
+        } else {
+            None
+        };
+        if span_path.is_none() {
+            for (mid, _) in &active_mons {
+                let mut wp_ptr = null_mut();
+                if get_wallpaper(wp.0, mid.0, &mut wp_ptr) >= 0 && !wp_ptr.is_null() {
+                    let s = CoTaskWStr(wp_ptr).to_string();
+                    if !s.is_empty() {
+                        span_path = Some(PathBuf::from(s));
+                        break;
+                    }
+                }
+            }
+        }
+        if span_path.is_none() {
+            span_path = query_spi_wallpaper_path();
+        }
+        let resolved = span_path.map(|p| resolve_per_monitor_path(p));
+        let entries = active_mons
+            .into_iter()
+            .map(|(_, rect)| (rect, resolved.clone()))
+            .collect();
+        return Some(dedup_monitors(entries, 22, false, bg_color));
+    }
+
+    let mut entries = Vec::with_capacity(active_mons.len());
+    for (mid, rect) in active_mons {
+        let mut wp_ptr = null_mut();
+        let path_opt = if get_wallpaper(wp.0, mid.0, &mut wp_ptr) >= 0 && !wp_ptr.is_null() {
+            let s = CoTaskWStr(wp_ptr).to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(resolve_per_monitor_path(PathBuf::from(s)))
+            }
+        } else {
+            None
+        };
+        entries.push((rect, path_opt));
+    }
+    Some(dedup_monitors(entries, style, tile, bg_color))
+}
+
+fn query_desktop_wallpaper_com() -> Option<DesktopWallpaperSpec> {
+    use std::sync::{mpsc, OnceLock};
+    type Req = mpsc::SyncSender<Option<DesktopWallpaperSpec>>;
+    static WORKER: OnceLock<Mutex<mpsc::Sender<Req>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (req_tx, req_rx) = mpsc::channel::<Req>();
+        let _ = std::thread::Builder::new()
+            .name("lumen-wallpaper-com".into())
+            .spawn(move || unsafe {
+                // Run out-of-process IDesktopWallpaper IPC in an MTA worker so COM never
+                // pumps a modal STA message loop on the UI thread while RefCell<Glass>
+                // or widget state is mutably borrowed.
+                let _com = ComInitGuard::enter_mta();
+                while let Ok(reply) = req_rx.recv() {
+                    let _ = reply.send(query_desktop_wallpaper_com_inner());
+                }
+            });
+        Mutex::new(req_tx)
+    });
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    let sent = worker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(reply_tx)
+        .is_ok();
+    if !sent {
+        return None;
+    }
+    reply_rx
+        .recv_timeout(Duration::from_millis(1500))
+        .ok()
+        .flatten()
+}
+
+unsafe fn query_desktop_wallpaper_legacy() -> Option<DesktopWallpaperSpec> {
+    let spi_opt = query_spi_wallpaper_path().map(|p| resolve_wallpaper_path(p));
+    let style = registry_number("WallpaperStyle", 10);
+    let tile = registry_number("TileWallpaper", 0) != 0;
+    let mut mons = enumerate_active_monitors();
+    if mons.is_empty() {
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(GetSystemMetrics(SM_CXSCREEN)).max(1);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(GetSystemMetrics(SM_CYSCREEN)).max(1);
+        mons.push((String::from(r"\\.\DISPLAY1"), [vx, vy, vx + vw, vy + vh]));
+    }
+    let entries = mons
+        .into_iter()
+        .map(|(_, rect)| (rect, spi_opt.clone()))
+        .collect();
+    Some(dedup_monitors(entries, style, tile, 0))
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -2872,58 +4330,123 @@ fn resolve_project_json_image(project_path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn resolve_wallpaper_engine_image(exe_dir: &Path) -> Option<PathBuf> {
-    let config_path = exe_dir.join("config.json");
-    let raw = std::fs::read_to_string(config_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+fn resolve_wallpaper_engine_entry_image(entry: &serde_json::Value) -> Option<PathBuf> {
+    let file_str = entry.get("file").and_then(|v| v.as_str())?;
+    let file_path = PathBuf::from(file_str);
+    if is_supported_image(&file_path) {
+        return Some(file_path);
+    }
+    if file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("project.json"))
+    {
+        return resolve_project_json_image(&file_path);
+    }
+    None
+}
+
+fn parse_wallpaper_engine_config(
+    raw: &str,
+    active_monitors: &[(String, [i32; 4])],
+) -> Option<DesktopWallpaperSpec> {
+    if active_monitors.is_empty() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
     let root = json.as_object()?;
     for profile in root.values() {
-        let Some(selected) = profile
-            .get("general")
-            .and_then(|g| g.get("wallpaperconfig"))
+        let wp_cfg = profile.get("general").and_then(|g| g.get("wallpaperconfig"));
+        let Some(selected) = wp_cfg
             .and_then(|w| w.get("selectedwallpapers"))
             .or_else(|| profile.get("selectedwallpapers"))
             .and_then(|s| s.as_object())
         else {
             continue;
         };
-        let entry = selected
+        let layout = wp_cfg
+            .and_then(|w| w.get("layout"))
+            .or_else(|| profile.get("layout"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let fallback_img = selected
             .get("Monitor0")
-            .or_else(|| selected.values().next())?;
-        let Some(file_str) = entry.get("file").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let file_path = PathBuf::from(file_str);
-        if is_supported_image(&file_path) {
-            return Some(file_path);
+            .or_else(|| selected.values().next())
+            .and_then(resolve_wallpaper_engine_entry_image);
+
+        if layout.contains("stretch") || layout.contains("span") {
+            let img = fallback_img?;
+            let entries = active_monitors
+                .iter()
+                .map(|(_, r)| (*r, Some(img.clone())))
+                .collect();
+            return Some(dedup_monitors(entries, 22, false, 0));
         }
-        if file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.eq_ignore_ascii_case("project.json"))
-        {
-            if let Some(img) = resolve_project_json_image(&file_path) {
-                return Some(img);
+        if layout.contains("clone") {
+            let img = fallback_img?;
+            let entries = active_monitors
+                .iter()
+                .map(|(_, r)| (*r, Some(img.clone())))
+                .collect();
+            return Some(dedup_monitors(entries, 10, false, 0));
+        }
+
+        let mut entries = Vec::with_capacity(active_monitors.len());
+        let mut any_img = false;
+        for (idx, (dev_name, rect)) in active_monitors.iter().enumerate() {
+            let matched = selected
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(dev_name))
+                .map(|(_, v)| v)
+                .or_else(|| {
+                    let digits: String = dev_name
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    let mon_idx = digits
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .unwrap_or(idx);
+                    selected.get(&format!("Monitor{mon_idx}"))
+                })
+                .or_else(|| selected.get(&format!("Monitor{idx}")))
+                .and_then(resolve_wallpaper_engine_entry_image)
+                .or_else(|| fallback_img.clone());
+            if matched.is_some() {
+                any_img = true;
             }
+            entries.push((*rect, matched));
+        }
+        if any_img {
+            return Some(dedup_monitors(entries, 10, false, 0));
         }
     }
     None
 }
 
-fn resolve_lively_image() -> Option<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
-    let layout_path =
-        PathBuf::from(local_app_data).join("Lively Wallpaper\\SaveData\\wpdata\\WallpaperLayout.json");
-    let raw = std::fs::read_to_string(layout_path).ok()?;
-    let layouts: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let first = layouts.as_array()?.first()?;
-    if let Some(info_dir) = first.get("LivelyInfoPath").and_then(|v| v.as_str()) {
+fn resolve_wallpaper_engine_spec(
+    exe_dir: &Path,
+    active_monitors: &[(String, [i32; 4])],
+) -> Option<DesktopWallpaperSpec> {
+    let config_path = exe_dir.join("config.json");
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    parse_wallpaper_engine_config(&raw, active_monitors)
+}
+
+fn resolve_lively_item_image(item: &serde_json::Value) -> Option<PathBuf> {
+    if let Some(info_dir) = item.get("LivelyInfoPath").and_then(|v| v.as_str()) {
         let info_path = Path::new(info_dir).join("LivelyInfo.json");
         if let Some(img) = resolve_project_json_image(&info_path) {
             return Some(img);
         }
     }
-    if let Some(file_str) = first.get("FilePath").and_then(|v| v.as_str()) {
+    if let Some(file_str) = item.get("FilePath").and_then(|v| v.as_str()) {
         let path = PathBuf::from(file_str);
         if is_supported_image(&path) {
             return Some(path);
@@ -2932,11 +4455,104 @@ fn resolve_lively_image() -> Option<PathBuf> {
     None
 }
 
-unsafe fn resolve_live_wallpaper_file() -> Option<PathBuf> {
-    use std::time::{Duration, Instant};
-    thread_local! {
-        static LIVE_WP_CACHE: RefCell<Option<(Instant, Option<PathBuf>)>> = const { RefCell::new(None) };
+fn parse_lively_config(
+    layout_raw: &str,
+    settings_raw: Option<&str>,
+    active_monitors: &[(String, [i32; 4])],
+) -> Option<DesktopWallpaperSpec> {
+    if active_monitors.is_empty() {
+        return None;
     }
+    let layouts_val: serde_json::Value = serde_json::from_str(layout_raw).ok()?;
+    let layouts = layouts_val.as_array()?;
+    if layouts.is_empty() {
+        return None;
+    }
+    let arrangement = settings_raw
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("WallpaperArrangement")
+                .and_then(|a| {
+                    a.as_str()
+                        .map(|s| s.to_ascii_lowercase())
+                        .or_else(|| a.as_u64().map(|n| match n {
+                            1 => "span".to_string(),
+                            2 => "duplicate".to_string(),
+                            _ => "per".to_string(),
+                        }))
+                })
+        })
+        .unwrap_or_else(|| "per".to_string());
+
+    let first_img = layouts.first().and_then(resolve_lively_item_image);
+    if arrangement.contains("span") {
+        let img = first_img?;
+        let entries = active_monitors
+            .iter()
+            .map(|(_, r)| (*r, Some(img.clone())))
+            .collect();
+        return Some(dedup_monitors(entries, 22, false, 0));
+    }
+    if arrangement.contains("dup") {
+        let img = first_img?;
+        let entries = active_monitors
+            .iter()
+            .map(|(_, r)| (*r, Some(img.clone())))
+            .collect();
+        return Some(dedup_monitors(entries, 10, false, 0));
+    }
+
+    let mut entries = Vec::with_capacity(active_monitors.len());
+    let mut any_img = false;
+    for (dev_name, rect) in active_monitors {
+        let matched = layouts
+            .iter()
+            .find(|item| {
+                let Some(screen) = item.get("LivelyScreen") else {
+                    return false;
+                };
+                let dev_match = screen
+                    .get("DeviceName")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|d| d.eq_ignore_ascii_case(dev_name));
+                let bounds_match = screen.get("Bounds").is_some_and(|b| {
+                    let x = b.get("X").and_then(|v| v.as_i64());
+                    let y = b.get("Y").and_then(|v| v.as_i64());
+                    let w = b.get("Width").and_then(|v| v.as_i64());
+                    let h = b.get("Height").and_then(|v| v.as_i64());
+                    matches!((x, y, w, h), (Some(x), Some(y), Some(w), Some(h))
+                        if [x as i32, y as i32, (x + w) as i32, (y + h) as i32] == *rect)
+                });
+                dev_match || bounds_match
+            })
+            .and_then(resolve_lively_item_image)
+            .or_else(|| first_img.clone());
+        if matched.is_some() {
+            any_img = true;
+        }
+        entries.push((*rect, matched));
+    }
+    any_img.then(|| dedup_monitors(entries, 10, false, 0))
+}
+
+fn resolve_lively_spec(active_monitors: &[(String, [i32; 4])]) -> Option<DesktopWallpaperSpec> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+    let base = PathBuf::from(local_app_data).join("Lively Wallpaper\\SaveData\\wpdata");
+    let layout_raw = std::fs::read_to_string(base.join("WallpaperLayout.json")).ok()?;
+    let settings_raw = base
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("Settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| {
+            base.parent()
+                .map(|p| p.join("Settings.json"))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        });
+    parse_lively_config(&layout_raw, settings_raw.as_deref(), active_monitors)
+}
+
+unsafe fn resolve_live_wallpaper_spec() -> Option<DesktopWallpaperSpec> {
     let ttl = if crate::motion::low_power() {
         Duration::from_secs(10)
     } else {
@@ -2958,21 +4574,22 @@ unsafe fn resolve_live_wallpaper_file() -> Option<PathBuf> {
             .and_then(|n| n.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
+        let active_monitors = enumerate_active_monitors();
         if exe_name.contains("wallpaper32") || exe_name.contains("wallpaper64") {
             if let Some(dir) = exe_path.parent() {
-                if let Some(img) = resolve_wallpaper_engine_image(dir) {
-                    return Some(img);
+                if let Some(spec) = resolve_wallpaper_engine_spec(dir, &active_monitors) {
+                    return Some(spec);
                 }
             }
         }
         if exe_name.contains("lively") || exe_name.contains("cefsharp") {
-            if let Some(img) = resolve_lively_image() {
-                return Some(img);
+            if let Some(spec) = resolve_lively_spec(&active_monitors) {
+                return Some(spec);
             }
         }
         if let Some(dir) = exe_path.parent() {
-            if let Some(img) = resolve_wallpaper_engine_image(dir) {
-                return Some(img);
+            if let Some(spec) = resolve_wallpaper_engine_spec(dir, &active_monitors) {
+                return Some(spec);
             }
         }
         None
@@ -3125,7 +4742,7 @@ mod tests {
                 for tile in [false, true] {
                     let p = SharpPlacement {
                         buf: &pixels, w, h, stride, left_f: -13.25, top_f: 7.5,
-                        dw, dh, tile, style,
+                        dw, dh, tile, style, bg_bgr: [0.0; 3],
                     };
                     for (bx, by) in [(-30., -10.), (0.25, 9.75), (21., 35.), (80., 50.), (200., 100.)] {
                         for (nx, ny) in [(0., 1.), (1., 0.), (0.6, -0.8)] {
@@ -3213,7 +4830,7 @@ mod tests {
         let placed = SharpPlacement {
             buf: &pixels, w, h, stride: w * 4,
             left_f: 0., top_f: 0., dw: w as f32, dh: h as f32,
-            tile: false, style: 10,
+            tile: false, style: 10, bg_bgr: [0.0; 3],
         };
         for dpi in [1.0, 1.25, 1.75, 2.0] {
             for (nx, ny) in [(0., 1.), (1., 0.), (0.6, 0.8)] {
@@ -3237,11 +4854,12 @@ mod tests {
         let placed = SharpPlacement {
             buf: &different_filter, w, h, stride: w * 4,
             left_f: 0., top_f: 0., dw: w as f32, dh: h as f32,
-            tile: false, style: 10,
+            tile: false, style: 10, bg_bgr: [0.0; 3],
         };
+        let placed_surface = PlacedSurface::Single(placed);
         let mut out = original.clone();
         apply_liquid_glass_pixels(
-            &mut out, w * 4, w, h, &original, SharpInput::None, Some(&placed),
+            &mut out, w * 4, w, h, &original, SharpInput::None, Some(&placed_surface),
             255, 1., true, Some(32.), None, None,
         );
         let at = |y: usize| out[(y * w + w / 2) * 4] as i32;
@@ -3466,21 +5084,21 @@ mod tests {
     fn refresh_async_contended_loading_key_does_not_block_subsequent_refresh() {
         let _ui = crate::native_ui_test_lock();
         unsafe {
-            let Some((path, modified, _, _)) = Glass::query_wallpaper() else {
+            let Some(spec) = Glass::query_desktop_wallpaper() else {
                 return;
             };
             clear_cache();
             let mut glass = Glass::new(13., 1.);
+            let keys: Vec<SourceKey> = spec.unique_sources.iter().map(|u| u.key.clone()).collect();
             {
-                *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((path.clone(), modified));
+                *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys);
             }
             assert!(!glass.refresh_async(null_mut(), 0));
             assert!(glass.bitmap.is_none());
             assert!(glass.path.as_os_str().is_empty());
             *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
             assert!(glass.refresh());
-            assert!(glass.bitmap.is_some());
+            assert!(glass.available());
         }
     }
 
@@ -3771,9 +5389,11 @@ mod tests {
         let preview = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([24, 64, 128, 255]));
         let source = WallpaperSource {
             path: PathBuf::from("Z:\\nonexistent\\wallpaper.png"),
+            cap: Some((1920, 1080)),
             small: RefCell::new(Some(preview.clone())),
             preview,
             sharp: Cell::new(null_mut()),
+            sharp_size: Cell::new((0, 0)),
             width: 1920,
             height: 1080,
             natural: [3840., 2160.],
@@ -3874,6 +5494,863 @@ mod tests {
                 rim_diff > 15,
                 "liquid glass rim must remain active while resizing outside low-power mode (rim_diff={rim_diff})"
             );
+        }
+    }
+
+    struct TestTempDir(PathBuf);
+    impl TestTempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "lumen-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct TestWindow(HWND);
+    impl TestWindow {
+        unsafe fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                wide("STATIC").as_ptr(),
+                wide("Lumen multi-monitor test").as_ptr(),
+                WS_POPUP,
+                x,
+                y,
+                w,
+                h,
+                null_mut(),
+                null_mut(),
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null());
+            Self(hwnd)
+        }
+    }
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    struct TestGlassState(bool, bool);
+    impl TestGlassState {
+        fn enter() -> Self {
+            clear_cache();
+            let prev_lg = liquid_glass();
+            let prev_lp = crate::motion::low_power();
+            crate::motion::set_low_power(false);
+            set_liquid_glass(false);
+            Self(prev_lg, prev_lp)
+        }
+    }
+    impl Drop for TestGlassState {
+        fn drop(&mut self) {
+            set_liquid_glass(self.0);
+            crate::motion::set_low_power(self.1);
+            clear_cache();
+        }
+    }
+
+    fn write_solid_png(path: &Path, w: u32, h: u32, rgba: [u8; 4]) {
+        image::RgbaImage::from_pixel(w, h, image::Rgba(rgba))
+            .save(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn per_monitor_different_wallpapers_sample_independently_and_across_border() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("per-monitor");
+        let red_path = dir.path().join("red.png");
+        let blue_path = dir.path().join("blue.png");
+        write_solid_png(&red_path, 160, 120, [220, 40, 40, 255]);
+        write_solid_png(&blue_path, 160, 120, [40, 60, 220, 255]);
+
+        unsafe {
+            let glass = Glass::fixture_multi_monitor(
+                vec![
+                    ([-320, 0, 0, 240], Some(red_path)),
+                    ([0, 0, 320, 240], Some(blue_path)),
+                ],
+                10,
+                false,
+                0,
+                0.0,
+                1.0,
+            );
+            assert_eq!(glass.unique_wallpaper_count(), 2);
+            assert!(!glass.is_shared_wallpaper());
+
+            let win_left = TestWindow::new(-200, 40, 80, 60);
+            let win_right = TestWindow::new(40, 40, 80, 60);
+            let win_straddle = TestWindow::new(-40, 20, 80, 80);
+
+            let left_buf = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(left_buf.dc, win_left.0, 80, 60, 255);
+            let lpx = left_buf.snapshot();
+            let li = (30 * 80 + 40) * 4;
+            assert!(
+                lpx[li + 2] > lpx[li] + 100,
+                "left monitor should sample red: BGRA={:?}",
+                &lpx[li..li + 4]
+            );
+
+            let right_buf = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(right_buf.dc, win_right.0, 80, 60, 255);
+            let rpx = right_buf.snapshot();
+            let ri = (30 * 80 + 40) * 4;
+            assert!(
+                rpx[ri] > rpx[ri + 2] + 100,
+                "right monitor should sample blue: BGRA={:?}",
+                &rpx[ri..ri + 4]
+            );
+
+            let straddle_buf = crate::compositor::Buffer::plain(80, 80, 1.0).unwrap();
+            glass.draw_blended(straddle_buf.dc, win_straddle.0, 80, 80, 255);
+            let spx = straddle_buf.snapshot();
+            let s_left = (40 * 80 + 10) * 4;
+            let s_right = (40 * 80 + 70) * 4;
+            assert!(
+                spx[s_left + 2] > spx[s_left] + 100,
+                "straddle left half should sample red: BGRA={:?}",
+                &spx[s_left..s_left + 4]
+            );
+            assert!(
+                spx[s_right] > spx[s_right + 2] + 100,
+                "straddle right half should sample blue: BGRA={:?}",
+                &spx[s_right..s_right + 4]
+            );
+
+            let tile = glass
+                .sample_blurred_tile(
+                    win_straddle.0,
+                    RECT {
+                        left: -40,
+                        top: 20,
+                        right: 40,
+                        bottom: 100,
+                    },
+                    8,
+                    8,
+                )
+                .expect("blurred tile");
+            let tile_left = tile[4 * 8 + 1];
+            let tile_right = tile[4 * 8 + 6];
+            assert!(
+                tile_left[2] > tile_left[0] + 100,
+                "tile left should be red: {tile_left:?}"
+            );
+            assert!(
+                tile_right[0] > tile_right[2] + 100,
+                "tile right should be blue: {tile_right:?}"
+            );
+
+            set_liquid_glass(true);
+            let lg_buf = crate::compositor::Buffer::plain(80, 80, 1.0).unwrap();
+            glass.draw_blended(lg_buf.dc, win_straddle.0, 80, 80, 255);
+            let lgpx = lg_buf.snapshot();
+            let rim_l = (40 * 80 + 4) * 4;
+            let rim_r = (40 * 80 + 75) * 4;
+            assert!(
+                lgpx[rim_l + 2] > lgpx[rim_l] + 60,
+                "liquid glass left rim should preserve red monitor: BGRA={:?}",
+                &lgpx[rim_l..rim_l + 4]
+            );
+            assert!(
+                lgpx[rim_r] > lgpx[rim_r + 2] + 60,
+                "liquid glass right rim should preserve blue monitor: BGRA={:?}",
+                &lgpx[rim_r..rim_r + 4]
+            );
+
+            let acc_left = glass.wallpaper_accent_for(win_left.0);
+            let acc_right = glass.wallpaper_accent_for(win_right.0);
+            assert!(
+                (acc_left & 0xff) > ((acc_left >> 16) & 0xff),
+                "left accent must favor red: {acc_left:#08x}"
+            );
+            assert!(
+                ((acc_right >> 16) & 0xff) > (acc_right & 0xff),
+                "right accent must favor blue: {acc_right:#08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_wallpaper_deduplicates_sources_blur_and_native_layers() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("shared-dedup");
+        let teal_path = dir.path().join("teal.png");
+        write_solid_png(&teal_path, 160, 120, [20, 180, 190, 255]);
+        let canon = std::fs::canonicalize(&teal_path).unwrap();
+        let plain_str = canon
+            .to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canon.to_string_lossy())
+            .to_string();
+        let path_mon0 = PathBuf::from(&plain_str);
+        let path_mon1 = PathBuf::from(format!(r"\\?\{}", plain_str.to_ascii_uppercase()));
+
+        unsafe {
+            let glass = Glass::fixture_multi_monitor(
+                vec![
+                    ([-320, 0, 0, 240], Some(path_mon0)),
+                    ([0, 0, 320, 240], Some(path_mon1)),
+                ],
+                10,
+                false,
+                0,
+                0.0,
+                1.0,
+            );
+            assert_eq!(glass.unique_wallpaper_count(), 1);
+            assert!(glass.is_shared_wallpaper());
+            assert_eq!(glass.monitors.len(), 2);
+            assert_eq!(glass.monitors[0].slot, Some(0));
+            assert_eq!(glass.monitors[1].slot, Some(0));
+
+            let win0 = TestWindow::new(-200, 40, 80, 60);
+            let win1 = TestWindow::new(40, 40, 80, 60);
+            let b0 = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            let b1 = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(b0.dc, win0.0, 80, 60, 255);
+            glass.draw_blended(b1.dc, win1.0, 80, 60, 255);
+
+            assert_eq!(WALLPAPER_SOURCES.with(|c| c.borrow().len()), 1);
+            assert_eq!(BLURRED_CACHE.with(|c| c.borrow().len()), 1);
+            let p0 = b0.snapshot();
+            let p1 = b1.snapshot();
+            let idx = (30 * 80 + 40) * 4;
+            assert_eq!(&p0[idx..idx + 3], &p1[idx..idx + 3]);
+            assert!(
+                p0[idx] > p0[idx + 2] + 80 && p0[idx + 1] > p0[idx + 2] + 80,
+                "shared wallpaper must render teal on both monitors: BGRA={:?}",
+                &p0[idx..idx + 4]
+            );
+        }
+    }
+
+    #[test]
+    fn partial_monitor_sharing_deduplicates_matching_subset() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("partial-dedup");
+        let path_a = dir.path().join("wp_a.png");
+        let path_b = dir.path().join("wp_b.png");
+        write_solid_png(&path_a, 160, 120, [210, 50, 50, 255]);
+        write_solid_png(&path_b, 160, 120, [50, 210, 60, 255]);
+
+        unsafe {
+            let glass = Glass::fixture_multi_monitor(
+                vec![
+                    ([-640, 0, -320, 240], Some(path_a.clone())),
+                    ([-320, 0, 0, 240], Some(path_a.clone())),
+                    ([0, 0, 320, 240], Some(path_b)),
+                ],
+                10,
+                false,
+                0,
+                0.0,
+                1.0,
+            );
+            assert_eq!(glass.unique_wallpaper_count(), 2);
+            assert!(!glass.is_shared_wallpaper());
+            assert_eq!(glass.monitors.len(), 3);
+            assert_eq!(glass.monitors[0].slot, Some(0));
+            assert_eq!(glass.monitors[1].slot, Some(0));
+            assert_eq!(glass.monitors[2].slot, Some(1));
+
+            let bg_color = 0x00_30_20_10u32;
+            let partial_fail = Glass::fixture_multi_monitor(
+                vec![
+                    ([-320, 0, 0, 240], Some(path_a)),
+                    ([0, 0, 320, 240], Some(dir.path().join("missing.png"))),
+                ],
+                10,
+                false,
+                bg_color,
+                0.0,
+                1.0,
+            );
+            assert_eq!(partial_fail.unique_wallpaper_count(), 1);
+            assert_eq!(partial_fail.monitors[0].slot, Some(0));
+            assert_eq!(partial_fail.monitors[1].slot, None);
+
+            let win_ok = TestWindow::new(-200, 40, 80, 60);
+            let win_fail = TestWindow::new(40, 40, 80, 60);
+            let ok_buf = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            let fail_buf = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            partial_fail.draw_blended(ok_buf.dc, win_ok.0, 80, 60, 255);
+            partial_fail.draw_blended(fail_buf.dc, win_fail.0, 80, 60, 255);
+
+            let ok_px = ok_buf.snapshot();
+            let ok_i = (30 * 80 + 40) * 4;
+            assert!(
+                ok_px[ok_i + 2] > ok_px[ok_i] + 100,
+                "valid monitor must still render red when sibling monitor fails: {:?}",
+                &ok_px[ok_i..ok_i + 4]
+            );
+            let fail_px = fail_buf.snapshot();
+            let fail_i = (30 * 80 + 40) * 4;
+            assert_eq!(
+                &fail_px[fail_i..fail_i + 3],
+                &[0x30, 0x20, 0x10],
+                "failed monitor must fall back to bg_color"
+            );
+        }
+    }
+
+    #[test]
+    fn span_mode_samples_continuous_virtual_canvas_and_caches_per_monitor_slices() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("span-mode");
+        let span_path = dir.path().join("span.png");
+        let span_img = image::RgbaImage::from_fn(640, 240, |x, _| {
+            if x < 320 {
+                image::Rgba([30, 210, 40, 255]) // left half: green
+            } else {
+                image::Rgba([230, 210, 30, 255]) // right half: yellow
+            }
+        });
+        span_img.save(&span_path).unwrap();
+
+        unsafe {
+            let glass = Glass::fixture_multi_monitor(
+                vec![
+                    ([-320, 0, 0, 240], Some(span_path.clone())),
+                    ([0, 0, 320, 240], Some(span_path)),
+                ],
+                22,
+                false,
+                0,
+                0.0,
+                1.0,
+            );
+            assert_eq!(glass.unique_wallpaper_count(), 1);
+            assert!(glass.is_shared_wallpaper());
+
+            let win_left = TestWindow::new(-200, 40, 80, 60);
+            let win_right = TestWindow::new(40, 40, 80, 60);
+            let win_straddle = TestWindow::new(-40, 20, 80, 80);
+
+            let lb = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(lb.dc, win_left.0, 80, 60, 255);
+            let lpx = lb.snapshot();
+            let li = (30 * 80 + 40) * 4;
+            assert!(
+                lpx[li + 1] > lpx[li + 2] + 80 && lpx[li + 1] > lpx[li] + 80,
+                "span left monitor should sample green: BGRA={:?}",
+                &lpx[li..li + 4]
+            );
+
+            let rb = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(rb.dc, win_right.0, 80, 60, 255);
+            let rpx = rb.snapshot();
+            let ri = (30 * 80 + 40) * 4;
+            assert!(
+                rpx[ri + 2] > rpx[ri] + 80 && rpx[ri + 1] > rpx[ri] + 80,
+                "span right monitor should sample yellow: BGRA={:?}",
+                &rpx[ri..ri + 4]
+            );
+
+            assert_eq!(WALLPAPER_SOURCES.with(|c| c.borrow().len()), 1);
+            assert_eq!(BLURRED_CACHE.with(|c| c.borrow().len()), 1);
+
+            let sb = crate::compositor::Buffer::plain(80, 80, 1.0).unwrap();
+            glass.draw_blended(sb.dc, win_straddle.0, 80, 80, 255);
+            let spx = sb.snapshot();
+            let sl = (40 * 80 + 10) * 4;
+            let sr = (40 * 80 + 70) * 4;
+            assert!(
+                spx[sl + 1] > spx[sl + 2] + 80,
+                "span straddle x=10 should be green: BGRA={:?}",
+                &spx[sl..sl + 4]
+            );
+            assert!(
+                spx[sr + 2] > spx[sr] + 80 && spx[sr + 1] > spx[sr] + 80,
+                "span straddle x=70 should be yellow: BGRA={:?}",
+                &spx[sr..sr + 4]
+            );
+        }
+    }
+
+    #[test]
+    fn shared_tile_mode_anchors_at_primary_origin_across_negative_monitor() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("shared-tile");
+        let tile_path = dir.path().join("tile.png");
+        let tile_img = image::RgbaImage::from_fn(320, 240, |x, _| {
+            if x < 160 {
+                image::Rgba([220, 40, 40, 255]) // left half: red
+            } else {
+                image::Rgba([40, 60, 220, 255]) // right half: blue
+            }
+        });
+        tile_img.save(&tile_path).unwrap();
+
+        unsafe {
+            let glass = Glass::fixture_multi_monitor(
+                vec![
+                    ([-160, 0, 0, 240], Some(tile_path.clone())),
+                    ([0, 0, 320, 240], Some(tile_path)),
+                ],
+                0,
+                true,
+                0,
+                0.0,
+                1.0,
+            );
+            assert_eq!(glass.unique_wallpaper_count(), 1);
+            assert!(glass.is_shared_wallpaper());
+
+            let win_neg = TestWindow::new(-120, 40, 80, 60);
+            let win_pos = TestWindow::new(20, 40, 80, 60);
+
+            let neg_buf = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(neg_buf.dc, win_neg.0, 80, 60, 255);
+            let npx = neg_buf.snapshot();
+            let ni = (30 * 80 + 40) * 4;
+            assert!(
+                npx[ni] > npx[ni + 2] + 80,
+                "negative monitor x=-120..-40 in 320px shared tile anchored at (0,0) should wrap into right/blue half: BGRA={:?}",
+                &npx[ni..ni + 4]
+            );
+
+            let pos_buf = crate::compositor::Buffer::plain(80, 60, 1.0).unwrap();
+            glass.draw_blended(pos_buf.dc, win_pos.0, 80, 60, 255);
+            let ppx = pos_buf.snapshot();
+            let pi = (30 * 80 + 40) * 4;
+            assert!(
+                ppx[pi + 2] > ppx[pi] + 80,
+                "primary monitor x=20..100 in 320px shared tile should sample left/red half: BGRA={:?}",
+                &ppx[pi..pi + 4]
+            );
+        }
+    }
+
+    #[test]
+    fn solid_color_monitor_and_fit_letterbox_use_desktop_background_color() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("solid-and-fit");
+        let wide_path = dir.path().join("wide.png");
+        write_solid_png(&wide_path, 320, 80, [20, 220, 30, 255]);
+        let bg_color = 0x00_20_40_80u32; // COLORREF: R=0x80, G=0x40, B=0x20
+
+        unsafe {
+            let solid_glass = Glass::fixture_multi_monitor(
+                vec![([0, 0, 320, 240], None)],
+                10,
+                false,
+                bg_color,
+                0.0,
+                1.0,
+            );
+            let win_solid = TestWindow::new(40, 40, 64, 48);
+            assert_eq!(solid_glass.raw_wallpaper_accent_for(win_solid.0), bg_color);
+            let sbuf = crate::compositor::Buffer::plain(64, 48, 1.0).unwrap();
+            solid_glass.draw_blended(sbuf.dc, win_solid.0, 64, 48, 255);
+            let spx = sbuf.snapshot();
+            let si = (24 * 64 + 32) * 4;
+            assert_eq!(
+                &spx[si..si + 3],
+                &[0x20, 0x40, 0x80],
+                "solid-color monitor must render bg_color"
+            );
+
+            let fit_glass = Glass::fixture_multi_monitor(
+                vec![([0, 0, 320, 240], Some(wide_path))],
+                6,
+                false,
+                bg_color,
+                0.0,
+                1.0,
+            );
+            let win_letterbox = TestWindow::new(40, 4, 40, 20);
+            let win_image = TestWindow::new(40, 100, 40, 40);
+            let lbuf = crate::compositor::Buffer::plain(40, 20, 1.0).unwrap();
+            fit_glass.draw_blended(lbuf.dc, win_letterbox.0, 40, 20, 255);
+            let lpx = lbuf.snapshot();
+            let li = (10 * 40 + 20) * 4;
+            assert_eq!(
+                &lpx[li..li + 3],
+                &[0x20, 0x40, 0x80],
+                "fit mode top letterbox must render bg_color"
+            );
+
+            let ibuf = crate::compositor::Buffer::plain(40, 40, 1.0).unwrap();
+            fit_glass.draw_blended(ibuf.dc, win_image.0, 40, 40, 255);
+            let ipx = ibuf.snapshot();
+            let ii = (20 * 40 + 20) * 4;
+            assert!(
+                ipx[ii + 1] > ipx[ii + 2] + 80,
+                "fit mode image region must render green wallpaper: BGRA={:?}",
+                &ipx[ii..ii + 4]
+            );
+        }
+    }
+
+    #[test]
+    fn transcoded_meta_path_decodes_utf16_source_at_offset_20() {
+        let mut raw = vec![0u8; 20];
+        for ch in r"E:\wallpaper\sample.jpg".encode_utf16() {
+            raw.extend_from_slice(&ch.to_le_bytes());
+        }
+        raw.extend_from_slice(&[0, 0, 1, 2, 3, 4]);
+        assert_eq!(
+            super::parse_transcoded_meta_path(&raw),
+            Some(PathBuf::from(r"E:\wallpaper\sample.jpg"))
+        );
+        assert_eq!(super::parse_transcoded_meta_path(&[0u8; 18]), None);
+    }
+
+    #[test]
+    fn live_wallpaper_parsers_handle_per_monitor_clone_and_span_configs() {
+        let dir = TestTempDir::new("live-parsers");
+        let wp1 = dir.path().join("wp1.png");
+        let wp2 = dir.path().join("wp2.png");
+        write_solid_png(&wp1, 8, 8, [200, 30, 30, 255]);
+        write_solid_png(&wp2, 8, 8, [30, 30, 200, 255]);
+
+        let active = vec![
+            (r"\\.\DISPLAY1".to_string(), [-1920, 0, 0, 1080]),
+            (r"\\.\DISPLAY2".to_string(), [0, 0, 1920, 1080]),
+        ];
+
+        let we_per = serde_json::json!({
+            "steamuser": {
+                "general": {
+                    "wallpaperconfig": {
+                        "layout": "permonitor",
+                        "selectedwallpapers": {
+                            "Monitor0": { "file": wp1 },
+                            "Monitor1": { "file": wp2 }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let spec_per = parse_wallpaper_engine_config(&we_per, &active).unwrap();
+        assert_eq!(spec_per.unique_sources.len(), 2);
+        assert!(!spec_per.shared);
+        assert_eq!(spec_per.style, 10);
+
+        let we_clone = serde_json::json!({
+            "steamuser": {
+                "general": {
+                    "wallpaperconfig": {
+                        "layout": "clone",
+                        "selectedwallpapers": {
+                            "Monitor0": { "file": wp1 },
+                            "Monitor1": { "file": wp2 }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let spec_clone = parse_wallpaper_engine_config(&we_clone, &active).unwrap();
+        assert_eq!(spec_clone.unique_sources.len(), 1);
+        assert!(spec_clone.shared);
+        assert_eq!(spec_clone.style, 10);
+
+        let we_stretch = serde_json::json!({
+            "steamuser": {
+                "general": {
+                    "wallpaperconfig": {
+                        "layout": "stretch",
+                        "selectedwallpapers": {
+                            "Monitor0": { "file": wp1 }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let spec_stretch = parse_wallpaper_engine_config(&we_stretch, &active).unwrap();
+        assert!(spec_stretch.shared);
+        assert_eq!(spec_stretch.style, 22);
+
+        let lively_layout = serde_json::json!([
+            {
+                "FilePath": wp1,
+                "LivelyScreen": {
+                    "DeviceName": r"\\.\DISPLAY1",
+                    "Bounds": { "X": -1920, "Y": 0, "Width": 1920, "Height": 1080 }
+                }
+            },
+            {
+                "FilePath": wp2,
+                "LivelyScreen": {
+                    "DeviceName": r"\\.\DISPLAY2",
+                    "Bounds": { "X": 0, "Y": 0, "Width": 1920, "Height": 1080 }
+                }
+            }
+        ])
+        .to_string();
+        let lively_per = parse_lively_config(&lively_layout, None, &active).unwrap();
+        assert_eq!(lively_per.unique_sources.len(), 2);
+        assert!(!lively_per.shared);
+
+        let lively_dup = parse_lively_config(
+            &lively_layout,
+            Some(r#"{"WallpaperArrangement":"duplicate"}"#),
+            &active,
+        )
+        .unwrap();
+        assert_eq!(lively_dup.unique_sources.len(), 1);
+        assert!(lively_dup.shared);
+
+        let lively_span = parse_lively_config(
+            &lively_layout,
+            Some(r#"{"WallpaperArrangement":"span"}"#),
+            &active,
+        )
+        .unwrap();
+        assert!(lively_span.shared);
+        assert_eq!(lively_span.style, 22);
+    }
+
+    #[test]
+    fn live_desktop_wallpaper_query_discovers_active_monitors() {
+        let _ui = crate::native_ui_test_lock();
+        let spec = unsafe { Glass::query_desktop_wallpaper() }
+            .expect("host desktop wallpaper query must return active monitor layout");
+        assert!(!spec.monitors.is_empty());
+        for m in &spec.monitors {
+            assert!(
+                m.rect[2] > m.rect[0] && m.rect[3] > m.rect[1],
+                "monitor rect must be non-empty: {:?}",
+                m.rect
+            );
+        }
+    }
+
+    #[test]
+    fn com_wallpaper_query_does_not_pump_ui_messages_or_reenter_refcell() {
+        use windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED;
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            struct StaGuard(bool);
+            impl Drop for StaGuard {
+                fn drop(&mut self) {
+                    if self.0 {
+                        unsafe {
+                            CoUninitialize();
+                        }
+                    }
+                }
+            }
+            let hr = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+            let _sta = StaGuard(hr >= 0);
+
+            let win = TestWindow::new(0, 0, 32, 32);
+            let custom_msg = WM_APP + 77;
+            assert_ne!(PostMessageW(win.0, custom_msg, 123, 456), 0);
+
+            let glass = RefCell::new(Glass::new(13.0, 1.0));
+            let _guard = glass.borrow_mut();
+            invalidate_query_cache();
+            let _ = Glass::query_desktop_wallpaper();
+            drop(_guard);
+
+            let mut msg: MSG = zeroed();
+            let got = PeekMessageW(&mut msg, win.0, custom_msg, custom_msg, PM_REMOVE);
+            assert_ne!(
+                got, 0,
+                "COM wallpaper query on STA UI thread must not pump Win32 messages re-entrantly"
+            );
+            assert_eq!(msg.wParam, 123);
+        }
+    }
+
+    #[test]
+    fn blurred_wallpaper_downsamples_large_source_for_memory_savings() {
+        let large = image::RgbaImage::from_fn(3840, 2160, |x, y| {
+            let r = (x * 255 / 3839) as u8;
+            let b = (y * 255 / 2159) as u8;
+            image::Rgba([r, 80, b, 255])
+        });
+        let (bytes, bw, bh) = Glass::prepare_blurred_bytes(&large, 13.0, 1.75, 3840.0);
+        assert!(
+            bw <= 960 && bh <= 540,
+            "4K blurred wallpaper should be downsampled, got {bw}x{bh}"
+        );
+        assert!(bw >= 256 && bh >= 144);
+        assert_eq!(bytes.len(), (bw * bh * 4) as usize);
+
+        let (zero_bytes, zw, zh) = Glass::prepare_blurred_bytes(&large, 0.0, 1.0, 3840.0);
+        assert_eq!((zw, zh), (3840, 2160));
+        assert_eq!(zero_bytes.len(), 3840 * 2160 * 4);
+    }
+
+    #[test]
+    fn prune_caches_immediately_evicts_inactive_wallpapers() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("prune-immediate");
+        let path_a = dir.path().join("a.png");
+        let path_b = dir.path().join("b.png");
+        write_solid_png(&path_a, 160, 120, [200, 40, 40, 255]);
+        write_solid_png(&path_b, 160, 120, [40, 40, 200, 255]);
+
+        unsafe {
+            let mut glass = Glass::fixture_multi_monitor(
+                vec![([0, 0, 320, 240], Some(path_a.clone()))],
+                10,
+                false,
+                0,
+                10.0,
+                1.0,
+            );
+            assert_eq!(WALLPAPER_SOURCES.with(|c| c.borrow().len()), 1);
+            assert_eq!(BLURRED_CACHE.with(|c| c.borrow().len()), 1);
+
+            let spec_b = dedup_monitors(
+                vec![([0, 0, 320, 240], Some(path_b.clone()))],
+                10,
+                false,
+                0,
+            );
+            glass.apply_spec_sync(&spec_b);
+
+            assert_eq!(WALLPAPER_SOURCES.with(|c| c.borrow().len()), 1);
+            assert_eq!(BLURRED_CACHE.with(|c| c.borrow().len()), 1);
+            let expected_key = file_spec(path_b).key;
+            assert!(WALLPAPER_SOURCES.with(|c| c.borrow().contains_key(&expected_key)));
+        }
+    }
+
+    #[test]
+    fn sharp_bitmap_caps_4k_source_to_full_hd_and_clears_on_disable() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("sharp-cap");
+        let path_4k = dir.path().join("wall4k.png");
+        write_solid_png(&path_4k, 3840, 2160, [40, 160, 220, 255]);
+
+        unsafe {
+            let glass = Glass::fixture_multi_monitor(
+                vec![([0, 0, 3840, 2160], Some(path_4k))],
+                10,
+                false,
+                0,
+                10.0,
+                1.0,
+            );
+            let slot = &glass.slots[0];
+            assert!(slot.source.small.borrow().is_none());
+            assert!(slot.source.preview.width() <= PREVIEW_MAX_DIM);
+            assert!(slot.source.preview.height() <= PREVIEW_MAX_DIM);
+
+            set_liquid_glass(true);
+            let bmp = slot.source.sharp_bitmap();
+            assert!(!bmp.is_null());
+            let mut ds: DIBSECTION = zeroed();
+            assert!(
+                GetObjectW(bmp as _, size_of::<DIBSECTION>() as i32, &mut ds as *mut _ as _)
+                    >= size_of::<BITMAP>() as i32
+            );
+            assert_eq!((ds.dsBm.bmWidth, ds.dsBm.bmHeight), (1920, 1080));
+            assert_eq!(slot.source.sharp_dimensions(), (1920, 1080));
+
+            set_frosted_glass(true);
+            set_liquid_glass(false);
+            assert!(slot.source.sharp.get().is_null());
+        }
+    }
+
+    #[test]
+    fn bilinear_blit_matches_fit_fill_and_tile_with_clip() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("blit-modes");
+        let wall_path = dir.path().join("quad.png");
+        let img = image::RgbaImage::from_fn(120, 80, |x, y| {
+            let r = if x < 60 { 220 } else { 30 };
+            let b = if y < 40 { 30 } else { 220 };
+            image::Rgba([r, 90, b, 255])
+        });
+        img.save(&wall_path).unwrap();
+
+        unsafe {
+            // Fit mode with bg_color letterbox and SaveDC/IntersectClipRect clip
+            let bg = 0x00_44_22_11u32;
+            let fit_glass = Glass::fixture_multi_monitor(
+                vec![([0, 0, 240, 240], Some(wall_path.clone()))],
+                6,
+                false,
+                bg,
+                0.0,
+                1.0,
+            );
+            let win = TestWindow::new(0, 0, 240, 240);
+            let buf = crate::compositor::Buffer::plain(240, 240, 1.0).unwrap();
+            fill_solid_bg(buf.dc, 240, 240, bg);
+            let saved = SaveDC(buf.dc);
+            IntersectClipRect(buf.dc, 20, 20, 220, 220);
+            fit_glass.draw_rect_layer(
+                buf.dc,
+                win.0,
+                240,
+                240,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 240,
+                    bottom: 240,
+                },
+                false,
+                false,
+            );
+            RestoreDC(buf.dc, saved);
+            let px = buf.snapshot();
+            // Letterbox row y=25 inside clip must remain bg_color [0x44, 0x22, 0x11]
+            let lb = (25 * 240 + 120) * 4;
+            assert_eq!(&px[lb..lb + 3], &[0x44, 0x22, 0x11]);
+            // Top-left quadrant (x=60, y=60) inside image (y in 40..200) must be red-dominant
+            let tl = (60 * 240 + 60) * 4;
+            assert!(px[tl + 2] > px[tl] + 100, "top-left should be red: {:?}", &px[tl..tl + 4]);
+            // Bottom-right quadrant (x=180, y=180) must be blue-dominant
+            let br = (180 * 240 + 180) * 4;
+            assert!(px[br] > px[br + 2] + 100, "bottom-right should be blue: {:?}", &px[br..br + 4]);
+
+            // Tile mode wrap across tile boundary
+            let tile_glass = Glass::fixture_multi_monitor(
+                vec![([0, 0, 240, 240], Some(wall_path))],
+                0,
+                true,
+                0,
+                0.0,
+                1.0,
+            );
+            let tbuf = crate::compositor::Buffer::plain(240, 160, 1.0).unwrap();
+            tile_glass.draw_blended(tbuf.dc, win.0, 240, 160, 255);
+            let tpx = tbuf.snapshot();
+            let tile0 = (20 * 240 + 20) * 4;
+            let tile1 = (100 * 240 + 140) * 4;
+            assert_eq!(&tpx[tile0..tile0 + 3], &tpx[tile1..tile1 + 3]);
         }
     }
 }
