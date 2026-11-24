@@ -397,9 +397,8 @@ impl Host {
     }
     pub unsafe fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
-        s.glass.borrow_mut().refresh();
         if let Some(glass) = &s.local_glass {
-            glass.borrow_mut().refresh();
+            glass.borrow_mut().sync_from(&s.glass.borrow());
         }
         s.background_key.clear();
         s.header_base_key.clear();
@@ -2967,9 +2966,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             DefWindowProcW(hwnd, msg, w, l)
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
-            s.glass.borrow_mut().refresh();
             if let Some(glass) = &s.local_glass {
-                glass.borrow_mut().refresh();
+                glass.borrow_mut().sync_from(&s.glass.borrow());
             }
             s.background_key.clear();
             s.overlay = None;

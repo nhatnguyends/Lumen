@@ -1,7 +1,7 @@
-Lumen 0.1.14 dramatically reduces frosted/liquid glass memory usage and adds full per-monitor wallpaper support:
+Lumen 0.1.15 fixes widget drag pixelation, strengthens Liquid Glass rim chromatic dispersion, and eliminates wallpaper-switch freezes:
 
-- **Low-Memory Frosted & Liquid Glass Pipeline**: Added adaptive pre-blur downsampling in `prepare_blurred_bytes`, aspect-preserving capped preview (`960px`) and sharp (`1920px`) wallpaper surfaces with automatic sharp-bitmap release when Liquid Glass is disabled, replaced full-monitor `NATIVE_LAYERS` DIB caches with direct fixed-point integer bilinear sampling (`blit_placed_bilinear`), enabled immediate stale wallpaper cache eviction (`prune_caches`), and shared idle-released scratch buffers (~50% RAM reduction on dual-4K setups).
-- **Per-Monitor & Multi-Monitor Wallpaper Support**: Added independent per-monitor wallpaper resolution and rendering across shared, Span, Fit, Center, and Tile modes, live wallpaper detection, seamless cross-monitor straddling, and per-monitor adaptive accent colors (`wallpaper_accent_for`) across all widgets and Fusion bridges.
+- **Smooth Widget Drag & Crisp 3× Liquid Glass Rim Chromatic Dispersion**: Fixed top-down DIB sign handling in `blit_placed_bilinear` to eliminate pixelation when dragging widgets, restored full-resolution BGR24 `SharpImage` rim sampling, and boosted Liquid Glass rim chromatic dispersion 3× across both CPU (`glass.rs`) and D3D11 HLSL shaders (`gpu.rs`).
+- **Non-Blocking Async Wallpaper Reloads & Deadlock Fix**: Eliminated UI freezes, ~15–20s black desktop stalls, and missed widget background updates during wallpaper changes by coalescing and timeout-cancelling `IDesktopWallpaper` COM queries (`800 ms`), running single-flight background polling/decoding (`Glass::poll_async`), centralizing debounced wallpaper refreshes in the launcher (`WALLPAPER_DEBOUNCE_TIMER`), removing blocking UI-thread `glass.refresh()` calls from sibling widgets (`sync_from` for local glass), and keeping the previous valid wallpaper when mid-write decoding fails (`try_commit_slots`).
 
 Optional Python entry points remain available:
 
@@ -13,7 +13,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.14-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.15-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

@@ -69,6 +69,7 @@ const SMOKE_TIMER: usize = 2;
 const UPDATE_CHECK_TIMER: usize = 6;
 const UPDATE_PROGRESS_TIMER: usize = 7;
 const TRAY_RETRY_TIMER: usize = 8;
+const WALLPAPER_DEBOUNCE_TIMER: usize = 9;
 const CMD_ADD: u32 = 10;
 const CMD_PC: u32 = 11;
 const CMD_BIN: u32 = 12;
@@ -234,6 +235,7 @@ struct App {
     cache_pending: bool,
     status: String,
     status_ticks: u8,
+    wallpaper_poll_ticks: u8,
     dpi: f32,
     smoke: bool,
     inspect: bool,
@@ -1343,6 +1345,7 @@ impl App {
             cache_pending: false,
             status: String::new(),
             status_ticks: 0,
+            wallpaper_poll_ticks: 0,
             dpi: dst_dpi,
             smoke,
             inspect,
@@ -2853,9 +2856,11 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
         app.dpi = dpi;
         if !is_dup {
             crate::glass::invalidate_query_cache();
-            let blur = app.glass.borrow().blur();
-            app.glass.borrow_mut().set_blur(blur, dpi);
-            app.glass.borrow_mut().refresh();
+            if app.glass.borrow().available() {
+                let blur = app.glass.borrow().blur();
+                app.glass.borrow_mut().set_blur(blur, dpi);
+            }
+            SetTimer(hwnd, WALLPAPER_DEBOUNCE_TIMER, 150, None);
         }
         if dpi_changed || clamped {
             app.frame = None;
@@ -2967,7 +2972,7 @@ unsafe extern "system" fn wndproc(
                 if std::env::args().any(|a| a == "--smoke-test") {
                     app.glass.borrow_mut().refresh();
                 } else {
-                    app.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
+                    app.glass.borrow_mut().poll_async(hwnd, WALLPAPER_READY);
                 }
             } else {
                 app.dpi = crate::geometry::window_dpi(hwnd);
@@ -3203,10 +3208,7 @@ unsafe extern "system" fn wndproc(
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             if !app.is_duplicate {
                 crate::glass::invalidate_query_cache();
-                let refreshed = app.glass.borrow_mut().refresh();
-                if refreshed {
-                    app.notify_wallpaper_changed(hwnd);
-                }
+                SetTimer(hwnd, WALLPAPER_DEBOUNCE_TIMER, 150, None);
             }
             drop(app);
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -3746,21 +3748,13 @@ unsafe extern "system" fn wndproc(
             0
         }
         WALLPAPER_READY => {
-            if !app.is_duplicate && app.glass.borrow_mut().finish_async() {
-                let accent = app.glass.borrow().wallpaper_accent_for(hwnd);
-                app.accent_color = accent;
-                if app.dock.theme == crate::accent::THEME {
-                    app.dock.light = crate::accent::light(app.accent_color);
-                    app.rebuild_style(hwnd);
+            if !app.is_duplicate {
+                if app.glass.borrow_mut().finish_async() {
+                    app.notify_wallpaper_changed(hwnd);
                 }
-                app.background_key.clear();
-                app.sync_duplicate_appearance();
-                app.packages.refresh();
-                if let Some(host) = &mut app.general {
-                    host.refresh();
+                if crate::glass::take_async_recheck() {
+                    SetTimer(hwnd, WALLPAPER_DEBOUNCE_TIMER, 250, None);
                 }
-                crate::fusion::refresh();
-                InvalidateRect(hwnd, null(), 0);
             }
             0
         }
@@ -3900,9 +3894,11 @@ unsafe extern "system" fn wndproc(
                     }
                 }
             }
-            let refreshed = app.glass.borrow_mut().refresh();
-            if refreshed {
-                app.notify_wallpaper_changed(hwnd);
+            if !app.is_duplicate {
+                app.wallpaper_poll_ticks = app.wallpaper_poll_ticks.wrapping_add(1);
+                if app.wallpaper_poll_ticks % 3 == 0 {
+                    app.glass.borrow_mut().poll_async(hwnd, WALLPAPER_READY);
+                }
             }
             if !app.dock.floating && !app.inspect {
                 pin_to_desktop(hwnd);
@@ -3928,6 +3924,13 @@ unsafe extern "system" fn wndproc(
                 if app.tray.as_ref().is_some_and(|t| t.is_registered()) {
                     KillTimer(hwnd, TRAY_RETRY_TIMER);
                 }
+            }
+            0
+        }
+        WM_TIMER if wparam == WALLPAPER_DEBOUNCE_TIMER => {
+            KillTimer(hwnd, WALLPAPER_DEBOUNCE_TIMER);
+            if !app.is_duplicate {
+                app.glass.borrow_mut().poll_async(hwnd, WALLPAPER_READY);
             }
             0
         }
@@ -3986,6 +3989,7 @@ unsafe extern "system" fn wndproc(
             KillTimer(hwnd, UPDATE_CHECK_TIMER);
             KillTimer(hwnd, UPDATE_PROGRESS_TIMER);
             KillTimer(hwnd, TRAY_RETRY_TIMER);
+            KillTimer(hwnd, WALLPAPER_DEBOUNCE_TIMER);
             for id in [MOTION_TIMER, LAUNCH_TIMER, CARET_TIMER] {
                 KillTimer(hwnd, id);
             }
@@ -4310,6 +4314,7 @@ pub fn run() -> Result<(), String> {
             cache_pending: false,
             status: String::new(),
             status_ticks: 0,
+            wallpaper_poll_ticks: 0,
             dpi: 1.0,
             smoke,
             inspect,

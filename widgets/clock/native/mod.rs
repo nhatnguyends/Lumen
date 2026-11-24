@@ -835,7 +835,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             s.key.clear();
-            s.glass.borrow_mut().refresh();
             let prev_dpi = s.dpi;
             let live_dpi = crate::geometry::window_dpi(hwnd);
             let pre_dpi_changed = (prev_dpi - live_dpi).abs() > 0.005;

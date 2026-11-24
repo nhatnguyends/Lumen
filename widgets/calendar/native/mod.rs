@@ -276,7 +276,6 @@ impl Host {
     }
     pub unsafe fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
-        s.glass.borrow_mut().refresh();
         s.key.clear();
         if IsWindowVisible(s.hwnd) != 0 {
             InvalidateRect(s.hwnd, null(), 0);
@@ -1219,8 +1218,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let next = Date::today();
             let changed = next != s.today;
             s.today = next;
-            let wallpaper = s.glass.borrow_mut().refresh();
-            if changed || wallpaper {
+            if changed {
                 s.key.clear();
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -1341,7 +1339,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-            s.glass.borrow_mut().refresh();
             s.key.clear();
             let prev_dpi = s.dpi;
             let live_dpi = crate::geometry::window_dpi(hwnd);

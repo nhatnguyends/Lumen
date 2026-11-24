@@ -448,7 +448,7 @@ float4 glass_composite_ps(VSOut i) : SV_Target {
                 float t = saturate(1.0 + d / rim_w);
                 float2 grad = normalize(local_px - half_size + 1e-4);
                 float2 refract_uv = screen_uv - grad * (t * t * 10.0 * dpi / max(screen_size, float2(1.0, 1.0)));
-                float2 ca = grad * (t * 2.5 * dpi / max(screen_size, float2(1.0, 1.0)));
+                float2 ca = grad * (t * 7.5 * dpi / max(screen_size, float2(1.0, 1.0)));
                 wall.r = blurred_tex.Sample(samp_clamp, refract_uv + ca).r;
                 wall.g = blurred_tex.Sample(samp_clamp, refract_uv).g;
                 wall.b = blurred_tex.Sample(samp_clamp, refract_uv - ca).b;
@@ -620,10 +620,15 @@ float fb_sample_ca_channel(
     if (abs(signed_ca) <= 0.05) {
         return dot(tex.Sample(samp_clamp, screen_uv + n * disp / desk_size).rgb, ch_mask);
     }
-    float d0 = disp + signed_ca * 0.35;
-    float d1 = disp + signed_ca;
-    float d2 = disp + signed_ca * 1.65;
-    float spread = max(abs(signed_ca) * 0.45, 0.75 * fb_dpi);
+    float abs_ca = abs(signed_ca);
+    float trans = 0.75 * max(fb_dpi, 1.0);
+    float t_fp = saturate((abs_ca - 0.05) / trans);
+    float fp = t_fp * t_fp * t_fp * (t_fp * (t_fp * 6.0 - 15.0) + 10.0);
+    float soft_ca = (signed_ca >= 0.0 ? 1.0 : -1.0) * (abs_ca - 0.05);
+    float d0 = disp + soft_ca * (1.0 - 0.35 * fp);
+    float d1 = disp + soft_ca;
+    float d2 = disp + soft_ca * (1.0 + 0.35 * fp);
+    float spread = max(abs_ca * 0.45, 0.75 * fb_dpi) * fp;
     float2 t_uv = float2(-n.y, n.x) * spread / desk_size;
     float2 n_uv = n / desk_size;
     return 0.20 * dot(tex.Sample(samp_clamp, screen_uv + n_uv * d0).rgb, ch_mask)
@@ -778,8 +783,7 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
                 float u = saturate(-d / bridge_rim);
                 float k = saturate(1.0 - u);
                 float edge_align = k * k * (2.0 - k);
-                float colour_k = saturate(1.0 - u / 0.65);
-                float ca_factor = (0.45 * 0.65) * colour_k * colour_k * (2.0 - colour_k);
+                float ca_factor = 0.88 * edge_align;
                 float lens_strength = min(1.0, 0.65 * bridge_rim / ((4.0 / 3.0) * (12.5 + 1.65 * 4.5) * fb_dpi));
                 float disp = -12.5 * fb_dpi * edge_align * lens_strength;
                 float ca = ca_factor * 4.5 * fb_dpi * lens_strength;
@@ -802,7 +806,7 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
                 if (u < 0.88) {
                     float s = saturate(1.0 - u / 0.88);
                     float clarity = 0.52 * s * s * s * (s * (s * 6.0 - 15.0) + 10.0);
-                    float ca_s = ca * 0.45;
+                    float ca_s = ca * 0.55;
                     float3 sharp_col;
                     sharp_col.r = fb_sample_ca_channel(sharp_tex, screen_uv, n, desk_size, disp, -ca_s, fb_dpi, float3(1.0, 0.0, 0.0));
                     sharp_col.g = sharp_tex.Sample(samp_clamp, refract_uv).g;

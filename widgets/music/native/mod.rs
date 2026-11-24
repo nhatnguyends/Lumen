@@ -719,7 +719,7 @@ impl State {
             self.clear_spin_base();
             if !self.moving { self.overlay = None; }
             if let Some(glass) = &mut self.local_glass {
-                glass.refresh();
+                glass.sync_from(&self.glass.borrow());
             }
         }
         crate::fusion::prepare(self.hwnd, 34.);
@@ -1118,9 +1118,9 @@ impl Host {
     }
     pub unsafe fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
-        s.glass.borrow_mut().refresh();
+        let shared = s.glass.clone();
         if let Some(glass) = &mut s.local_glass {
-            glass.refresh();
+            glass.sync_from(&shared.borrow());
         }
         s.background = None;
         s.clear_spin_base();
@@ -1645,11 +1645,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
-            let mut changed = s.glass.borrow_mut().refresh();
+            let shared = s.glass.clone();
             if let Some(glass) = &mut s.local_glass {
-                changed |= glass.refresh();
+                glass.sync_from(&shared.borrow());
             }
-            if !s.moving && (changed || msg == WM_DISPLAYCHANGE) {
+            if !s.moving && msg == WM_DISPLAYCHANGE {
                 s.frame = None;
                 s.background = None;
                 s.clear_spin_base();

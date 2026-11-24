@@ -343,7 +343,6 @@ impl Host {
     }
     pub unsafe fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
-        s.glass.borrow_mut().refresh();
         s.key.clear();
         if IsWindowVisible(s.hwnd) != 0 {
             InvalidateRect(s.hwnd, null(), 0);
@@ -4077,10 +4076,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.drain_worker_snapshots(visible);
             let poll_due = s.last_poll.elapsed() >= Duration::from_millis(2400);
             if visible && poll_due {
-                if s.glass.borrow_mut().refresh() {
-                    s.key.clear();
-                    InvalidateRect(hwnd, null(), 0);
-                }
                 if s.slider.is_none() {
                     s.read();
                 }
@@ -4152,7 +4147,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
-            s.glass.borrow_mut().refresh();
             s.key.clear();
             s.read();
             let prev_dpi = s.dpi;
