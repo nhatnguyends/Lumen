@@ -260,7 +260,14 @@ impl State {
         let floating_changed = loaded.floating != self.config.floating;
         let queue_changed = loaded.queue != self.config.queue;
         let design_changed = loaded.design != self.config.design;
+        let browser_changed = loaded.browser != self.config.browser;
         self.config = loaded;
+        if browser_changed && self.backend.is_some() {
+            self.send(serde_json::json!({
+                "action": "setBrowser",
+                "browser": self.config.browser
+            }));
+        }
         if queue_changed {
             self.queue_offset = 0;
         }
@@ -297,9 +304,15 @@ impl State {
         }
         if self.backend.is_none() {
             match backend::Backend::start_with_notify(&self.root, self.hwnd, MUSIC_EVENT) {
-                Ok(b) => {
-                    self.backend = Some(b);
+                Ok(mut b) => {
                     self.error.clear();
+                    if let Err(e) = b.send(serde_json::json!({
+                        "action": "setBrowser",
+                        "browser": self.config.browser
+                    })) {
+                        crate::logger::warn("music", format!("failed to send initial browser preference: {e}"));
+                    }
+                    self.backend = Some(b);
                 }
                 Err(e) => {
                     crate::logger::error("music", format!("backend start failed: {e}"));

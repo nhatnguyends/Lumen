@@ -9,12 +9,24 @@ pub const DESIGNS: [&str; 5] = [
     "orbit",
     "disc",
 ];
+pub const BROWSERS: [&str; 9] = [
+    "auto",
+    "brave",
+    "chrome",
+    "edge",
+    "coccoc",
+    "vivaldi",
+    "opera",
+    "opera_gx",
+    "chromium",
+];
 pub const MIN_SIZE: [i32; 2] = [168, 104];
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
     pub version: u32,
     pub design: String,
+    pub browser: String,
     pub position: Option<[i32; 2]>,
     pub size: [i32; 2],
     pub floating: bool,
@@ -32,6 +44,7 @@ impl Default for Config {
         Self {
             version: 1,
             design: "coverflow".into(),
+            browser: "auto".into(),
             position: None,
             size: [491, 479],
             floating: false,
@@ -85,6 +98,7 @@ impl Config {
     pub fn validate(&mut self) -> Result<(), String> {
         if self.version != 1
             || !DESIGNS.contains(&self.design.as_str())
+            || !BROWSERS.contains(&self.browser.as_str())
             || !self.opacity.is_finite()
             || !self.tint.is_finite()
             || !self.frost_strength.is_finite()
@@ -265,6 +279,26 @@ mod tests {
         fs::write(&own, "{broken").unwrap();
         assert!(Config::load(&root).is_err());
         assert_eq!(fs::read_to_string(&own).unwrap(), "{broken");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn browser_preference_defaults_round_trips_and_validates() {
+        let root = std::env::temp_dir().join(format!("lumen-music-browser-{}", std::process::id()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        let legacy: Config = serde_json::from_str(r#"{"version":1,"design":"coverflow"}"#).unwrap();
+        assert_eq!(legacy.browser, "auto");
+
+        let mut c = Config::default();
+        assert_eq!(c.browser, "auto");
+        for browser in BROWSERS {
+            c.browser = browser.into();
+            c.validate().unwrap();
+            c.save(&root).unwrap();
+            let restored = Config::load(&root).unwrap();
+            assert_eq!(restored.browser, browser);
+        }
+        c.browser = "firefox".into();
+        assert!(c.validate().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

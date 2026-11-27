@@ -56,9 +56,9 @@ extern "system" {
 }
 
 pub const PLAYER_BROWSERS: [&str; 8] = [
+    "brave",
     "chrome",
     "edge",
-    "brave",
     "coccoc",
     "vivaldi",
     "opera",
@@ -129,6 +129,31 @@ pub fn find_browser(preferred: Option<&str>) -> Option<BrowserCandidate> {
         candidates.sort_by_key(|c| u8::from(c.browser != pref));
     }
     candidates.into_iter().find(|c| c.executable.is_file())
+}
+
+pub fn installed_browsers() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for c in player_browser_candidates() {
+        if c.executable.is_file() && !out.contains(&c.browser) {
+            out.push(c.browser);
+        }
+    }
+    out
+}
+
+pub fn browser_label(browser: &str) -> &'static str {
+    match browser {
+        "auto" => "Auto",
+        "brave" => "Brave",
+        "chrome" => "Chrome",
+        "edge" => "Edge",
+        "coccoc" => "CocCoc",
+        "vivaldi" => "Vivaldi",
+        "opera" => "Opera",
+        "opera_gx" => "Opera GX",
+        "chromium" => "Chromium",
+        _ => "Auto",
+    }
 }
 
 pub fn validate_player_url(url: &str) -> Result<(), String> {
@@ -751,5 +776,21 @@ mod tests {
             r#""C:\Program Files\Chrome\chrome.exe""#
         );
         assert_eq!(quote_win_arg(OsStr::new(r#"a"b"#)), r#""a\"b""#);
+    }
+
+    #[test]
+    fn brave_is_prioritized_first_with_chrome_and_edge_fallback() {
+        assert_eq!(PLAYER_BROWSERS[0], "brave");
+        let roots = [PathBuf::from(r"C:\Program Files")];
+        let candidates = player_browser_candidates_from_roots(&roots);
+        let order: Vec<&str> = candidates.iter().map(|c| c.browser).collect();
+        let brave_pos = order.iter().position(|&b| b == "brave").unwrap();
+        let chrome_pos = order.iter().position(|&b| b == "chrome").unwrap();
+        let edge_pos = order.iter().position(|&b| b == "edge").unwrap();
+        assert!(brave_pos < chrome_pos);
+        assert!(chrome_pos < edge_pos);
+        assert_eq!(browser_label("auto"), "Auto");
+        assert_eq!(browser_label("brave"), "Brave");
+        assert_eq!(browser_label("opera_gx"), "Opera GX");
     }
 }

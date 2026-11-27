@@ -11,10 +11,36 @@ impl State {
         )
     }
     pub(super) fn settings_rows(&self) -> Vec<Row> {
+        let mut browser_keys: Vec<String> = vec![
+            "auto".into(),
+            "brave".into(),
+            "chrome".into(),
+            "edge".into(),
+        ];
+        for browser in backend::installed_browsers() {
+            if !browser_keys.iter().any(|k| k == browser) {
+                browser_keys.push((*browser).into());
+            }
+        }
+        if !self.config.browser.is_empty()
+            && !browser_keys.iter().any(|k| k == &self.config.browser)
+        {
+            browser_keys.push(self.config.browser.clone());
+        }
+        let browser_choices: Vec<Choice> = browser_keys
+            .into_iter()
+            .map(|key| {
+                let label = backend::browser_label(&key);
+                Choice::new(key, label, None)
+            })
+            .collect();
+
         vec![
             Row::section("Account"),
             Row::accent_button(204, if self.playback.signed_in { "Sign out of YouTube Music" } else { "Sign in to YouTube Music" }, 0x0000ff),
             Row::note(if self.playback.signed_in { "Sign out clears the session only in Music's dedicated browser profile." } else { "Sign in in the browser, close it, then press Play to reconnect." }),
+            Row::choices(205, "Player browser", &self.config.browser, browser_choices),
+            Row::note("Auto prefers Brave (ad-free) when installed, then Chrome or Edge. Switching browsers uses a separate YouTube Music sign-in profile."),
             Row::section("Background"),
             Row::slider(102, "Glass tint", self.config.tint, 0., 100., "%"),
             Row::slider(103, "Frost strength", self.config.frost_strength, 0., 100., "%"),
@@ -69,6 +95,17 @@ impl State {
             (204, Value::Action) => {
                 self.send(serde_json::json!({"action": if self.playback.signed_in { "signout" } else { "signin" }}));
                 return false;
+            }
+            (205, Value::Choice(value)) if model::BROWSERS.contains(&value.as_str()) => {
+                if self.config.browser == value {
+                    return false;
+                }
+                self.config.browser = value.clone();
+                if self.backend.is_some() {
+                    self.send(serde_json::json!({"action": "setBrowser", "browser": value}));
+                }
+                self.settings_dirty = true;
+                return true;
             }
             (101, Value::Bool(value)) => {
                 self.config.frosted_glass = value;

@@ -4,9 +4,10 @@ mod player_page;
 mod player_window;
 
 use cdp_pipe::{
-    BootstrapServer, CdpPipe, ChildProcess, PLAYER_BROWSERS, find_browser, player_arguments,
-    sign_in_arguments, spawn_with_cdp_pipe,
+    BootstrapServer, BrowserCandidate, CdpPipe, ChildProcess, PLAYER_BROWSERS, find_browser,
+    player_arguments, sign_in_arguments, spawn_with_cdp_pipe,
 };
+pub use cdp_pipe::{browser_label, installed_browsers};
 use player_page::{
     MUSIC_PAGE_STATE, MUSIC_PLAY_PROBE, PlayerPageState, download_artwork,
     has_auth_session_cookies, music_page_command, music_page_select, sanitize_page_state,
@@ -270,6 +271,7 @@ struct MusicPlayer {
     notifier: EventNotifier,
     stop_flag: Arc<AtomicBool>,
     art: ArtCache,
+    preferred_browser: Option<String>,
     browser_name: Option<String>,
     app_id: String,
     resume_video_id: String,
@@ -331,6 +333,7 @@ impl MusicPlayer {
             events,
             notifier,
             stop_flag,
+            preferred_browser: None,
             browser_name: None,
             app_id: String::new(),
             resume_video_id: String::new(),
@@ -412,6 +415,33 @@ impl MusicPlayer {
 
     fn profile_dir(&self, browser: &str) -> PathBuf {
         self.directory.join("music-player").join(browser)
+    }
+
+    fn resolve_browser(&self) -> Option<BrowserCandidate> {
+        find_browser(self.preferred_browser.as_deref())
+    }
+
+    fn set_preferred_browser(&mut self, browser: &str) {
+        let next = if browser.is_empty() || browser == "auto" {
+            None
+        } else if PLAYER_BROWSERS.contains(&browser) {
+            Some(browser.to_owned())
+        } else {
+            return;
+        };
+        if self.preferred_browser == next {
+            return;
+        }
+        self.preferred_browser = next;
+        let resolved = self.resolve_browser();
+        let resolved_name = resolved.as_ref().map(|c| c.browser);
+        if (self.ready() || self.child.is_some()) && resolved_name != self.browser_name.as_deref() {
+            self.stop();
+            self.shutdown_child(1200);
+            self.browser_name = None;
+            self.app_id.clear();
+            self.save();
+        }
     }
 
     fn resume_watch_url(&self, video_id: &str) -> String {
@@ -570,7 +600,7 @@ impl MusicPlayer {
         if self.next_sign_in_retry.is_some_and(|t| Instant::now() < t) {
             return;
         }
-        if let Some(found) = find_browser(self.browser_name.as_deref()) {
+        if let Some(found) = self.resolve_browser() {
             let profile = self.profile_dir(found.browser);
             if Self::is_profile_locked(&profile) && self.pending_sign_in_reconnect > 1 {
                 self.pending_sign_in_reconnect -= 1;
@@ -679,8 +709,8 @@ impl MusicPlayer {
         }
         self.shutdown_child(1200);
 
-        let found = find_browser(self.browser_name.as_deref()).ok_or_else(|| {
-            "Install a Chromium browser (Chrome, Edge, Brave, CocCoc, Vivaldi, or Opera) to open the music player.".to_string()
+        let found = self.resolve_browser().ok_or_else(|| {
+            "Install a Chromium browser (Brave, Chrome, Edge, CocCoc, Vivaldi, or Opera) to open the music player.".to_string()
         })?;
         let profile = self.profile_dir(found.browser);
         crate::logger::info(
@@ -1007,8 +1037,8 @@ impl MusicPlayer {
             }
             self.sign_in_child = None;
         }
-        let found = find_browser(self.browser_name.as_deref()).ok_or_else(|| {
-            "Install a Chromium browser (Chrome, Edge, Brave, CocCoc, Vivaldi, or Opera) to sign in to Music.".to_string()
+        let found = self.resolve_browser().ok_or_else(|| {
+            "Install a Chromium browser (Brave, Chrome, Edge, CocCoc, Vivaldi, or Opera) to sign in to Music.".to_string()
         })?;
         self.pending_sign_in_reconnect = 0;
         self.next_sign_in_retry = None;
@@ -1445,6 +1475,10 @@ fn dispatch_command(
         "library" => player.open("https://music.youtube.com/library"),
         "signin" => player.sign_in(),
         "signout" => player.sign_out(),
+        "setBrowser" => {
+            player.set_preferred_browser(msg["browser"].as_str().unwrap_or("auto"));
+            Ok(())
+        }
         "layout" => Ok(()),
         "select" => player.play(msg["videoId"].as_str().unwrap_or(""), 0.0, cmd_rx),
         "info" => {
@@ -1742,6 +1776,31 @@ mod tests {
         );
 
         backend.set_notify(null_mut(), 0);
+        drop(backend);
+    }
+
+    #[test]
+    fn set_browser_command_is_accepted_without_error() {
+        let temp = TempDir::new();
+        let mut backend = Backend::start(&temp.0).expect("Backend::start must succeed");
+        let ready = backend
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("should emit ready event");
+        assert_eq!(ready["type"], "ready");
+
+        backend
+            .send(json!({"action": "setBrowser", "browser": "brave"}))
+            .unwrap();
+        backend
+            .send(json!({"action": "setBrowser", "browser": "auto"}))
+            .unwrap();
+        backend.send(json!({"action": "info"})).unwrap();
+        let event = backend
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("should emit info event without error");
+        assert_eq!(event["type"], "info");
         drop(backend);
     }
 }
