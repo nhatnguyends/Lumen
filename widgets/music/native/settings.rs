@@ -3,6 +3,22 @@ use super::*;
 use crate::settings_ui::{Change, Choice, Host as SettingsHost, Row, Value};
 pub const NOTIFY: u32 = WM_APP + 83;
 pub const FLUSH_TIMER: usize = 92;
+fn missing_browser_notice(selected: &str, installed: &[&str]) -> Option<String> {
+    if selected == "auto" || installed.contains(&selected) {
+        return None;
+    }
+    let label = backend::browser_label(selected);
+    Some(match installed.first() {
+        Some(&fallback) => format!(
+            "{label} is not installed on this PC — using {} instead.",
+            backend::browser_label(fallback)
+        ),
+        None => format!(
+            "{label} is not installed on this PC. Install Brave, Chrome, or Edge to play Music."
+        ),
+    })
+}
+
 impl State {
     pub(super) fn surface_color(&self) -> u32 {
         crate::surface::color(
@@ -11,15 +27,16 @@ impl State {
         )
     }
     pub(super) fn settings_rows(&self) -> Vec<Row> {
+        let installed = backend::installed_browsers();
         let mut browser_keys: Vec<String> = vec![
             "auto".into(),
             "brave".into(),
             "chrome".into(),
             "edge".into(),
         ];
-        for browser in backend::installed_browsers() {
+        for &browser in &installed {
             if !browser_keys.iter().any(|k| k == browser) {
-                browser_keys.push((*browser).into());
+                browser_keys.push(browser.into());
             }
         }
         if !self.config.browser.is_empty()
@@ -35,11 +52,16 @@ impl State {
             })
             .collect();
 
-        vec![
+        let mut rows = vec![
             Row::section("Account"),
             Row::accent_button(204, if self.playback.signed_in { "Sign out of YouTube Music" } else { "Sign in to YouTube Music" }, 0x0000ff),
             Row::note(if self.playback.signed_in { "Sign out clears the session only in Music's dedicated browser profile." } else { "Sign in in the browser, close it, then press Play to reconnect." }),
             Row::choices(205, "Player browser", &self.config.browser, browser_choices),
+        ];
+        if let Some(notice) = missing_browser_notice(&self.config.browser, &installed) {
+            rows.push(Row::highlight_note(notice, 0x1ea0f5));
+        }
+        rows.extend([
             Row::note("Auto prefers Brave (ad-free) when installed, then Chrome or Edge. Switching browsers uses a separate YouTube Music sign-in profile."),
             Row::section("Background"),
             Row::slider(102, "Glass tint", self.config.tint, 0., 100., "%"),
@@ -56,7 +78,8 @@ impl State {
             ]),
 
             Row::note("Themes scale down in place before switching to the pocket player. Minimum size: 168 × 104 DIP. Playback follows the web player."),
-        ]
+        ]);
+        rows
     }
     pub(super) unsafe fn ensure_settings(&mut self) -> bool {
         let rows = self.settings_rows();
@@ -104,6 +127,7 @@ impl State {
                 if self.backend.is_some() {
                     self.send(serde_json::json!({"action": "setBrowser", "browser": value}));
                 }
+                self.sync_settings();
                 self.settings_dirty = true;
                 return true;
             }
@@ -195,5 +219,24 @@ impl State {
             let rows = self.settings_rows();
             self.settings.as_mut().unwrap().set_rows(rows);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_browser_notice_reports_fallback_or_install_hint() {
+        assert_eq!(missing_browser_notice("auto", &["chrome", "edge"]), None);
+        assert_eq!(missing_browser_notice("brave", &["brave", "chrome"]), None);
+        assert_eq!(
+            missing_browser_notice("brave", &["chrome", "edge"]).as_deref(),
+            Some("Brave is not installed on this PC — using Chrome instead.")
+        );
+        assert_eq!(
+            missing_browser_notice("brave", &[]).as_deref(),
+            Some("Brave is not installed on this PC. Install Brave, Chrome, or Edge to play Music.")
+        );
     }
 }

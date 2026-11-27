@@ -339,7 +339,7 @@ pub fn peer_hwnds_for(
         .collect()
 }
 
-pub unsafe fn notify_peers(widget_id: &str, source_hwnd: HWND) {
+pub unsafe fn notify_peers_with_message(widget_id: &str, source_hwnd: HWND, message: u32) {
     let peers = STATE.with(|s| {
         s.try_borrow()
             .ok()
@@ -349,9 +349,13 @@ pub unsafe fn notify_peers(widget_id: &str, source_hwnd: HWND) {
     for peer in peers {
         let hwnd = peer as HWND;
         if !hwnd.is_null() && IsWindow(hwnd) != 0 {
-            PostMessageW(hwnd, WIDGET_SYNC_MESSAGE, 0, 0);
+            PostMessageW(hwnd, message, 0, 0);
         }
     }
+}
+
+pub unsafe fn notify_peers(widget_id: &str, source_hwnd: HWND) {
+    notify_peers_with_message(widget_id, source_hwnd, WIDGET_SYNC_MESSAGE);
 }
 
 pub fn is_duplicate(hwnd: HWND) -> bool {

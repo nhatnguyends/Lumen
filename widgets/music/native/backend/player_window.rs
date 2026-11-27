@@ -17,7 +17,7 @@ use windows_sys::Win32::{
         SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
         SW_HIDE, SW_MINIMIZE, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, SendMessageTimeoutW,
         SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW,
-        WINDOWPLACEMENT, WM_SETICON,
+        WINDOWPLACEMENT, WM_GETICON, WM_SETICON,
     },
 };
 
@@ -107,6 +107,91 @@ struct CachedIcons {
 }
 
 static ICONS: OnceLock<Option<CachedIcons>> = OnceLock::new();
+static FAVICON_SCRIPT: OnceLock<Option<String>> = OnceLock::new();
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub fn youtube_music_favicon_script() -> Option<String> {
+    FAVICON_SCRIPT
+        .get_or_init(|| {
+            let png = render_youtube_music_png(128)?;
+            let b64 = encode_base64(&png);
+            Some(format!(
+                r###"(() => {{
+  const href = "data:image/png;base64,{b64}";
+  let applying = false;
+  const isIconLink = el => {{
+    if (!el || el.tagName !== 'LINK') return false;
+    const rel = (el.getAttribute('rel') || '').toLowerCase();
+    return rel.split(/\s+/).includes('icon');
+  }};
+  const enforce = () => {{
+    if (applying) return;
+    applying = true;
+    try {{
+      const root = document.head || document.documentElement;
+      if (!root) return;
+      let ours = null;
+      for (const link of [...document.querySelectorAll('link[rel]')]) {{
+        if (!isIconLink(link)) continue;
+        if (link.getAttribute('data-lumen-icon') === '1' && !ours) {{
+          ours = link;
+        }} else {{
+          link.remove();
+        }}
+      }}
+      if (!ours) {{
+        ours = document.createElement('link');
+        ours.setAttribute('data-lumen-icon', '1');
+        ours.rel = 'icon';
+        ours.type = 'image/png';
+        ours.sizes = '128x128';
+        ours.href = href;
+        root.appendChild(ours);
+      }} else {{
+        if (ours.getAttribute('href') !== href) ours.href = href;
+        if (ours.getAttribute('rel') !== 'icon') ours.rel = 'icon';
+        if (ours.parentNode !== root) root.appendChild(ours);
+      }}
+    }} finally {{
+      applying = false;
+    }}
+  }};
+  enforce();
+  new MutationObserver(enforce).observe(document, {{
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['href', 'rel'],
+  }});
+}})()"###
+            ))
+        })
+        .clone()
+}
 
 fn ensure_icons() -> Option<&'static CachedIcons> {
     ICONS
@@ -137,6 +222,39 @@ fn ensure_icons() -> Option<&'static CachedIcons> {
             }
         })
         .as_ref()
+}
+
+fn get_window_icon(hwnd: HWND, kind: usize) -> Option<isize> {
+    let mut result = 0usize;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETICON,
+            kind,
+            0,
+            SMTO_ABORTIFHUNG,
+            50,
+            &mut result,
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some(result as isize)
+    }
+}
+
+fn window_icon_matches(hwnd: HWND, icons: &CachedIcons) -> bool {
+    let check = |kind: usize, expected: isize| -> bool {
+        if expected == 0 {
+            return true;
+        }
+        match get_window_icon(hwnd, kind) {
+            Some(actual) => actual == expected,
+            None => true,
+        }
+    };
+    check(ICON_BIG as usize, icons.big) && check(ICON_SMALL as usize, icons.small)
 }
 
 fn apply_window_icon(hwnd: HWND) {
@@ -320,6 +438,7 @@ impl MusicWindowHost {
             return Err("Music window is not ready".into());
         }
         let raw = hwnd as HWND;
+        apply_window_icon(raw);
         let centered = centered_rect_in_work(primary_work_area());
         unsafe {
             let mut wp: WINDOWPLACEMENT = zeroed();
@@ -389,6 +508,19 @@ impl MusicWindowHost {
         }
     }
 
+    pub fn ensure_icon(&self) {
+        if self.disposed {
+            return;
+        }
+        let raw = self.hwnd as HWND;
+        let Some(icons) = ensure_icons() else {
+            return;
+        };
+        if !window_icon_matches(raw, icons) {
+            apply_window_icon(raw);
+        }
+    }
+
     pub fn destroy(&mut self) {
         if self.disposed {
             return;
@@ -445,5 +577,17 @@ mod tests {
         assert_eq!(small.bottom - small.top, 600);
         assert_eq!(small.left, 100);
         assert_eq!(small.top, 40);
+    }
+
+    #[test]
+    fn base64_and_favicon_override_script_render_cleanly() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"M"), "TQ==");
+        assert_eq!(encode_base64(b"Ma"), "TWE=");
+        assert_eq!(encode_base64(b"Man"), "TWFu");
+
+        let script = youtube_music_favicon_script().expect("favicon script should build");
+        assert!(script.contains("data:image/png;base64,"));
+        assert!(script.contains("data-lumen-icon"));
     }
 }

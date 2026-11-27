@@ -37,6 +37,23 @@ use windows_sys::Win32::{
 };
 
 const MUSIC_EVENT: u32 = WM_APP + 84;
+const PEER_PLAYBACK_MSG: u32 = WM_APP + 86;
+const PEER_COMMAND_MSG: u32 = WM_APP + 87;
+
+#[derive(Default)]
+struct SharedPlayback {
+    owner: usize,
+    live: bool,
+    playback: Playback,
+    art_files: HashMap<String, String>,
+    error: String,
+    version: u64,
+    pending_cmds: std::collections::VecDeque<serde_json::Value>,
+}
+
+thread_local! {
+    static SHARED_PLAYBACK: RefCell<SharedPlayback> = RefCell::new(SharedPlayback::default());
+}
 
 struct State {
     hwnd: HWND,
@@ -45,6 +62,8 @@ struct State {
     glass: Rc<RefCell<Glass>>,
     backend: Option<backend::Backend>,
     backend_live: bool,
+    peer_live: bool,
+    peer_sync_version: u64,
     smtc: Option<smtc::SmtcClient>,
     latest_smtc: Option<smtc::SmtcState>,
     smtc_active: bool,
@@ -136,6 +155,7 @@ impl State {
     }
     fn use_smtc(&self) -> bool {
         !self.backend_live
+            && !self.peer_live
             && self
                 .latest_smtc
                 .as_ref()
@@ -295,7 +315,121 @@ impl State {
         self.sync_spin_timer();
         InvalidateRect(self.hwnd, null(), 0);
     }
+    fn publish_to_peers(&mut self) {
+        if self.smoke {
+            return;
+        }
+        SHARED_PLAYBACK.with(|shared| {
+            let mut shared = shared.borrow_mut();
+            shared.owner = self.hwnd as usize;
+            shared.live = self.backend_live;
+            shared.playback = self.playback.clone();
+            shared.art_files = self.art_files.clone();
+            shared.error = self.error.clone();
+            shared.version = shared.version.wrapping_add(1);
+        });
+        unsafe {
+            crate::multi_monitor::notify_peers_with_message(
+                "music",
+                self.hwnd,
+                PEER_PLAYBACK_MSG,
+            );
+        }
+    }
+    fn sync_from_peer(&mut self) {
+        if self.smoke || self.backend_live {
+            return;
+        }
+        let snapshot = SHARED_PLAYBACK.with(|shared| {
+            let shared = shared.borrow();
+            if shared.owner == self.hwnd as usize || shared.version == self.peer_sync_version {
+                return None;
+            }
+            Some((
+                shared.version,
+                shared.live,
+                shared.playback.clone(),
+                shared.art_files.clone(),
+                shared.error.clone(),
+            ))
+        });
+        let Some((version, live, playback, art_files, error)) = snapshot else {
+            return;
+        };
+        self.peer_sync_version = version;
+        self.peer_live = live;
+        if !art_files.is_empty() {
+            if self.art_files.len() + art_files.len() > 64 {
+                self.art_files.retain(|url, _| {
+                    self.last_cover.as_ref() == Some(url)
+                        || self.playback.art.as_ref() == Some(url)
+                        || self.playback.queue.iter().any(|t| t.thumb == *url)
+                        || playback.art.as_ref() == Some(url)
+                        || playback.queue.iter().any(|t| t.thumb == *url)
+                });
+            }
+            self.art_files.extend(art_files);
+        }
+        if live {
+            self.smtc_active = false;
+            self.error = error;
+            self.accept_playback(playback);
+            if !self.hwnd.is_null() && unsafe { IsWindowVisible(self.hwnd) != 0 } {
+                unsafe {
+                    SetTimer(self.hwnd, 91, 250, None);
+                }
+            }
+            if self.coverflow_anim.is_some()
+                && self.config.design == "coverflow"
+                && !self.hwnd.is_null()
+                && unsafe { IsWindowVisible(self.hwnd) != 0 }
+            {
+                if self.anim_clock.is_none() {
+                    self.anim_clock = Some(crate::motion::FrameClock::start());
+                }
+                unsafe {
+                    SetTimer(self.hwnd, 94, crate::motion::frame_interval_ms(), None);
+                }
+            }
+        } else {
+            self.playback.available = false;
+            self.playback.playing = false;
+            self.playback.can_next = false;
+            self.playback.can_previous = false;
+            self.playback.can_seek = false;
+            self.error = error;
+        }
+        if !self.hwnd.is_null() && unsafe { IsWindowVisible(self.hwnd) != 0 } {
+            self.restore_art();
+            unsafe {
+                InvalidateRect(self.hwnd, null(), 0);
+            }
+        }
+        unsafe {
+            self.sync_spin_timer();
+        }
+    }
     fn send(&mut self, value: serde_json::Value) {
+        if !self.smoke && self.backend.is_none() {
+            let target = SHARED_PLAYBACK.with(|shared| {
+                let mut shared = shared.borrow_mut();
+                if shared.owner != 0
+                    && shared.owner != self.hwnd as usize
+                    && unsafe { IsWindow(shared.owner as HWND) != 0 }
+                {
+                    shared.pending_cmds.push_back(value.clone());
+                    Some(shared.owner as HWND)
+                } else {
+                    None
+                }
+            });
+            if let Some(owner_hwnd) = target {
+                unsafe {
+                    PostMessageW(owner_hwnd, PEER_COMMAND_MSG, 0, 0);
+                }
+                return;
+            }
+        }
         let action = value["action"].as_str().unwrap_or("unknown").to_owned();
         crate::logger::info("music", format!("backend action={action}"));
         if self.backend.as_mut().is_some_and(|b| b.exited()) {
@@ -442,6 +576,7 @@ impl State {
             s.clear_notify_pending();
         }
         let mut dirty = false;
+        let mut backend_dirty = false;
         // Drain outside the receiver borrow, then create images on the UI thread.
         let events: Vec<_> = self
             .backend
@@ -461,6 +596,7 @@ impl State {
                                 .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(2500));
                         self.backend_live = has_backend_session || (self.backend_live && seeking);
                         if self.backend_live {
+                            self.peer_live = false;
                             self.smtc_active = false;
                         }
                         self.error = state.error.clone().unwrap_or_default();
@@ -488,6 +624,7 @@ impl State {
                         self.error = error.into();
                     }
                     dirty = true;
+                    backend_dirty = true;
                 }
                 "error" => {
                     let err = event["error"].as_str().unwrap_or("Playback error");
@@ -498,6 +635,7 @@ impl State {
                     }
                     self.error = err.into();
                     dirty = true;
+                    backend_dirty = true;
                 }
                 "art" => {
                     if let (Some(url), Some(file)) = (event["url"].as_str(), event["file"].as_str())
@@ -515,6 +653,7 @@ impl State {
                             }
                             self.art_files.insert(url.into(), file.into());
                             dirty = true;
+                            backend_dirty = true;
                         }
                     }
                 }
@@ -522,7 +661,14 @@ impl State {
             }
         }
         if self.backend.as_mut().is_some_and(|b| b.exited()) {
+            if self.backend_live {
+                backend_dirty = true;
+                dirty = true;
+            }
             self.backend_live = false;
+        }
+        if backend_dirty {
+            self.publish_to_peers();
         }
         let smtc_updates: Vec<_> = self
             .smtc
@@ -537,7 +683,7 @@ impl State {
         if let Some(latest) = smtc_updates.into_iter().last() {
             self.latest_smtc = Some(latest);
         }
-        if !self.backend_live && (smtc_changed || !self.smtc_active) {
+        if !self.backend_live && !self.peer_live && (smtc_changed || !self.smtc_active) {
             if let Some(smtc_state) = self.latest_smtc.clone().filter(|s| s.has_session && s.available)
             {
                 if !self.smtc_active {
@@ -1003,6 +1149,8 @@ impl Host {
             glass,
             backend: None,
             backend_live: false,
+            peer_live: false,
+            peer_sync_version: 0,
             smtc: if smoke {
                 None
             } else {
@@ -1089,6 +1237,13 @@ impl Host {
             smtc.set_notify(hwnd, MUSIC_EVENT);
         }
         if !smoke {
+            let has_live_peer = SHARED_PLAYBACK.with(|shared| {
+                let shared = shared.borrow();
+                shared.live && shared.owner != 0
+            });
+            if has_live_peer {
+                state.borrow_mut().sync_from_peer();
+            }
             PostMessageW(hwnd, MUSIC_EVENT, 0, 0);
         }
         state.borrow_mut().restore_art();
@@ -1184,6 +1339,27 @@ impl Drop for Host {
             }
             s.backend.take();
             s.shadow.take();
+            if !s.smoke {
+                let was_owner = SHARED_PLAYBACK.with(|shared| {
+                    let mut shared = shared.borrow_mut();
+                    if shared.owner == s.hwnd as usize {
+                        shared.owner = 0;
+                        shared.live = false;
+                        shared.pending_cmds.clear();
+                        shared.version = shared.version.wrapping_add(1);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if was_owner {
+                    crate::multi_monitor::notify_peers_with_message(
+                        "music",
+                        s.hwnd,
+                        PEER_PLAYBACK_MSG,
+                    );
+                }
+            }
             let hwnd = s.hwnd;
             // No callback may retain a State pointer while the owner is dropped.
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1380,6 +1556,24 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         m if m == crate::multi_monitor::WIDGET_SYNC_MESSAGE => {
             s.reload_from_shared();
+            0
+        }
+        m if m == PEER_PLAYBACK_MSG => {
+            s.sync_from_peer();
+            0
+        }
+        m if m == PEER_COMMAND_MSG => {
+            let cmds: Vec<_> = SHARED_PLAYBACK.with(|shared| {
+                let mut shared = shared.borrow_mut();
+                if shared.owner == hwnd as usize {
+                    shared.pending_cmds.drain(..).collect()
+                } else {
+                    Vec::new()
+                }
+            });
+            for cmd in cmds {
+                s.send(cmd);
+            }
             0
         }
         m if m == MUSIC_EVENT => {
@@ -2388,6 +2582,8 @@ mod tests {
                             glass: Rc::new(RefCell::new(Glass::new(13., 1.))),
                             backend: None,
                             backend_live: false,
+                            peer_live: false,
+                            peer_sync_version: 0,
                             smtc: None,
                             latest_smtc: None,
                             smtc_active: false,
@@ -2913,6 +3109,86 @@ mod tests {
                 }
             }
             drop(host);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn peer_sync_shares_full_queue_and_art_files_and_suppresses_smtc() {
+        let _ui = crate::native_ui_test_lock();
+        SHARED_PLAYBACK.with(|shared| *shared.borrow_mut() = SharedPlayback::default());
+        unsafe {
+            let root = test_root("music-peer-sync");
+            let host_a = Host::create(
+                &root,
+                Rc::new(RefCell::new(Glass::new(13., 1.))),
+                true,
+                true,
+            )
+            .unwrap();
+            let host_b = Host::create(
+                &root,
+                Rc::new(RefCell::new(Glass::new(13., 1.))),
+                true,
+                true,
+            )
+            .unwrap();
+
+            {
+                let mut a = host_a.state.borrow_mut();
+                a.smoke = false;
+                a.backend_live = true;
+                let queue: Vec<model::Track> = (0..5)
+                    .map(|i| model::Track {
+                        video_id: format!("peer000000{i}"),
+                        title: format!("Peer Track {i}"),
+                        artist: "Peer Artist".into(),
+                        thumb: format!("https://i.ytimg.com/vi/peer000000{i}/0.jpg"),
+                        selected: i == 1,
+                    })
+                    .collect();
+                a.playback = Playback {
+                    video_id: "peer0000001".into(),
+                    title: "Peer Track 1".into(),
+                    artist: "Peer Artist".into(),
+                    art: Some("https://i.ytimg.com/vi/peer0000001/0.jpg".into()),
+                    available: true,
+                    playing: true,
+                    queue,
+                    ..Playback::default()
+                };
+                for i in 0..5 {
+                    let url = format!("https://i.ytimg.com/vi/peer000000{i}/0.jpg");
+                    let file = format!("{:064x}.img", i + 1);
+                    a.art_files.insert(url, file);
+                }
+                a.publish_to_peers();
+                a.smoke = true;
+            }
+
+            {
+                let mut b = host_b.state.borrow_mut();
+                b.smoke = false;
+                b.latest_smtc = Some(smtc::SmtcState {
+                    has_session: true,
+                    available: true,
+                    playing: true,
+                    title: "SMTC Single Track".into(),
+                    artist: "Browser".into(),
+                    ..smtc::SmtcState::default()
+                });
+                b.sync_from_peer();
+                assert!(b.peer_live);
+                assert!(!b.use_smtc());
+                assert_eq!(b.playback.queue.len(), 5);
+                assert_eq!(b.art_files.len(), 5);
+                assert_eq!(b.playback.title, "Peer Track 1");
+                b.smoke = true;
+            }
+
+            drop(host_b);
+            drop(host_a);
+            SHARED_PLAYBACK.with(|shared| *shared.borrow_mut() = SharedPlayback::default());
             let _ = std::fs::remove_dir_all(root);
         }
     }

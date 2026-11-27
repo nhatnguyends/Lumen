@@ -1,6 +1,9 @@
-Lumen 0.1.16 prioritizes Brave for ad-free YouTube Music playback and adds a browser selector in Music settings:
+Lumen 0.1.17 fixes YouTube Music playback reliability, keeps the taskbar icon crisp, and synchronizes Coverflow across multi-monitor duplicate widgets:
 
-- **Brave Priority & Music Player Browser Selector**: Prioritized `brave` first in automatic Chromium browser discovery (`brave` → `chrome` → `edge` fallback) and added a **Player browser** choice (`Auto`, `Brave`, `Chrome`, `Edge`, plus any other installed Chromium browsers) under **Account** in Music settings (`config/native-music.json` `browser` field, defaulting to `auto`). Switching browsers cleanly shuts down any active background player and keeps per-browser YouTube Music profiles separate.
+- **Reliable YouTube Music Playback Across Browsers**: Removed `Emulation.setFocusEmulationEnabled` and unnecessary `awaitPromise` evaluation on synchronous 1s state polls so YouTube Music plays continuously across Brave, Chrome, and Edge without triggering `"Something went wrong. Refresh or try again later."` interruptions, fixed dead-session reattach loops when a player window closes, and expanded player/media error capture.
+- **Crisp YouTube Music Taskbar Icon Without Blur Flash**: Applied Lumen's 128×128 icon before taskbar placement (`MusicWindowHost::new`), verified icon handles via `WM_GETICON` (`ensure_icon`), and installed a pre-navigation CDP script (`Page.addScriptToEvaluateOnNewDocument`) that keeps the high-resolution 128×128 PNG icon active instead of flashing the low-res web favicon.
+- **Multi-Monitor Coverflow & Playback Sync**: Shared live `playback`, full `queue`, `art_files`, and sign-in state across duplicate Music widgets (`SHARED_PLAYBACK` + peer messages) and forwarded control commands to the active backend owner so every monitor displays the complete Coverflow album art fan without falling back to single-track SMTC.
+- **Missing-Browser Notice in Music Settings**: Displays a highlighted warning in **Account → Player browser** when a selected browser (such as Brave) is not installed on the PC, showing which fallback browser is used or prompting to install one.
 
 Optional Python entry points remain available:
 
@@ -12,7 +15,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.16-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.17-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Brave, Chrome or Edge and an internet connection.

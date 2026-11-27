@@ -13,7 +13,9 @@ use player_page::{
     has_auth_session_cookies, music_page_command, music_page_select, sanitize_page_state,
     sanitize_playlist_id, validate_video_id,
 };
-use player_window::{MusicWindowHost, hide_music_background_window};
+use player_window::{
+    MusicWindowHost, hide_music_background_window, youtube_music_favicon_script,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -804,15 +806,6 @@ impl MusicPlayer {
             let session_id = self.attach(&target_id)?;
             self.playback_session = session_id.clone();
 
-            self.pipe
-                .as_ref()
-                .ok_or("Music browser disconnected")?
-                .send(
-                    "Emulation.setFocusEmulationEnabled",
-                    json!({"enabled": true}),
-                    Some(&session_id),
-                )?;
-
             let title_js = format!(
                 "document.title={}; true",
                 serde_json::to_string(&bootstrap_title).map_err(|e| e.to_string())?
@@ -840,6 +833,24 @@ impl MusicPlayer {
             let host = MusicWindowHost::new(hwnd, start_visible)?;
             self.host = Some(host);
             drop(bootstrap);
+
+            if let Some(favicon_js) = youtube_music_favicon_script() {
+                if let Some(pipe) = &self.pipe {
+                    if let Err(err) = pipe.send("Page.enable", json!({}), Some(&session_id)) {
+                        crate::logger::warn("music", format!("Page.enable failed: {err}"));
+                    }
+                    if let Err(err) = pipe.send(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        json!({"source": favicon_js}),
+                        Some(&session_id),
+                    ) {
+                        crate::logger::warn(
+                            "music",
+                            format!("failed to install favicon script: {err}"),
+                        );
+                    }
+                }
+            }
 
             self.pipe
                 .as_ref()
@@ -939,14 +950,6 @@ impl MusicPlayer {
             let session_id = self.attach(&target_id)?;
             self.playback_id = target_id.clone();
             self.playback_session = session_id.clone();
-            self.pipe
-                .as_ref()
-                .ok_or("Music browser disconnected")?
-                .send(
-                    "Emulation.setFocusEmulationEnabled",
-                    json!({"enabled": true}),
-                    Some(&session_id),
-                )?;
             crate::logger::info(
                 "music",
                 format!("reattached music CDP target={target_id} url={url}"),
@@ -971,7 +974,7 @@ impl MusicPlayer {
                 json!({
                     "expression": expression,
                     "returnByValue": true,
-                    "awaitPromise": true,
+                    "awaitPromise": user_gesture,
                     "userGesture": user_gesture,
                 }),
                 Some(session_id),
@@ -1334,7 +1337,19 @@ impl MusicPlayer {
             Ok(val) => val,
             Err(err) if is_target_or_session_error(&err) => {
                 crate::logger::warn("music", format!("reattaching after evaluate error: {err}"));
-                self.reattach_music_target(true)?;
+                if !self.reattach_music_target(true)? {
+                    self.playback_session.clear();
+                    self.playback_id.clear();
+                    self.sessions.clear();
+                    if let Some(mut host) = self.host.take() {
+                        host.destroy();
+                    }
+                    self.emit_state(
+                        None,
+                        Some("Background player closed. Press Play to reconnect."),
+                    );
+                    return Ok(());
+                }
                 session = self.playback_session.clone();
                 self.evaluate(&session, MUSIC_PAGE_STATE, false)?
             }
@@ -1422,12 +1437,18 @@ impl MusicPlayer {
         }
         self.current = Some(state.clone());
         self.emit_state(Some(&state), None);
+        if let Some(host) = &self.host {
+            host.ensure_icon();
+        }
         Ok(())
     }
 
     fn poll(&mut self) {
         if !self.ready() {
             return;
+        }
+        if let Some(host) = &self.host {
+            host.ensure_icon();
         }
         if let Err(msg) = self.publish() {
             crate::logger::warn("music", format!("music poll error: {msg}"));

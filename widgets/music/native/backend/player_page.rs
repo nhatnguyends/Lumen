@@ -32,8 +32,10 @@ pub const MUSIC_PLAY_PROBE: &str = r###"(() => {
   const btn = document.querySelector('ytmusic-player-bar .play-pause-button');
   const api = document.getElementById?.('movie_player');
   const playerState = typeof api?.getPlayerState === 'function' ? api.getPlayerState() : -1;
-  const errNode = document.querySelector('ytmusic-player yt-player-error-message-renderer #reason, ytmusic-player .ytp-error-content-wrap-reason, #movie_player .ytp-error-content-wrap-reason, ytmusic-player #error-screen #reason');
-  const err = errNode && errNode.getBoundingClientRect?.().height > 0 ? (errNode.textContent?.trim() || '') : '';
+  const errNode = document.querySelector('yt-playability-error-supported-renderers #reason, yt-playability-error-supported-renderers .reason, ytmusic-player yt-player-error-message-renderer #reason, ytmusic-player .ytp-error-content-wrap-reason, #movie_player .ytp-error-content-wrap-reason, ytmusic-player #error-screen #reason')
+    || document.querySelector('ytmusic-player yt-player-error-message-renderer');
+  const errText = errNode && errNode.getBoundingClientRect?.().height > 0 ? (errNode.textContent?.replace(/\s+/g, ' ').trim() || '') : '';
+  const err = errText || (video?.error ? `Media error ${video.error.code}` : '');
   return {
     onOrigin: true,
     hasControls: !!(video || btn || (playerState >= 1 && playerState <= 5)),
@@ -110,8 +112,10 @@ pub const MUSIC_PAGE_STATE: &str = r###"(() => {
   const available = !!title && hasMedia;
   const fallbackArt = videoId ? 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' : null;
   const art = current?.thumb || imgSrc(bar?.querySelector('img')) || meta?.artwork?.at(-1)?.src || fallbackArt;
-  const errNode = document.querySelector('ytmusic-player yt-player-error-message-renderer #reason, ytmusic-player .ytp-error-content-wrap-reason, #movie_player .ytp-error-content-wrap-reason, ytmusic-player #error-screen #reason');
-  const errText = errNode && errNode.getBoundingClientRect?.().height > 0 ? text(errNode) : '';
+  const errNode = document.querySelector('yt-playability-error-supported-renderers #reason, yt-playability-error-supported-renderers .reason, ytmusic-player yt-player-error-message-renderer #reason, ytmusic-player .ytp-error-content-wrap-reason, #movie_player .ytp-error-content-wrap-reason, ytmusic-player #error-screen #reason')
+    || document.querySelector('ytmusic-player yt-player-error-message-renderer');
+  const errText = (errNode && errNode.getBoundingClientRect?.().height > 0 ? text(errNode).replace(/\s+/g, ' ').trim() : '')
+    || (video?.error ? `Media error ${video.error.code}` : '');
   return { available, playing,
     title, artist,
     album:meta?.album || '', art,
