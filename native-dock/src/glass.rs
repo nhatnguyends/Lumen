@@ -2184,7 +2184,8 @@ impl Glass {
         let has_sharp = sharp_placed.is_some();
         for &(x, y, d, nx, ny, a, edge, spec) in samples {
             let u = (-d / rim).clamp(0.0, 1.0);
-            let (edge_align, ca_factor, clarity) = liquid_lens_profile(u, has_sharp, rim, bend, ca_strength);
+            let (edge_align, ca_factor, clarity) =
+                liquid_lens_profile(u, has_sharp, rim, bend, ca_strength, self.blur);
             let disp = -bend * edge_align;
             let ca = ca_factor * ca_strength;
             let fx = x as f32 + 0.5;
@@ -2324,6 +2325,7 @@ impl Glass {
                 blur_placed,
                 amount,
                 self.dpi,
+                self.blur,
                 true,
                 pane_radius,
                 fusion,
@@ -2510,6 +2512,7 @@ pub fn apply_liquid_glass_rgba(
             None,
             255,
             dpi,
+            global_blur(),
             false,
             pane_radius,
             fusion,
@@ -2634,13 +2637,26 @@ fn sample_refracted_channel(
 /// Broad meniscus with a bounded gradient and a flat inner endpoint. The colour
 /// split uses the same curve in a narrower rim with its gradient preserved.
 #[inline]
-fn liquid_lens_profile(u: f32, has_sharp: bool, rim: f32, bend: f32, ca_strength: f32) -> (f32, f32, f32) {
+fn liquid_lens_profile(
+    u: f32,
+    has_sharp: bool,
+    rim: f32,
+    bend: f32,
+    ca_strength: f32,
+    blur: f32,
+) -> (f32, f32, f32) {
     let k = (1.0 - u).clamp(0.0, 1.0);
     let edge_align = k * k * (2.0 - k);
     let ca_factor = 0.88 * edge_align;
-    let clarity = if has_sharp && u < 0.88 {
-        let s = (1.0 - u / 0.88).clamp(0.0, 1.0);
-        0.52 * s * s * s * (s * (s * 6.0 - 15.0) + 10.0)
+    let t = ((blur - 10.0) / 70.0).clamp(0.0, 1.0);
+    let blur_t = t * (2.0 - t);
+    let reach = 0.88 - 0.48 * blur_t;
+    let clarity = if has_sharp && u < reach {
+        let s = (1.0 - u / reach).clamp(0.0, 1.0);
+        let f = s * s * s * (s * (s * 6.0 - 15.0) + 10.0);
+        let f_eff = f * (1.0 + blur_t * (f * f - 1.0));
+        let peak = 0.52 * (1.0 - 0.72 * blur_t);
+        peak * f_eff
     } else {
         0.0
     };
@@ -2783,7 +2799,7 @@ pub(crate) fn card_rim_lens_params(
     _dpi: f32,
 ) -> (f32, f32, f32, f32) {
     let u = (-d / rim).clamp(0.0, 1.0);
-    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
+    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength, 0.0);
     let disp = -bend * edge_align;
     let ca = ca_factor * ca_strength;
     let soft_ca = if ca.abs() <= 0.05 {
@@ -2825,7 +2841,7 @@ pub fn refract_bgra_card_pixel(
         return [0; 3];
     }
     let u = (-d / rim).clamp(0.0, 1.0);
-    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
+    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength, 0.0);
     let disp = -bend * edge_align;
     let ca = ca_factor * ca_strength;
 
@@ -2922,7 +2938,7 @@ pub fn apply_liquid_glass_premul_bgra(
                     let a = src[i + 3];
                     if a > 0 {
                         let u = (-d / rim).clamp(0.0, 1.0);
-                        let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
+                        let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength, 0.0);
                         let disp = -bend * edge_align;
                         let ca = ca_factor * ca_strength;
 
@@ -2973,6 +2989,7 @@ fn apply_liquid_glass_pixels(
     blur_placed: Option<&PlacedSurface<'_>>,
     amount: u8,
     dpi: f32,
+    blur: f32,
     bgra: bool,
     pane_radius: Option<f32>,
     fusion: Option<(Vec<crate::fusion::geometry::Pane>, [f32; 2])>,
@@ -3010,7 +3027,8 @@ fn apply_liquid_glass_pixels(
                 return;
             }
             let u = (-d / rim).clamp(0.0, 1.0);
-            let (edge_align, ca_factor, clarity) = liquid_lens_profile(u, has_sharp, rim, bend, ca_strength);
+            let (edge_align, ca_factor, clarity) =
+                liquid_lens_profile(u, has_sharp, rim, bend, ca_strength, blur);
             let disp = -bend * edge_align;
             let ca = ca_factor * ca_strength;
 
@@ -4915,10 +4933,10 @@ mod tests {
     #[test]
     fn liquid_meniscus_retains_outer_bend_and_strong_card_refraction() {
         for dpi in [1., 1.25, 1.75, 2.] {
-            let (outer, colour, _) = liquid_lens_profile(0., false, 40. * dpi, 12.5 * dpi, 4.5 * dpi);
+            let (outer, colour, _) = liquid_lens_profile(0., false, 40. * dpi, 12.5 * dpi, 4.5 * dpi, 0.0);
             assert!(outer >= 0.97, "full-size glass must retain almost all original edge displacement");
             assert!(colour >= 0.85, "the glass edge must retain visible colour separation");
-            let (card, _, _) = liquid_lens_profile(0., false, 20. * dpi, 10. * dpi, 3.5 * dpi);
+            let (card, _, _) = liquid_lens_profile(0., false, 20. * dpi, 10. * dpi, 3.5 * dpi, 0.0);
             assert!(card >= 0.60, "nested glass must not become visually flat");
         }
     }
@@ -4929,7 +4947,7 @@ mod tests {
                 (20. * dpi, 10. * dpi, 3.5 * dpi), (9. * dpi, 10. * dpi, 3.5 * dpi)] {
                 for channel_sign in [-1., 0., 1.] {
                     let mapped = |depth: f32| {
-                        let (edge, ca, _) = liquid_lens_profile(depth / rim, false, rim, bend, ca_strength);
+                        let (edge, ca, _) = liquid_lens_profile(depth / rim, false, rim, bend, ca_strength, 0.0);
                         let taps = RefCell::new(Vec::new());
                         let mean = sample_refracted_channel(64., 64. + depth, 0., -1.,
                             -bend * edge, channel_sign * ca_strength * ca, dpi, [1., 1.], |_, y| {
@@ -4986,12 +5004,12 @@ mod tests {
             crate::motion::set_low_power(true);
             apply_liquid_glass_pixels(
                 &mut serial, stride, w, h, &source, SharpInput::None, None,
-                255, 1.25, true, Some(34.), fusion.clone(), None,
+                255, 1.25, 0.0, true, Some(34.), fusion.clone(), None,
             );
             crate::motion::set_low_power(false);
             apply_liquid_glass_pixels(
                 &mut parallel, stride, w, h, &source, SharpInput::None, None,
-                255, 1.25, true, Some(34.), fusion, None,
+                255, 1.25, 0.0, true, Some(34.), fusion, None,
             );
             assert!(serial == parallel, "parallel optics must produce identical pixels, alpha and padding");
         }
@@ -5143,7 +5161,7 @@ mod tests {
         let mut out = original.clone();
         apply_liquid_glass_pixels(
             &mut out, w * 4, w, h, &original, SharpInput::None, Some(&placed_surface),
-            255, 1., true, Some(32.), None, None,
+            255, 1., 0.0, true, Some(32.), None, None,
         );
         let at = |y: usize| out[(y * w + w / 2) * 4] as i32;
         for y in 24..60 {
@@ -6757,6 +6775,89 @@ mod tests {
             assert!(
                 max_center_rb <= 1,
                 "interior outside rim must remain chromatic-free (max |R-B|={max_center_rb})"
+            );
+        }
+    }
+
+    #[test]
+    fn liquid_rim_clarity_blurs_progressively_with_high_blur() {
+        let dpi = 1.75;
+        let rim = 40.0 * dpi;
+        let bend = 12.5 * dpi;
+        let ca = 4.5 * dpi;
+
+        let (_, _, c10_outer) = liquid_lens_profile(0.0, true, rim, bend, ca, 10.0);
+        let (_, _, c10_inner) = liquid_lens_profile(0.75, true, rim, bend, ca, 10.0);
+        assert!((c10_outer - 0.52).abs() < 1e-5);
+        assert!(c10_inner > 0.01);
+
+        let (_, _, c40_outer) = liquid_lens_profile(0.0, true, rim, bend, ca, 40.0);
+        let (_, _, c80_outer) = liquid_lens_profile(0.0, true, rim, bend, ca, 80.0);
+        assert!(c40_outer < c10_outer && c40_outer > 0.15, "c40_outer={c40_outer}");
+        assert!(c80_outer < c40_outer && c80_outer > 0.10, "c80_outer={c80_outer}");
+
+        let (_, _, c80_u15) = liquid_lens_profile(0.15, true, rim, bend, ca, 80.0);
+        let (_, _, c80_u30) = liquid_lens_profile(0.30, true, rim, bend, ca, 80.0);
+        let (_, _, c80_u50) = liquid_lens_profile(0.50, true, rim, bend, ca, 80.0);
+        assert!(c80_u15 < c80_outer);
+        assert!(c80_u30 < c80_u15);
+        assert_eq!(c80_u50, 0.0);
+    }
+
+    #[test]
+    fn liquid_glass_high_blur_softens_rim_chromatic_dispersion() {
+        let _ui = crate::native_ui_test_lock();
+        let _state = TestGlassState::enter();
+        let dir = TestTempDir::new("rim-ca-high-blur");
+        let wall_path = dir.path().join("diag.png");
+
+        unsafe {
+            let (w, h) = (480, 300);
+            let win = TestWindow::new(120, 120, w, h);
+            let mut wr: RECT = zeroed();
+            GetWindowRect(win.0, &mut wr);
+            let diag_split = wr.left + wr.top + 240;
+            let img = image::RgbaImage::from_fn(1920, 1080, |x, y| {
+                let v = if (x as i32 + y as i32) < diag_split { 12 } else { 244 };
+                image::Rgba([v, v, v, 255])
+            });
+            img.save(&wall_path).unwrap();
+
+            set_liquid_glass(true);
+            let measure = |blur: f32| {
+                let glass = Glass::fixture_multi_monitor(
+                    vec![([0, 0, 1920, 1080], Some(wall_path.clone()))],
+                    10,
+                    false,
+                    0,
+                    blur,
+                    1.75,
+                );
+                let buf = crate::compositor::Buffer::plain(w, h, 1.0).unwrap();
+                glass.draw_blended(buf.dc, win.0, w, h, 255);
+                let px = buf.snapshot();
+                let band_max_rb = |rows: std::ops::Range<usize>| {
+                    let mut max_rb = 0u8;
+                    for y in rows {
+                        for x in 100..(w as usize - 100) {
+                            let i = (y * w as usize + x) * 4;
+                            max_rb = max_rb.max(px[i + 2].abs_diff(px[i]));
+                        }
+                    }
+                    max_rb
+                };
+                (band_max_rb(7..13), band_max_rb(32..38))
+            };
+
+            let (outer_10, inner_10) = measure(10.0);
+            let (outer_60, inner_60) = measure(60.0);
+            assert!(
+                outer_60 > 10 && outer_60 < outer_10,
+                "outer rim CA at high blur must soften gently without vanishing: outer_10={outer_10}, outer_60={outer_60}"
+            );
+            assert!(
+                inner_60 < outer_60 && inner_60 < inner_10,
+                "inward rim CA at high blur must blur further than outer rim and low blur: inner_10={inner_10}, outer_60={outer_60}, inner_60={inner_60}"
             );
         }
     }

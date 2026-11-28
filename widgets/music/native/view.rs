@@ -6,6 +6,7 @@ pub enum Action {
     Browse,
     SignIn,
     Library,
+    PopOut,
     Close,
     Settings,
     Queue,
@@ -14,6 +15,13 @@ pub enum Action {
     Next,
     Seek,
     Track(String),
+}
+pub(super) fn popout_button_rect(w: f32, signed_in: bool) -> Option<[f32; 4]> {
+    if signed_in || w >= 200. {
+        Some([w - 120., 12., w - 88., 44.])
+    } else {
+        None
+    }
 }
 pub struct Button {
     pub rect: [f32; 4],
@@ -58,7 +66,7 @@ fn tiny_layout(w: f32, h: f32) -> TinyLayout {
             art: if horizontal {
                 [18., y, 54., y + 36.]
             } else {
-                [18., 14., 50., 46.]
+                [18., 14., 46., 42.]
             },
             title: [if horizontal { 66. } else { 18. }, y, w - 66., y + 22.],
             artist: [
@@ -319,6 +327,74 @@ impl State {
         }
         // Match the visual stacking order: chrome is drawn and hit-tested last,
         // so compact Coverflow cards never intercept Settings/Hide.
+        if let Some(r) = popout_button_rect(w, self.playback.signed_in) {
+            self.buttons.push(Button {
+                rect: r,
+                action: Action::PopOut,
+            });
+            let motion = crate::widget_header::visual(self.hwnd);
+            if motion.alpha >= 0.001 {
+                let hovered = self.hover == Some(Action::PopOut);
+                let pressed = self.pressed == Some(Action::PopOut);
+                let active = self.config.floating;
+                let light = crate::contrast::luminance(self.ink) < 0.5;
+                let strength = if hovered {
+                    1.0_f32
+                } else if active {
+                    0.72
+                } else {
+                    0.0
+                };
+                let c = Canvas::new(dc, self.dpi);
+                if strength > 0.001 {
+                    let pill = [r[0] + 1., r[1] + 1., r[2] - 1., r[3] - 1.];
+                    c.round(
+                        pill,
+                        15.,
+                        0xffffff,
+                        (motion.alpha * strength * if light { 140. } else { 42. }).round() as u8,
+                        false,
+                        false,
+                    );
+                    if strength > 0.01 {
+                        c.round(
+                            pill,
+                            15.,
+                            0xffffff,
+                            (motion.alpha * strength * if light { 64. } else { 48. }).round() as u8,
+                            true,
+                            false,
+                        );
+                    }
+                }
+                if pressed {
+                    c.round(
+                        r,
+                        16.,
+                        self.ink,
+                        (if light { 54. } else { 64. } * motion.alpha).round() as u8,
+                        false,
+                        false,
+                    );
+                }
+                let alpha = (motion.alpha * if active || hovered { 0.92 } else { 0.62 } * 255.)
+                    .round()
+                    .clamp(0., 255.) as u8;
+                self.media_icons.draw(
+                    &c,
+                    self.dpi,
+                    if active {
+                        icons::Kind::PopIn
+                    } else {
+                        icons::Kind::PopOut
+                    },
+                    [r[0] + 16., r[1] + 16.],
+                    16.,
+                    self.ink,
+                    alpha,
+                );
+            }
+        }
         for (action, rect) in widget_header_hits(w) {
             self.buttons.push(Button {
                 rect,
@@ -388,7 +464,7 @@ impl State {
         let right = w - if crate::settings_ui::widget_title_visible(w, h) {
             24.
         } else {
-            96.
+            128.
         };
         if self.config.queue && h < 232. {
             self.compact_queue(c, right + 16., top + 4., 1);
@@ -688,6 +764,9 @@ mod tests {
                 assert!(r[2] > r[0] && r[3] > r[1]);
                 for (_, header) in crate::settings_ui::widget_header_hits(w) {
                     assert!(!overlaps(*r, header), "content/header collision {w}x{h}");
+                }
+                if let Some(popout) = popout_button_rect(w, true) {
+                    assert!(!overlaps(*r, popout), "content/popout collision {w}x{h}");
                 }
                 for other in &boxes[i + 1..] {
                     assert!(!overlaps(*r, *other));

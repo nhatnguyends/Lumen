@@ -863,9 +863,15 @@ impl MusicPlayer {
         })();
 
         if let Err(err) = startup_result {
+            let exit_code = self.child.as_ref().and_then(|c| c.exit_code());
+            crate::logger::warn(
+                "music",
+                format!("music browser pid={pid} startup failed (exit_code={exit_code:?}): {err}"),
+            );
             if let Some(pipe) = self.pipe.take() {
                 pipe.close();
             }
+            self.shutdown_child(500);
             if let Some(mut host) = self.host.take() {
                 host.destroy();
             }
@@ -1055,6 +1061,7 @@ impl MusicPlayer {
         self.save();
 
         let child = Command::new(&found.executable)
+            .env_remove("__COMPAT_LAYER")
             .args(sign_in_arguments(&profile))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

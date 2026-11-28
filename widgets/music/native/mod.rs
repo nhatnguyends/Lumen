@@ -250,6 +250,20 @@ impl State {
             }
         }
     }
+    fn save_floating(&self) {
+        if unsafe {
+            crate::multi_monitor::record_duplicate_floating(
+                self.hwnd,
+                self.dpi,
+                self.config.floating,
+            )
+        } {
+            return;
+        }
+        if !crate::multi_monitor::is_duplicate(self.hwnd) {
+            self.save_local();
+        }
+    }
     fn save(&self) {
         if self.smoke {
             return;
@@ -260,6 +274,7 @@ impl State {
                 shared.position = disk.position;
                 shared.size = disk.size;
                 shared.open = disk.open;
+                shared.floating = disk.floating;
             }
             shared.save(&self.root)
         } else {
@@ -277,7 +292,7 @@ impl State {
         loaded.position = self.config.position;
         loaded.size = self.config.size;
         loaded.open = self.config.open;
-        let floating_changed = loaded.floating != self.config.floating;
+        loaded.floating = self.config.floating;
         let queue_changed = loaded.queue != self.config.queue;
         let design_changed = loaded.design != self.config.design;
         let browser_changed = loaded.browser != self.config.browser;
@@ -302,9 +317,6 @@ impl State {
         self.overlay = None;
         self.frost = None;
         self.card_cache.clear();
-        if floating_changed {
-            PostMessageW(self.hwnd, WM_APP + 82, 0, 0);
-        }
         self.sync_settings();
         if self.settings.is_some() {
             let color = self.surface_color();
@@ -503,6 +515,19 @@ impl State {
                 }
             }
             Action::Settings => self.open_settings(),
+            Action::PopOut => {
+                self.config.floating = !self.config.floating;
+                self.background = None;
+                self.clear_spin_base();
+                self.overlay = None;
+                self.frost = None;
+                self.card_cache.clear();
+                self.window_origin = [i32::MIN, i32::MIN];
+                self.fusion_revision = 0;
+                self.save_floating();
+                self.sync_settings();
+                PostMessageW(self.hwnd, WM_APP + 82, 0, 0);
+            }
             Action::Queue => {
                 self.config.queue = !self.config.queue;
                 self.save();
@@ -555,7 +580,9 @@ impl State {
         InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn bounds(&mut self) {
-        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi)
+            || crate::multi_monitor::is_primary_displaced("music")
+        {
             return;
         }
         let mut r = zeroed();
@@ -566,6 +593,7 @@ impl State {
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
         self.save_local();
+        crate::multi_monitor::record_primary_bounds(self.hwnd, "music", self.dpi);
     }
     unsafe fn poll(&mut self) {
         self.last_poll = Instant::now();
@@ -813,8 +841,9 @@ impl State {
         );
         let _ = write!(
             key,
-            "\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            "\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
             self.config.design,
+            self.config.floating,
             self.config.frosted_glass,
             self.config.opacity.to_bits(),
             self.config.tint.to_bits(),
@@ -1030,6 +1059,24 @@ impl State {
                         frame.retain_control_backing(bg, *rect, *radius, 1.);
                     }
                     crate::settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, width);
+                    if let Some(r) = view::popout_button_rect(width, self.playback.signed_in) {
+                        let motion = crate::widget_header::visual(self.hwnd);
+                        let strength = if self.hover == Some(Action::PopOut) {
+                            1.0
+                        } else if self.config.floating {
+                            0.72
+                        } else {
+                            0.0
+                        };
+                        if motion.alpha * strength > 0.001 {
+                            frame.retain_control_backing(
+                                bg,
+                                [r[0] + 1., r[1] + 1., r[2] - 1., r[3] - 1.],
+                                15.,
+                                motion.alpha * strength,
+                            );
+                        }
+                    }
                 }
             }
             if let (Some(key), Some(disc_r)) = (spin_key, self.spin_disc_rect) {
@@ -1232,6 +1279,9 @@ impl Host {
             let mut s = state.borrow_mut();
             s.hwnd = hwnd;
             s.dpi = live_dpi;
+            if crate::multi_monitor::is_duplicate(hwnd) {
+                s.config.floating = false;
+            }
         }
         if let Some(smtc) = &state.borrow().smtc {
             smtc.set_notify(hwnd, MUSIC_EVENT);
@@ -1257,7 +1307,9 @@ impl Host {
     pub unsafe fn show(&mut self) {
         let (hwnd, floating, inspect) = {
             let mut s = self.state.borrow_mut();
-            if !crate::multi_monitor::is_duplicate(s.hwnd) {
+            if crate::multi_monitor::is_duplicate(s.hwnd) {
+                s.config.floating = crate::multi_monitor::duplicate_floating(s.hwnd);
+            } else {
                 s.config.open = true;
                 s.save_local();
             }
@@ -1266,7 +1318,7 @@ impl Host {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, 91, 250, None);
         self.state.borrow_mut().sync_spin_timer();
-        crate::window::apply_window_mode(hwnd, floating, inspect);
+        crate::window::apply_floating_mode(hwnd, floating, inspect);
         let mut s = self.state.borrow_mut();
         s.poll();
         s.restore_art();
@@ -1312,12 +1364,17 @@ impl Host {
         if let Some(floating) = floating {
             s.config.floating = floating;
         }
-        s.save();
+        if opacity.is_some() {
+            s.save();
+        }
+        if floating.is_some() {
+            s.save_floating();
+        }
         s.sync_settings();
         let (hwnd, inspect) = (s.hwnd, s.inspect);
         drop(s);
         if let Some(floating) = floating {
-            crate::window::apply_window_mode(hwnd, floating, inspect);
+            crate::window::apply_floating_mode(hwnd, floating, inspect);
         }
         if IsWindowVisible(hwnd) != 0 {
             InvalidateRect(hwnd, null(), 0);
@@ -1605,9 +1662,29 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         m if m == WM_APP + 82 => {
+            s.background = None;
+            s.clear_spin_base();
+            s.overlay = None;
+            s.frost = None;
+            s.card_cache.clear();
+            s.window_origin = [i32::MIN, i32::MIN];
+            s.fusion_revision = 0;
             let (floating, inspect) = (s.config.floating, s.inspect);
             drop(s);
-            crate::window::apply_window_mode(hwnd, floating, inspect);
+            crate::window::apply_floating_mode(hwnd, floating, inspect);
+            if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                let dpi = s.dpi;
+                let opacity = (s.config.opacity * 2.55) as u8;
+                crate::widget_interaction::sync_shadow(
+                    hwnd,
+                    s.moving,
+                    s.resizing,
+                    &mut s.shadow,
+                    dpi,
+                    opacity,
+                );
+            }
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_NCHITTEST => {
@@ -1689,6 +1766,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 .rev()
                 .find(|b| view::contains(b.rect, p))
                 .map(|b| b.action.clone());
+            if s.pressed == Some(Action::PopOut)
+                && crate::widget_header::visual(hwnd).alpha < 0.05
+            {
+                s.pressed = None;
+                return 0;
+            }
             if s.pressed == Some(Action::Seek) {
                 s.scrub_to(p[0]);
             }
@@ -2771,12 +2854,34 @@ mod tests {
                                         | Action::Seek
                                         | Action::Library
                                         | Action::Browse
+                                        | Action::PopOut
                                         | Action::Settings
                                         | Action::Close
                                         | Action::SignIn
                                 )),
                                 "small layouts retain media controls but never playlist actions"
                             );
+                        }
+                        if let Some(popout) = s.buttons.iter().find(|b| b.action == Action::PopOut)
+                        {
+                            for other in s.buttons.iter().filter(|b| {
+                                matches!(
+                                    b.action,
+                                    Action::Browse
+                                        | Action::Settings
+                                        | Action::Close
+                                        | Action::SignIn
+                                )
+                            }) {
+                                assert!(
+                                    popout.rect[2] <= other.rect[0]
+                                        || other.rect[2] <= popout.rect[0]
+                                        || popout.rect[3] <= other.rect[1]
+                                        || other.rect[3] <= popout.rect[1],
+                                    "{design} {size:?}: popout/{:?} overlap",
+                                    other.action
+                                );
+                            }
                         }
                         let pixels = b.snapshot();
                         let body =
@@ -3189,6 +3294,256 @@ mod tests {
             drop(host_b);
             drop(host_a);
             SHARED_PLAYBACK.with(|shared| *shared.borrow_mut() = SharedPlayback::default());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn music_popout_floats_topmost_detaches_fusion_and_preserves_theme_and_layout() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _runtime = render::Runtime::start().unwrap();
+            let root = test_root("music-popout-floating");
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            crate::fusion::init(glass.clone());
+            let host = Host::create(&root, glass, false, true).unwrap();
+            let hwnd = host.hwnd();
+            {
+                let mut s = host.state.borrow_mut();
+                s.config.design = "orbit".into();
+                s.config.palette = "gradient:dusk".into();
+                s.config.tint = 42.;
+                s.config.opacity = 85.;
+                s.dpi = 1.;
+            }
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                -19600,
+                -20000,
+                320,
+                260,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            crate::fusion::register_widget(hwnd);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            crate::fusion::prepare(hwnd, 34.);
+
+            let neighbor = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                wide("STATIC").as_ptr(),
+                wide("Music popout neighbor").as_ptr(),
+                WS_POPUP,
+                -19600 - 200 + 8,
+                -20000,
+                200,
+                260,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!neighbor.is_null());
+            crate::fusion::register_widget(neighbor);
+            ShowWindow(neighbor, SW_SHOWNOACTIVATE);
+            crate::fusion::prepare(neighbor, 30.);
+            crate::fusion::refresh();
+            assert!(crate::fusion::fused(hwnd));
+            assert!(crate::fusion::fused(neighbor));
+
+            let mut before_rect: RECT = zeroed();
+            GetWindowRect(hwnd, &mut before_rect);
+
+            host.state.borrow_mut().activate(Action::PopOut, 0.);
+            SendMessageW(hwnd, WM_APP + 82, 0, 0);
+
+            {
+                let s = host.state.borrow();
+                assert!(s.config.floating);
+                assert_eq!(s.config.design, "orbit");
+                assert_eq!(s.config.palette, "gradient:dusk");
+                assert_eq!(s.config.tint, 42.);
+                assert_eq!(s.config.opacity, 85.);
+            }
+            let mut after_rect: RECT = zeroed();
+            GetWindowRect(hwnd, &mut after_rect);
+            assert_eq!(
+                [after_rect.left, after_rect.top, after_rect.right, after_rect.bottom],
+                [before_rect.left, before_rect.top, before_rect.right, before_rect.bottom]
+            );
+            assert_ne!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0,
+                "popped out music widget must float topmost"
+            );
+            assert!(!crate::desktop_layer::contains(hwnd));
+            assert!(crate::fusion::is_excluded(hwnd));
+            assert!(!crate::fusion::fused(hwnd));
+            assert!(!crate::fusion::fused(neighbor));
+
+            host.state.borrow_mut().activate(Action::PopOut, 0.);
+            SendMessageW(hwnd, WM_APP + 82, 0, 0);
+
+            assert!(!host.state.borrow().config.floating);
+            assert_eq!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0,
+                "docked music widget must clear WS_EX_TOPMOST"
+            );
+            assert!(crate::desktop_layer::contains(hwnd));
+            assert!(!crate::fusion::is_excluded(hwnd));
+            assert!(crate::fusion::fused(hwnd));
+            assert!(crate::fusion::fused(neighbor));
+
+            DestroyWindow(neighbor);
+            drop(host);
+            crate::fusion::shutdown();
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn music_popout_only_affects_clicked_instance_across_duplicates() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _runtime = render::Runtime::start().unwrap();
+            let root = test_root("music-popout-multi-monitor");
+            std::fs::create_dir_all(&root).unwrap();
+            crate::multi_monitor::configure_root(&root, true);
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            crate::fusion::init(glass.clone());
+
+            let mut primary = Host::create(&root, glass.clone(), false, true).unwrap();
+            let primary_hwnd = primary.hwnd();
+            primary.state.borrow_mut().dpi = 1.;
+            crate::multi_monitor::register_widget(primary_hwnd, "music");
+            SetWindowPos(
+                primary_hwnd,
+                null_mut(),
+                -19600,
+                -20000,
+                320,
+                260,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            crate::fusion::register_widget(primary_hwnd);
+
+            let mut dup = {
+                let _guard = crate::multi_monitor::DuplicateCreationGuard::enter();
+                Host::create(&root, glass.clone(), false, true).unwrap()
+            };
+            let dup_hwnd = dup.hwnd();
+            dup.state.borrow_mut().dpi = 1.;
+            crate::multi_monitor::register_duplicate(dup_hwnd, "music", "disp-2");
+            SetWindowPos(
+                dup_hwnd,
+                null_mut(),
+                -16000,
+                -20000,
+                320,
+                260,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            crate::fusion::register_widget(dup_hwnd);
+
+            primary.show();
+            dup.show();
+
+            // 1. Popping out primary keeps duplicate docked.
+            primary.state.borrow_mut().activate(Action::PopOut, 0.);
+            SendMessageW(primary_hwnd, WM_APP + 82, 0, 0);
+            assert!(primary.state.borrow().config.floating);
+            assert_ne!(
+                GetWindowLongPtrW(primary_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert!(crate::fusion::is_excluded(primary_hwnd));
+
+            assert!(!dup.state.borrow().config.floating);
+            assert_eq!(
+                GetWindowLongPtrW(dup_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert!(!crate::fusion::is_excluded(dup_hwnd));
+
+            // 2. Syncing shared settings (palette) from primary preserves duplicate's docked state.
+            {
+                let mut s = primary.state.borrow_mut();
+                s.config.palette = "gradient:dusk".into();
+                s.config.save(&root).unwrap();
+            }
+            dup.state.borrow_mut().reload_from_shared();
+            {
+                let ds = dup.state.borrow();
+                assert_eq!(ds.config.palette, "gradient:dusk");
+                assert!(!ds.config.floating);
+            }
+            assert_eq!(
+                GetWindowLongPtrW(dup_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+
+            // 3. A newly spawned duplicate does not inherit floating=true from primary config on disk.
+            let mut third_dup = {
+                let _guard = crate::multi_monitor::DuplicateCreationGuard::enter();
+                Host::create(&root, glass.clone(), false, true).unwrap()
+            };
+            let third_hwnd = third_dup.hwnd();
+            third_dup.state.borrow_mut().dpi = 1.;
+            crate::multi_monitor::register_duplicate(third_hwnd, "music", "disp-3");
+            SetWindowPos(
+                third_hwnd,
+                null_mut(),
+                -12000,
+                -20000,
+                320,
+                260,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            third_dup.show();
+            assert!(!third_dup.state.borrow().config.floating);
+            assert_eq!(
+                GetWindowLongPtrW(third_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+
+            // 4. Popping out duplicate affects only that duplicate; docking primary leaves duplicate floating.
+            dup.state.borrow_mut().activate(Action::PopOut, 0.);
+            SendMessageW(dup_hwnd, WM_APP + 82, 0, 0);
+            assert!(dup.state.borrow().config.floating);
+            assert!(crate::multi_monitor::duplicate_floating(dup_hwnd));
+            assert_ne!(
+                GetWindowLongPtrW(dup_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert!(crate::fusion::is_excluded(dup_hwnd));
+            assert!(!third_dup.state.borrow().config.floating);
+
+            primary.state.borrow_mut().activate(Action::PopOut, 0.);
+            SendMessageW(primary_hwnd, WM_APP + 82, 0, 0);
+            assert!(!primary.state.borrow().config.floating);
+            assert!(dup.state.borrow().config.floating);
+            assert_ne!(
+                GetWindowLongPtrW(dup_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+
+            dup.state.borrow_mut().activate(Action::PopOut, 0.);
+            SendMessageW(dup_hwnd, WM_APP + 82, 0, 0);
+            assert!(!dup.state.borrow().config.floating);
+            assert!(!crate::multi_monitor::duplicate_floating(dup_hwnd));
+            assert_eq!(
+                GetWindowLongPtrW(dup_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert!(!crate::fusion::is_excluded(dup_hwnd));
+
+            drop(third_dup);
+            drop(dup);
+            drop(primary);
+            crate::multi_monitor::shutdown();
+            crate::fusion::shutdown();
             let _ = std::fs::remove_dir_all(root);
         }
     }

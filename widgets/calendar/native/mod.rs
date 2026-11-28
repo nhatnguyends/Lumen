@@ -532,7 +532,9 @@ impl State {
         InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn bounds(&mut self) {
-        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi)
+            || crate::multi_monitor::is_primary_displaced("calendar")
+        {
             return;
         }
         let mut r: RECT = zeroed();
@@ -543,6 +545,7 @@ impl State {
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
         self.save_local();
+        crate::multi_monitor::record_primary_bounds(self.hwnd, "calendar", self.dpi);
     }
     unsafe fn buttons(&self) -> Vec<Button> {
         let [w, h] = self.size();
@@ -1332,9 +1335,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            if let Ok(mut s) = (*ptr).try_borrow_mut() {
-                s.bounds();
-            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1357,7 +1357,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     s.backdrop = None;
                     s.key.clear();
                 }
-                s.bounds();
                 if let Some(host) = &mut s.settings_host {
                     host.refit();
                 }

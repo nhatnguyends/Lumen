@@ -7,6 +7,7 @@ use std::{
     io::{Read, Write},
     mem::{size_of, zeroed},
     net::{TcpListener, TcpStream},
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
@@ -25,6 +26,8 @@ use windows_sys::Win32::{
 };
 
 const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+const STILL_ACTIVE: u32 = 259;
 const FOPEN: u8 = 0x01;
 const FPIPE: u8 = 0x08;
 const CDP_TIMEOUT: Duration = Duration::from_secs(12);
@@ -39,6 +42,7 @@ extern "system" {
         nSize: u32,
     ) -> i32;
     fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: u32) -> i32;
+    fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut u32) -> i32;
     fn ReadFile(
         hFile: HANDLE,
         lpBuffer: *mut u8,
@@ -215,6 +219,52 @@ pub(crate) fn pack_crt_pipe_fds(fd3_read: isize, fd4_write: isize) -> Vec<u8> {
         buf.extend_from_slice(&slot.to_le_bytes());
     }
     buf
+}
+
+/// Builds a double-NUL-terminated, case-insensitively sorted UTF-16 environment block
+/// while removing `__COMPAT_LAYER` (e.g. Windows `DetectorsAppHealth` injected by Start Menu
+/// shortcuts, which causes Chromium/Edge to exit immediately during startup).
+pub(crate) fn build_sanitized_env_block<I, K, V>(vars: I) -> Vec<u16>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let eq = b'=' as u16;
+    let mut entries: Vec<(Vec<u16>, Vec<u16>, String)> = vars
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let k_os = k.as_ref();
+            let v_os = v.as_ref();
+            if k_os.to_string_lossy().eq_ignore_ascii_case("__COMPAT_LAYER") {
+                return None;
+            }
+            let key_wide: Vec<u16> = k_os.encode_wide().collect();
+            if key_wide.is_empty() || key_wide.contains(&0) || key_wide.contains(&eq) {
+                return None;
+            }
+            let val_wide: Vec<u16> = v_os.encode_wide().collect();
+            if val_wide.contains(&0) {
+                return None;
+            }
+            let sort_key = k_os.to_string_lossy().to_uppercase();
+            Some((key_wide, val_wide, sort_key))
+        })
+        .collect();
+    entries.sort_by(|a, b| a.2.cmp(&b.2));
+
+    let mut out = Vec::new();
+    for (k, v, _) in entries {
+        out.extend_from_slice(&k);
+        out.push(eq);
+        out.extend_from_slice(&v);
+        out.push(0);
+    }
+    if out.is_empty() {
+        return vec![0, 0];
+    }
+    out.push(0);
+    out
 }
 
 fn quote_win_arg(arg: &OsStr) -> String {
@@ -428,6 +478,16 @@ impl ChildProcess {
 
     pub fn wait_exit(&self, timeout_ms: u32) -> bool {
         unsafe { WaitForSingleObject(self.process.0, timeout_ms) == WAIT_OBJECT_0 }
+    }
+
+    pub fn exit_code(&self) -> Option<u32> {
+        let mut code = 0u32;
+        let ok = unsafe { GetExitCodeProcess(self.process.0, &mut code) };
+        if ok != 0 && code != STILL_ACTIVE {
+            Some(code)
+        } else {
+            None
+        }
     }
 
     pub fn terminate(&mut self) {
@@ -678,6 +738,7 @@ pub fn spawn_with_cdp_pipe(exe: &Path, args: &[String]) -> Result<(ChildProcess,
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
     let exe_w = crate::model::wide(exe);
     let mut cmd_w = build_command_line(exe, args);
+    let env_block = build_sanitized_env_block(std::env::vars_os());
 
     let ok = unsafe {
         CreateProcessW(
@@ -686,8 +747,8 @@ pub fn spawn_with_cdp_pipe(exe: &Path, args: &[String]) -> Result<(ChildProcess,
             null(),
             null(),
             1,
-            0,
-            null(),
+            CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_ptr().cast(),
             null(),
             &si,
             &mut pi,
@@ -792,5 +853,23 @@ mod tests {
         assert_eq!(browser_label("auto"), "Auto");
         assert_eq!(browser_label("brave"), "Brave");
         assert_eq!(browser_label("opera_gx"), "Opera GX");
+    }
+
+    #[test]
+    fn sanitized_env_block_strips_compat_layer_and_sorts_entries() {
+        let block = build_sanitized_env_block([
+            ("c", "3"),
+            ("__COMPAT_LAYER", "DetectorsAppHealth"),
+            ("a", "1"),
+            ("__compat_layer", "Lowercase"),
+            ("B", "2"),
+        ]);
+        assert!(block.ends_with(&[0, 0]));
+        let text = String::from_utf16(&block[..block.len() - 2]).unwrap();
+        let parts: Vec<&str> = text.split('\0').collect();
+        assert_eq!(parts, vec!["a=1", "B=2", "c=3"]);
+
+        let empty = build_sanitized_env_block(std::iter::empty::<(&str, &str)>());
+        assert_eq!(empty, vec![0, 0]);
     }
 }

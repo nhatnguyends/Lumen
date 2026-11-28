@@ -1,7 +1,7 @@
 //! Manages independent per-monitor duplicate widget instances, native-DPI
 //! placement/clamping, and per-display layout persistence.
 use crate::displays::{self, DisplayInfo};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -20,6 +20,7 @@ pub const SYNC_MESSAGE: u32 = WM_APP + 23;
 pub const WIDGET_SYNC_MESSAGE: u32 = WM_APP + 230;
 pub const HIDE_WIDGET_MESSAGE: u32 = WM_APP + 231;
 const LAYOUT_FILE: &str = "multi-monitor-layout.json";
+const PRIMARY_LAYOUT_FILE: &str = "primary-monitor-layout.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,9 +29,25 @@ pub struct SavedRect {
     pub y: i32,
     pub w_dip: i32,
     pub h_dip: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_y: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpi_x100: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floating: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimaryHome {
+    pub display_id: String,
+    pub rect: SavedRect,
 }
 
 type LayoutStore = HashMap<String, HashMap<String, SavedRect>>;
+type PrimaryLayoutStore = HashMap<String, PrimaryHome>;
 
 #[derive(Clone)]
 struct DuplicateMeta {
@@ -46,7 +63,9 @@ struct State {
     root: Option<PathBuf>,
     smoke: bool,
     host_hwnd: usize,
+    creating_duplicate: u32,
     layout: LayoutStore,
+    primary_layout: PrimaryLayoutStore,
     duplicates: HashMap<usize, DuplicateMeta>,
     instances: HashMap<usize, String>,
     pending_hides: Vec<String>,
@@ -56,32 +75,29 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 
-fn load_layout(root: &Path) -> LayoutStore {
-    let path = root.join("config").join(LAYOUT_FILE);
+fn load_json_store<T: DeserializeOwned + Default>(root: &Path, file: &str) -> T {
+    let path = root.join("config").join(file);
     match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            crate::logger::warn(
-                "multi-monitor",
-                format!("ignoring corrupt {LAYOUT_FILE}: {e}"),
-            );
-            HashMap::new()
+            crate::logger::warn("multi-monitor", format!("ignoring corrupt {file}: {e}"));
+            T::default()
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
         Err(e) => {
-            crate::logger::warn("multi-monitor", format!("failed reading {LAYOUT_FILE}: {e}"));
-            HashMap::new()
+            crate::logger::warn("multi-monitor", format!("failed reading {file}: {e}"));
+            T::default()
         }
     }
 }
 
-fn save_layout(root: &Path, layout: &LayoutStore) -> Result<(), String> {
+fn save_json_store<T: Serialize>(root: &Path, file: &str, data: &T) -> Result<(), String> {
     let dir = root.join("config");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let temp = dir.join(format!("{LAYOUT_FILE}.tmp"));
-    let dest = dir.join(LAYOUT_FILE);
+    let temp = dir.join(format!("{file}.tmp"));
+    let dest = dir.join(file);
     std::fs::write(
         &temp,
-        serde_json::to_vec_pretty(layout).map_err(|e| e.to_string())?,
+        serde_json::to_vec_pretty(data).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     unsafe {
@@ -166,17 +182,105 @@ unsafe fn monitor_bounds(hwnd: HWND) -> Option<([i32; 4], [i32; 4])> {
     ))
 }
 
-pub fn configure_root(root: &Path, smoke: bool) {
-    let layout = if smoke {
-        HashMap::new()
+pub fn resolve_saved_rect(
+    saved: SavedRect,
+    dst_work: [i32; 4],
+    dst_dpi: f32,
+    min_dip: [i32; 2],
+    legacy_origin: Option<[i32; 2]>,
+) -> [i32; 4] {
+    let dst_dpi = dst_dpi.max(1.0);
+    let min_w_dip = min_dip[0].max(1);
+    let min_h_dip = min_dip[1].max(1);
+    let w = (saved.w_dip.max(min_w_dip) as f32 * dst_dpi).round() as i32;
+    let h = (saved.h_dip.max(min_h_dip) as f32 * dst_dpi).round() as i32;
+    let min_px = [
+        (min_w_dip as f32 * dst_dpi).round() as i32,
+        (min_h_dip as f32 * dst_dpi).round() as i32,
+    ];
+    let (x, y) = if let (Some(rx), Some(ry)) = (saved.rel_x, saved.rel_y) {
+        let (sx, sy) = match saved.dpi_x100 {
+            Some(d) if d > 0 => {
+                let saved_dpi = d as f32 / 100.0;
+                if (dst_dpi - saved_dpi).abs() > 0.005 {
+                    let scale = dst_dpi / saved_dpi;
+                    (
+                        (rx as f32 * scale).round() as i32,
+                        (ry as f32 * scale).round() as i32,
+                    )
+                } else {
+                    (rx, ry)
+                }
+            }
+            _ => (rx, ry),
+        };
+        (dst_work[0] + sx, dst_work[1] + sy)
+    } else if saved.x >= dst_work[0]
+        && saved.x < dst_work[2]
+        && saved.y >= dst_work[1]
+        && saved.y < dst_work[3]
+    {
+        (saved.x, saved.y)
+    } else if let Some([ox, oy]) = legacy_origin {
+        (dst_work[0] + (saved.x - ox), dst_work[1] + (saved.y - oy))
     } else {
-        load_layout(root)
+        (saved.x, saved.y)
+    };
+    crate::geometry::clamp_rect_to_work([x, y, x + w, y + h], dst_work, min_px)
+}
+
+fn make_saved_rect(r: RECT, work: [i32; 4], dpi: f32) -> SavedRect {
+    let dpi = dpi.max(1.0);
+    SavedRect {
+        x: r.left,
+        y: r.top,
+        w_dip: ((r.right - r.left).max(1) as f32 / dpi).round() as i32,
+        h_dip: ((r.bottom - r.top).max(1) as f32 / dpi).round() as i32,
+        rel_x: Some(r.left - work[0]),
+        rel_y: Some(r.top - work[1]),
+        dpi_x100: Some((dpi * 100.0).round() as u32),
+        floating: None,
+    }
+}
+
+fn find_display_for_bounds<'a>(
+    displays: &'a [DisplayInfo],
+    mon_bounds: [i32; 4],
+) -> Option<&'a DisplayInfo> {
+    displays
+        .iter()
+        .find(|d| d.enabled && d.bounds == Some(mon_bounds) && d.work.is_some())
+}
+
+unsafe fn ensure_displays_loaded() {
+    let need = STATE.with(|s| s.try_borrow().map_or(false, |s| s.displays.is_empty()));
+    if need {
+        let enumerated = displays::enumerate();
+        STATE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                if s.displays.is_empty() {
+                    s.displays = enumerated;
+                }
+            }
+        });
+    }
+}
+
+pub fn configure_root(root: &Path, smoke: bool) {
+    let (layout, primary_layout) = if smoke {
+        (HashMap::new(), HashMap::new())
+    } else {
+        (
+            load_json_store(root, LAYOUT_FILE),
+            load_json_store(root, PRIMARY_LAYOUT_FILE),
+        )
     };
     STATE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
             s.root = Some(root.to_path_buf());
             s.smoke = smoke;
             s.layout = layout;
+            s.primary_layout = primary_layout;
         }
     });
 }
@@ -222,13 +326,17 @@ pub unsafe fn configure(enabled: bool, selected_ids: Vec<String>) {
     request_sync();
 }
 
-pub unsafe fn refresh_displays() {
+pub unsafe fn refresh_displays_now() {
     let enumerated = displays::enumerate();
     STATE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
             s.displays = enumerated;
         }
     });
+}
+
+pub unsafe fn refresh_displays() {
+    refresh_displays_now();
     request_sync();
 }
 
@@ -358,13 +466,37 @@ pub unsafe fn notify_peers(widget_id: &str, source_hwnd: HWND) {
     notify_peers_with_message(widget_id, source_hwnd, WIDGET_SYNC_MESSAGE);
 }
 
+pub struct DuplicateCreationGuard;
+
+impl DuplicateCreationGuard {
+    pub fn enter() -> Self {
+        STATE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.creating_duplicate = s.creating_duplicate.saturating_add(1);
+            }
+        });
+        Self
+    }
+}
+
+impl Drop for DuplicateCreationGuard {
+    fn drop(&mut self) {
+        STATE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.creating_duplicate = s.creating_duplicate.saturating_sub(1);
+            }
+        });
+    }
+}
+
 pub fn is_duplicate(hwnd: HWND) -> bool {
     if hwnd.is_null() {
         return false;
     }
     STATE.with(|s| {
-        s.try_borrow()
-            .map_or(false, |s| s.duplicates.contains_key(&(hwnd as usize)))
+        s.try_borrow().map_or(false, |s| {
+            s.creating_duplicate > 0 || s.duplicates.contains_key(&(hwnd as usize))
+        })
     })
 }
 
@@ -372,11 +504,20 @@ pub unsafe fn record_duplicate_bounds(hwnd: HWND, dpi: f32) -> bool {
     if hwnd.is_null() {
         return false;
     }
-    let meta = STATE.with(|s| {
+    let (creating, meta) = STATE.with(|s| {
         s.try_borrow()
             .ok()
-            .and_then(|s| s.duplicates.get(&(hwnd as usize)).cloned())
+            .map(|s| {
+                (
+                    s.creating_duplicate > 0,
+                    s.duplicates.get(&(hwnd as usize)).cloned(),
+                )
+            })
+            .unwrap_or((false, None))
     });
+    if creating {
+        return true;
+    }
     let Some(meta) = meta else {
         return false;
     };
@@ -384,22 +525,125 @@ pub unsafe fn record_duplicate_bounds(hwnd: HWND, dpi: f32) -> bool {
     if GetWindowRect(hwnd, &mut r) == 0 {
         return true;
     }
-    let dpi = dpi.max(1.0);
-    let saved = SavedRect {
-        x: r.left,
-        y: r.top,
-        w_dip: ((r.right - r.left).max(1) as f32 / dpi).round() as i32,
-        h_dip: ((r.bottom - r.top).max(1) as f32 / dpi).round() as i32,
+    let Some((cur_mon, _)) = monitor_bounds(hwnd) else {
+        return true;
     };
+    ensure_displays_loaded();
     STATE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
+            let assigned_work = s
+                .displays
+                .iter()
+                .find(|d| d.id == meta.display_id && d.enabled && d.bounds == Some(cur_mon))
+                .and_then(|d| d.work);
+            let Some(work) = assigned_work else {
+                return;
+            };
+            let mut saved = make_saved_rect(r, work, dpi);
+            saved.floating = s
+                .layout
+                .get(&meta.display_id)
+                .and_then(|m| m.get(&meta.widget_id))
+                .and_then(|prev| prev.floating);
             s.layout
                 .entry(meta.display_id)
                 .or_default()
                 .insert(meta.widget_id, saved);
             if !s.smoke {
                 if let Some(root) = &s.root {
-                    if let Err(e) = save_layout(root, &s.layout) {
+                    if let Err(e) = save_json_store(root, LAYOUT_FILE, &s.layout) {
+                        crate::logger::warn("multi-monitor", format!("failed saving layout: {e}"));
+                    }
+                }
+            }
+        }
+    });
+    true
+}
+
+pub fn duplicate_floating(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .and_then(|s| {
+                let meta = s.duplicates.get(&(hwnd as usize))?;
+                s.layout
+                    .get(&meta.display_id)?
+                    .get(&meta.widget_id)?
+                    .floating
+            })
+            .unwrap_or(false)
+    })
+}
+
+pub unsafe fn record_duplicate_floating(hwnd: HWND, dpi: f32, floating: bool) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    let (creating, meta) = STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .map(|s| {
+                (
+                    s.creating_duplicate > 0,
+                    s.duplicates.get(&(hwnd as usize)).cloned(),
+                )
+            })
+            .unwrap_or((false, None))
+    });
+    if creating {
+        return true;
+    }
+    let Some(meta) = meta else {
+        return false;
+    };
+    let has_entry = STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .and_then(|s| s.layout.get(&meta.display_id)?.get(&meta.widget_id).copied())
+            .is_some()
+    });
+    let mut rect: RECT = zeroed();
+    let mon_bounds = if !has_entry {
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            None
+        } else {
+            ensure_displays_loaded();
+            monitor_bounds(hwnd)
+        }
+    } else {
+        None
+    };
+    STATE.with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            if let Some(entry) = s
+                .layout
+                .get_mut(&meta.display_id)
+                .and_then(|m| m.get_mut(&meta.widget_id))
+            {
+                entry.floating = Some(floating);
+            } else if let Some((cur_mon, mon_work)) = mon_bounds {
+                let work = s
+                    .displays
+                    .iter()
+                    .find(|d| d.id == meta.display_id && d.enabled && d.bounds == Some(cur_mon))
+                    .and_then(|d| d.work)
+                    .unwrap_or(mon_work);
+                let mut saved = make_saved_rect(rect, work, dpi);
+                saved.floating = Some(floating);
+                s.layout
+                    .entry(meta.display_id)
+                    .or_default()
+                    .insert(meta.widget_id, saved);
+            } else {
+                return;
+            }
+            if !s.smoke {
+                if let Some(root) = &s.root {
+                    if let Err(e) = save_json_store(root, LAYOUT_FILE, &s.layout) {
                         crate::logger::warn("multi-monitor", format!("failed saving layout: {e}"));
                     }
                 }
@@ -431,12 +675,12 @@ pub unsafe fn compute_duplicate_rect(
         (min_dip[1].max(1) as f32 * dst_dpi).round() as i32,
     ];
     if let Some(saved) = saved {
-        let w = (saved.w_dip.max(min_dip[0]) as f32 * dst_dpi).round() as i32;
-        let h = (saved.h_dip.max(min_dip[1]) as f32 * dst_dpi).round() as i32;
-        return crate::geometry::clamp_rect_to_work(
-            [saved.x, saved.y, saved.x + w, saved.y + h],
+        return resolve_saved_rect(
+            saved,
             dst_work,
-            min_px,
+            dst_dpi,
+            min_dip,
+            displays::saved_entry(display_id).map(|e| [e.x, e.y]),
         );
     }
     let mut r: RECT = zeroed();
@@ -457,6 +701,21 @@ pub unsafe fn compute_duplicate_rect(
     map_rect_native_dpi(src_rect, src_work, src_dpi, dst_work, dst_dpi, min_dip)
 }
 
+unsafe fn set_window_rect(hwnd: HWND, r: [i32; 4]) -> bool {
+    let mut cur: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut cur) != 0 && [cur.left, cur.top, cur.right, cur.bottom] == r {
+        return false;
+    }
+    let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+    SetWindowPos(hwnd, null_mut(), r[0], r[1], (r[2] - r[0]).max(1), (r[3] - r[1]).max(1), flags);
+    // A cross-DPI move triggers WM_DPICHANGED synchronously, which may shift the
+    // window to Windows's suggested rect; re-apply once on the target monitor.
+    if GetWindowRect(hwnd, &mut cur) != 0 && [cur.left, cur.top, cur.right, cur.bottom] != r {
+        SetWindowPos(hwnd, null_mut(), r[0], r[1], (r[2] - r[0]).max(1), (r[3] - r[1]).max(1), flags);
+    }
+    true
+}
+
 pub unsafe fn place_duplicate_window(
     hwnd: HWND,
     widget_id: &str,
@@ -465,32 +724,138 @@ pub unsafe fn place_duplicate_window(
     dst_work: [i32; 4],
     dst_dpi: f32,
     min_dip: [i32; 2],
+    force_notify: bool,
 ) {
     if hwnd.is_null() || IsWindow(hwnd) == 0 {
         return;
     }
     let r = compute_duplicate_rect(widget_id, display_id, src_hwnd, dst_work, dst_dpi, min_dip);
-    SetWindowPos(
-        hwnd,
-        null_mut(),
-        r[0],
-        r[1],
-        (r[2] - r[0]).max(1),
-        (r[3] - r[1]).max(1),
-        SWP_NOZORDER | SWP_NOACTIVATE,
+    let moved = set_window_rect(hwnd, r);
+    if moved || force_notify {
+        SendMessageW(hwnd, WM_DISPLAYCHANGE, 0, 0);
+    }
+}
+
+pub unsafe fn record_primary_bounds(hwnd: HWND, widget_id: &str, dpi: f32) {
+    if hwnd.is_null() || is_duplicate(hwnd) {
+        return;
+    }
+    let mut r: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut r) == 0 || r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
+    let Some((cur_mon, _)) = monitor_bounds(hwnd) else {
+        return;
+    };
+    ensure_displays_loaded();
+    STATE.with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            if let Some(existing) = s.primary_layout.get(widget_id) {
+                if !s.displays.is_empty()
+                    && !s
+                        .displays
+                        .iter()
+                        .any(|d| d.id == existing.display_id && d.enabled && d.work.is_some())
+                {
+                    return;
+                }
+            }
+            let Some(disp) = find_display_for_bounds(&s.displays, cur_mon) else {
+                return;
+            };
+            let Some(work) = disp.work else {
+                return;
+            };
+            let home = PrimaryHome {
+                display_id: disp.id.clone(),
+                rect: make_saved_rect(r, work, dpi),
+            };
+            s.primary_layout.insert(widget_id.to_owned(), home);
+            if !s.smoke {
+                if let Some(root) = &s.root {
+                    if let Err(e) = save_json_store(root, PRIMARY_LAYOUT_FILE, &s.primary_layout) {
+                        crate::logger::warn(
+                            "multi-monitor",
+                            format!("failed saving primary layout: {e}"),
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+pub fn is_primary_displaced(widget_id: &str) -> bool {
+    STATE.with(|s| {
+        s.try_borrow().map_or(false, |s| {
+            if s.displays.is_empty() {
+                return false;
+            }
+            let Some(home) = s.primary_layout.get(widget_id) else {
+                return false;
+            };
+            !s.displays
+                .iter()
+                .any(|d| d.id == home.display_id && d.enabled && d.work.is_some())
+        })
+    })
+}
+
+pub unsafe fn restore_primary_window(hwnd: HWND, widget_id: &str, min_dip: [i32; 2]) -> bool {
+    if hwnd.is_null() || IsWindow(hwnd) == 0 || is_duplicate(hwnd) {
+        return false;
+    }
+    ensure_displays_loaded();
+    let cur_mon = monitor_bounds(hwnd).map(|(m, _)| m);
+    let target = STATE.with(|s| {
+        s.try_borrow().ok().and_then(|s| {
+            let home = s.primary_layout.get(widget_id)?;
+            if let Some(home_disp) = s
+                .displays
+                .iter()
+                .find(|d| d.id == home.display_id && d.enabled && d.work.is_some())
+            {
+                let work = home_disp.work?;
+                return Some((home_disp.id.clone(), home.rect, work));
+            }
+            let cur_mon = cur_mon?;
+            let cur_disp = find_display_for_bounds(&s.displays, cur_mon)?;
+            let work = cur_disp.work?;
+            let saved = s.layout.get(&cur_disp.id)?.get(widget_id).copied()?;
+            Some((cur_disp.id.clone(), saved, work))
+        })
+    });
+    let Some((target_id, saved, work)) = target else {
+        return false;
+    };
+    let r = resolve_saved_rect(
+        saved,
+        work,
+        display_dpi(work),
+        min_dip,
+        displays::saved_entry(&target_id).map(|e| [e.x, e.y]),
     );
-    SendMessageW(hwnd, WM_DISPLAYCHANGE, 0, 0);
+    set_window_rect(hwnd, r)
 }
 
 pub unsafe fn register_widget(hwnd: HWND, widget_id: &str) {
     if hwnd.is_null() {
         return;
     }
-    STATE.with(|s| {
+    let need_seed = STATE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
             s.instances.insert(hwnd as usize, widget_id.to_owned());
+            !s.primary_layout.contains_key(widget_id)
+        } else {
+            false
         }
     });
+    if need_seed {
+        let mut r: RECT = zeroed();
+        if GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left && r.bottom > r.top {
+            record_primary_bounds(hwnd, widget_id, crate::geometry::window_dpi(hwnd));
+        }
+    }
 }
 
 pub unsafe fn request_hide_widget(widget_id: &str) {
@@ -628,7 +993,7 @@ mod tests {
 
         let corrupt = root.join("config").join(LAYOUT_FILE);
         std::fs::write(&corrupt, "{not-valid-json").unwrap();
-        assert!(load_layout(&root).is_empty());
+        assert!(load_json_store::<LayoutStore>(&root, LAYOUT_FILE).is_empty());
 
         let mut store: LayoutStore = HashMap::new();
         store.entry("disp-2".into()).or_default().insert(
@@ -638,13 +1003,99 @@ mod tests {
                 y: 120,
                 w_dip: 260,
                 h_dip: 140,
+                rel_x: Some(120),
+                rel_y: Some(120),
+                dpi_x100: Some(150),
+                floating: Some(true),
             },
         );
-        save_layout(&root, &store).unwrap();
-        let loaded = load_layout(&root);
+        save_json_store(&root, LAYOUT_FILE, &store).unwrap();
+        let loaded: LayoutStore = load_json_store(&root, LAYOUT_FILE);
         assert_eq!(loaded, store);
 
+        let corrupt_primary = root.join("config").join(PRIMARY_LAYOUT_FILE);
+        std::fs::write(&corrupt_primary, "{bad-json").unwrap();
+        assert!(load_json_store::<PrimaryLayoutStore>(&root, PRIMARY_LAYOUT_FILE).is_empty());
+
+        let mut primary: PrimaryLayoutStore = HashMap::new();
+        primary.insert(
+            "notes".into(),
+            PrimaryHome {
+                display_id: "disp-1".into(),
+                rect: SavedRect {
+                    x: 100,
+                    y: 80,
+                    w_dip: 440,
+                    h_dip: 420,
+                    rel_x: Some(100),
+                    rel_y: Some(80),
+                    dpi_x100: Some(150),
+                    floating: None,
+                },
+            },
+        );
+        save_json_store(&root, PRIMARY_LAYOUT_FILE, &primary).unwrap();
+        let loaded_primary: PrimaryLayoutStore = load_json_store(&root, PRIMARY_LAYOUT_FILE);
+        assert_eq!(loaded_primary, primary);
+
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_saved_rect_preserves_monitor_relative_position_on_origin_shift_and_dpi_change() {
+        let saved = SavedRect {
+            x: -3041,
+            y: 1099,
+            w_dip: 312,
+            h_dip: 161,
+            rel_x: Some(799),
+            rel_y: Some(1099),
+            dpi_x100: Some(150),
+            floating: None,
+        };
+        // Origin shifted from [-3840, 0] to [0, 0] at same 150% DPI.
+        let shifted = resolve_saved_rect(saved, [0, 0, 3840, 2112], 1.5, [110, 80], None);
+        assert_eq!(shifted, [799, 1099, 799 + 468, 1099 + 242]);
+
+        // DPI changed from 150% to 100%.
+        let rescaled = resolve_saved_rect(saved, [0, 0, 1920, 1040], 1.0, [110, 80], None);
+        assert_eq!(rescaled[2] - rescaled[0], 312);
+        assert_eq!(rescaled[3] - rescaled[1], 161);
+        assert_eq!(rescaled[0], (799.0_f32 / 1.5).round() as i32);
+        assert_eq!(rescaled[1], (1099.0_f32 / 1.5).round() as i32);
+    }
+
+    #[test]
+    fn resolve_saved_rect_recovers_legacy_coords_using_origin_when_offscreen() {
+        let legacy = SavedRect {
+            x: -3041,
+            y: 1099,
+            w_dip: 312,
+            h_dip: 161,
+            rel_x: None,
+            rel_y: None,
+            dpi_x100: None,
+            floating: None,
+        };
+        // Legacy origin was [-3840, 0], monitor moved to [0, 0].
+        let recovered =
+            resolve_saved_rect(legacy, [0, 0, 3840, 2112], 1.5, [110, 80], Some([-3840, 0]));
+        assert_eq!(recovered, [799, 1099, 799 + 468, 1099 + 242]);
+
+        // Legacy coords still inside dst_work keep exact coordinates.
+        let in_place = SavedRect {
+            x: 2040,
+            y: 120,
+            w_dip: 260,
+            h_dip: 140,
+            rel_x: None,
+            rel_y: None,
+            dpi_x100: None,
+            floating: None,
+        };
+        let kept =
+            resolve_saved_rect(in_place, [1920, 0, 3840, 1040], 1.0, [110, 80], Some([0, 0]));
+        assert_eq!(kept, [2040, 120, 2040 + 260, 120 + 140]);
     }
 
     #[test]

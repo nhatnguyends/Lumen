@@ -484,7 +484,9 @@ impl State {
         InvalidateRect(self.hwnd, null(), 0);
     }
     unsafe fn bounds(&mut self) {
-        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi)
+            || crate::multi_monitor::is_primary_displaced("controls")
+        {
             return;
         }
         let mut r: RECT = zeroed();
@@ -495,6 +497,7 @@ impl State {
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
         self.save_local();
+        crate::multi_monitor::record_primary_bounds(self.hwnd, "controls", self.dpi);
     }
     fn read(&mut self) {
         if !self.pending {
@@ -4134,7 +4137,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             if let Ok(mut s) = (*ptr).try_borrow_mut() {
-                s.bounds();
                 if let Some(host) = &mut s.settings {
                     host.refit();
                 }
@@ -4162,7 +4164,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     s.backdrop = None;
                     s.key.clear();
                 }
-                s.bounds();
                 if let Some(host) = &mut s.settings {
                     host.refit();
                 }

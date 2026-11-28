@@ -296,6 +296,7 @@ pub struct FusionBridgeConstants {
     pub fuse_corner_c: [[f32; 4]; 32],  // cx, cy, radius, +1 convex / -1 concave
     pub fuse_corner_uv: [[f32; 4]; 32], // -v.x, -v.y, u.x, u.y
     pub field_uv: [f32; 4],             // [tex_w, tex_h, step_px, active]
+    pub blur_params: [f32; 4],          // [blur_px, 0.0, 0.0, 0.0]
 }
 
 impl Default for FusionBridgeConstants {
@@ -314,6 +315,7 @@ impl Default for FusionBridgeConstants {
             fuse_corner_c: [[0.0; 4]; 32],
             fuse_corner_uv: [[0.0; 4]; 32],
             field_uv: [0.0; 4],
+            blur_params: [0.0; 4],
         }
     }
 }
@@ -366,6 +368,7 @@ cbuffer FusionBridgeCB : register(b2) {
     float4 fb_fuse_corner_c[32];
     float4 fb_fuse_corner_uv[32];
     float4 fb_field_uv;
+    float4 fb_blur_params;
 };
 
 Texture2D sharp_tex : register(t0);
@@ -803,9 +806,14 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
                     wall = blur_col;
                 }
 
-                if (u < 0.88) {
-                    float s = saturate(1.0 - u / 0.88);
-                    float clarity = 0.52 * s * s * s * (s * (s * 6.0 - 15.0) + 10.0);
+                float bt_raw = saturate((fb_blur_params.x - 10.0) / 70.0);
+                float blur_t = bt_raw * (2.0 - bt_raw);
+                float clarity_reach = 0.88 - 0.48 * blur_t;
+                if (u < clarity_reach) {
+                    float s = saturate(1.0 - u / clarity_reach);
+                    float f = s * s * s * (s * (s * 6.0 - 15.0) + 10.0);
+                    float f_eff = f * (1.0 + blur_t * (f * f - 1.0));
+                    float clarity = 0.52 * (1.0 - 0.72 * blur_t) * f_eff;
                     float ca_s = ca * 0.55;
                     float3 sharp_col;
                     sharp_col.r = fb_sample_ca_channel(sharp_tex, screen_uv, n, desk_size, disp, -ca_s, fb_dpi, float3(1.0, 0.0, 0.0));

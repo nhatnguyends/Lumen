@@ -7,6 +7,63 @@ thread_local! {
     static SEARCH_CACHE: RefCell<HashMap<(u32, u32, u8), Vec<u8>>> = RefCell::new(HashMap::new());
 }
 
+pub fn popout(c: &Canvas, x: f32, y: f32, ink: u32, active: bool, hover: f32, hot: bool) {
+    let hover = hover.clamp(0., 1.);
+    if hover <= 0.001 {
+        return;
+    }
+    if hot {
+        c.round(
+            [x - 4., y - 4., x + 20., y + 20.],
+            12.,
+            ink,
+            (26. * hover).round() as u8,
+            false,
+            false,
+        );
+    }
+    let alpha = ((if active || hot { 245. } else { 165. }) * hover)
+        .round()
+        .clamp(0., 255.) as u8;
+    if alpha == 0 {
+        return;
+    }
+    let width = if active { 1.45 } else { 1.25 };
+    if active {
+        c.round(
+            [x + 3.5, y + 4., x + 12., y + 12.5],
+            2.,
+            ink,
+            (65. * hover).round() as u8,
+            false,
+            false,
+        );
+    }
+    c.line(
+        &[
+            (x + 8., y + 3.),
+            (x + 2.5, y + 3.),
+            (x + 2.5, y + 13.5),
+            (x + 13., y + 13.5),
+            (x + 13., y + 8.),
+        ],
+        ink,
+        alpha,
+        width,
+    );
+    c.line(
+        &[(x + 7.5, y + 8.5), (x + 14., y + 2.)],
+        ink,
+        alpha,
+        width,
+    );
+    c.line(
+        &[(x + 9.5, y + 2.), (x + 14., y + 2.), (x + 14., y + 6.5)],
+        ink,
+        alpha,
+        width,
+    );
+}
 pub fn pin(c: &Canvas, x: f32, y: f32, ink: u32, pinned: bool, hover: f32, hot: bool) {
     let hover = hover.clamp(0., 1.);
     if hover <= 0.001 {

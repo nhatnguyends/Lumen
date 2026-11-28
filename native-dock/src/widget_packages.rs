@@ -274,11 +274,24 @@ impl Registry {
             }
         }
     }
+    pub unsafe fn restore_primary_layouts(&self) -> bool {
+        let mut changed = false;
+        for (id, host) in &self.hosts {
+            let hwnd = host.hwnd();
+            if !hwnd.is_null() && IsWindow(hwnd) != 0 && host.visible() {
+                if crate::multi_monitor::restore_primary_window(hwnd, id, min_dip_for(id)) {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
     pub unsafe fn sync_duplicates(
         &mut self,
         glass: Rc<RefCell<Glass>>,
         inspect: bool,
         smoke: bool,
+        reposition_existing: bool,
     ) -> bool {
         if !crate::multi_monitor::is_enabled() {
             if self.duplicates.is_empty() {
@@ -317,7 +330,24 @@ impl Registry {
         let mut changed = self.duplicates.len() != before;
         for (id, disp) in desired {
             let key = (id.clone(), disp.id.clone());
-            if self.duplicates.contains_key(&key) {
+            if let Some(existing) = self.duplicates.get(&key) {
+                if reposition_existing {
+                    if let (Some(src_hwnd), Some(dst_work)) =
+                        (self.hosts.get(&id).map(|h| h.hwnd()), disp.work)
+                    {
+                        let dst_dpi = crate::multi_monitor::display_dpi(dst_work);
+                        crate::multi_monitor::place_duplicate_window(
+                            existing.hwnd(),
+                            &id,
+                            &disp.id,
+                            src_hwnd,
+                            dst_work,
+                            dst_dpi,
+                            min_dip_for(&id),
+                            false,
+                        );
+                    }
+                }
                 continue;
             }
             let Some(def) = self.definitions.get(id.as_str()) else {
@@ -329,7 +359,11 @@ impl Registry {
             let Some(dst_work) = disp.work else {
                 continue;
             };
-            match (def.factory)(&self.root, glass.clone(), inspect, smoke) {
+            let created = {
+                let _guard = crate::multi_monitor::DuplicateCreationGuard::enter();
+                (def.factory)(&self.root, glass.clone(), inspect, smoke)
+            };
+            match created {
                 Ok(mut dup) => {
                     let dup_hwnd = dup.hwnd();
                     crate::multi_monitor::register_duplicate(dup_hwnd, &id, &disp.id);
@@ -343,6 +377,7 @@ impl Registry {
                         dst_work,
                         dst_dpi,
                         min_dip_for(&id),
+                        true,
                     );
                     dup.show();
                     self.duplicates.insert(key, dup);

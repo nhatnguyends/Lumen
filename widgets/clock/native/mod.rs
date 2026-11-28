@@ -322,7 +322,9 @@ impl State {
         }
     }
     unsafe fn save_bounds(&mut self) {
-        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi)
+            || crate::multi_monitor::is_primary_displaced("clock")
+        {
             return;
         }
         let mut r = zeroed();
@@ -333,6 +335,7 @@ impl State {
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
         self.save_local();
+        crate::multi_monitor::record_primary_bounds(self.hwnd, "clock", self.dpi);
     }
     unsafe fn reload_from_shared(&mut self) {
         let Ok(mut loaded) = Config::load(&self.root) else {
@@ -849,7 +852,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     s.background = None;
                     s.key.clear();
                 }
-                s.save_bounds();
             }
             InvalidateRect(hwnd, null(), 0);
             0

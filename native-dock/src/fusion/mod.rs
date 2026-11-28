@@ -6,7 +6,7 @@ use crate::{compositor::Buffer, glass::Glass, model::wide};
 use geometry::{components, snap_move, Pane};
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem::zeroed,
     ptr::{null, null_mut},
     rc::Rc,
@@ -68,6 +68,7 @@ impl Drop for Bridge {
 struct Manager {
     members: HashMap<usize, Member>,
     materials: HashMap<usize, material::Material>,
+    excluded: HashSet<usize>,
     bridges: Vec<Bridge>,
     glass: Rc<RefCell<Glass>>,
     host: HWND,
@@ -227,6 +228,7 @@ pub unsafe fn init(glass: Rc<RefCell<Glass>>) {
         *m.borrow_mut() = Some(Manager {
             members: HashMap::new(),
             materials: HashMap::new(),
+            excluded: HashSet::new(),
             bridges: Vec::new(),
             glass,
             host,
@@ -270,6 +272,52 @@ pub fn set_enabled(value: bool) {
             }
         }
     });
+}
+pub fn is_excluded(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    MANAGER.with(|m| {
+        m.try_borrow()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.excluded.contains(&(hwnd as usize))))
+            .unwrap_or(false)
+    })
+}
+pub unsafe fn set_excluded(hwnd: HWND, excluded: bool) {
+    if hwnd.is_null() {
+        return;
+    }
+    let id = hwnd as usize;
+    let changed = MANAGER.with(|m| {
+        let Ok(mut guard) = m.try_borrow_mut() else {
+            return false;
+        };
+        let Some(s) = guard.as_mut() else {
+            return false;
+        };
+        let was = s.excluded.contains(&id);
+        if was == excluded {
+            return false;
+        }
+        if excluded {
+            s.excluded.insert(id);
+        } else {
+            s.excluded.remove(&id);
+        }
+        s.materials.remove(&id);
+        if s.members.contains_key(&id) {
+            s.update(hwnd, None);
+        }
+        s.revision = s.revision.wrapping_add(1);
+        true
+    });
+    if changed {
+        refresh();
+        if IsWindow(hwnd) != 0 {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
 }
 
 unsafe fn is_widget(hwnd: HWND) -> bool {
@@ -402,13 +450,16 @@ impl Manager {
         let mut ps: Vec<_> = self
             .members
             .values()
-            .filter(|p| p.visible && !p.moving)
+            .filter(|p| p.visible && !p.moving && !self.excluded.contains(&p.pane.id))
             .map(|p| p.pane)
             .collect();
         ps.sort_by_key(|p| p.id);
         ps
     }
     fn group(&self, id: usize) -> Option<Vec<Pane>> {
+        if self.excluded.contains(&id) {
+            return None;
+        }
         let desired = components(&self.panes())
             .into_iter()
             .find(|g| g.len() > 1 && g.iter().any(|p| p.id == id))?;
@@ -435,7 +486,7 @@ impl Manager {
             new.drag = old.drag;
             let changed = old.pane != new.pane || old.visible != new.visible;
             self.members.insert(id, new);
-            if changed && !old.moving {
+            if changed && !old.moving && !self.excluded.contains(&id) {
                 self.materials.remove(&id);
                 self.changed();
             }
@@ -443,7 +494,9 @@ impl Manager {
             self.members
                 .insert(id, read_member(hwnd, radius.unwrap_or(34.)));
             SetWindowSubclass(hwnd, Some(widget_proc), SUBCLASS, 0);
-            self.changed();
+            if !self.excluded.contains(&id) {
+                self.changed();
+            }
         }
     }
     unsafe fn begin_resize(&mut self, hwnd: HWND, cursor: POINT) {
@@ -558,7 +611,7 @@ impl Manager {
             need_changed = true;
         }
         let mut target = drag.raw_rect;
-        if self.enabled {
+        if self.enabled && !self.excluded.contains(&id) {
             let inset = 4. * dpi;
             let candidate = Pane {
                 rect: [
@@ -645,7 +698,7 @@ impl Manager {
         if need_changed {
             self.changed();
         }
-        if !self.enabled {
+        if !self.enabled || self.excluded.contains(&(hwnd as usize)) {
             return true;
         }
         let inset = 4. * dpi;
@@ -1450,6 +1503,7 @@ unsafe extern "system" fn widget_proc(
                     if let Some(s) = x.as_mut() {
                         s.members.remove(&(hwnd as usize));
                         s.materials.remove(&(hwnd as usize));
+                        s.excluded.remove(&(hwnd as usize));
                         s.changed();
                     }
                 }
@@ -1465,6 +1519,7 @@ unsafe extern "system" fn widget_proc(
                     s.update(hwnd, None);
                     if msg == WM_WINDOWPOSCHANGED
                         && (*(lp as *const WINDOWPOS)).flags & SWP_NOZORDER == 0
+                        && !s.excluded.contains(&(hwnd as usize))
                     {
                         s.changed();
                     }
@@ -1598,7 +1653,7 @@ pub(crate) unsafe fn refresh() {
             )) = packed
             {
                 let ref_hwnd = ps[0].id as HWND;
-                let (desk, accent, has_wallpaper) = {
+                let (desk, accent, has_wallpaper, blur_px) = {
                     let glass = s.glass.borrow();
                     let mon_area = glass.monitor_origin_size(ref_hwnd);
                     let fits_monitor = l >= mon_area[0]
@@ -1630,7 +1685,7 @@ pub(crate) unsafe fn refresh() {
                     } else {
                         false
                     };
-                    (target_area, glass.wallpaper_accent_for(ref_hwnd), synced)
+                    (target_area, glass.wallpaper_accent_for(ref_hwnd), synced, glass.blur())
                 };
                 let mut constants = crate::gpu::FusionBridgeConstants {
                     bridge_rect: [l as f32, t as f32, w as f32, h as f32],
@@ -1661,6 +1716,7 @@ pub(crate) unsafe fn refresh() {
                     fuse_lines,
                     fuse_corner_c,
                     fuse_corner_uv,
+                    blur_params: [blur_px, 0.0, 0.0, 0.0],
                     ..Default::default()
                 };
                 for (i, (p, &op)) in ps.iter().zip(&opacities).enumerate() {
@@ -4654,6 +4710,72 @@ mod tests {
             assert!(snap_resize_rect(windows[0], &mut solo_resize, HTRIGHT, min_size));
             assert_eq!(solo_resize.right, solo_anchor.right + 6);
             SendMessageW(windows[0], WM_CAPTURECHANGED, 0, 0);
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+    #[test]
+    fn excluded_widget_detaches_from_fusion_and_reattaches_when_cleared() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            init(Rc::new(RefCell::new(Glass::new(0., 1.))));
+            let mut windows = Vec::new();
+            for x in [-20000, -19808] {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Lumen fusion exclude test").as_ptr(),
+                    WS_POPUP,
+                    x,
+                    -20000,
+                    200,
+                    160,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 34.);
+                windows.push(hwnd);
+            }
+            refresh();
+            assert!(fused(windows[0]));
+            assert!(fused(windows[1]));
+
+            set_excluded(windows[0], true);
+            assert!(is_excluded(windows[0]));
+            assert!(!is_excluded(windows[1]));
+            assert!(!fused(windows[0]));
+            assert!(!fused(windows[1]));
+
+            // Excluded window must not magnetically snap back to neighbor.
+            let near = RECT {
+                left: -19996,
+                top: -20000,
+                right: -19796,
+                bottom: -19840,
+            };
+            let snapped = MANAGER.with(|m| {
+                let mut g = m.borrow_mut();
+                g.as_mut().unwrap().step_drag_move(windows[0], near, None)
+            });
+            assert_eq!(snapped.unwrap().0.left, near.left);
+            MANAGER.with(|m| {
+                if let Some(s) = m.borrow_mut().as_mut() {
+                    s.end_drag(windows[0]);
+                }
+            });
+
+            set_excluded(windows[0], false);
+            assert!(!is_excluded(windows[0]));
+            assert!(fused(windows[0]));
+            assert!(fused(windows[1]));
 
             for hwnd in windows {
                 DestroyWindow(hwnd);

@@ -2674,6 +2674,70 @@ impl WindowShadow {
         self.rect[0] = x;
         self.rect[1] = y;
     }
+    /// Move the owner and its shadow together in a single DWM commit.
+    pub unsafe fn move_with_owner(&mut self, owner: HWND, owner_x: i32, owner_y: i32, dpi: f32) {
+        let pad = (40. * dpi).ceil() as i32;
+        let sx = owner_x - pad;
+        let sy = owner_y - pad;
+        let has_shadow =
+            self.rect[2] > 0 && self.dpi == dpi && IsWindowVisible(self.hwnd) != 0;
+        if has_shadow {
+            let hdwp = BeginDeferWindowPos(2);
+            if !hdwp.is_null() {
+                let hdwp = DeferWindowPos(
+                    hdwp,
+                    owner,
+                    null_mut(),
+                    owner_x,
+                    owner_y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let hdwp = if !hdwp.is_null() {
+                    DeferWindowPos(
+                        hdwp,
+                        self.hwnd,
+                        owner,
+                        sx,
+                        sy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                    )
+                } else {
+                    null_mut()
+                };
+                if !hdwp.is_null() && EndDeferWindowPos(hdwp) != 0 {
+                    self.rect[0] = sx;
+                    self.rect[1] = sy;
+                    return;
+                }
+            }
+        }
+        SetWindowPos(
+            owner,
+            null_mut(),
+            owner_x,
+            owner_y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        if has_shadow {
+            SetWindowPos(
+                self.hwnd,
+                owner,
+                sx,
+                sy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+            self.rect[0] = sx;
+            self.rect[1] = sy;
+        }
+    }
     pub unsafe fn hide(&self) {
         if IsWindowVisible(self.hwnd) != 0 {
             ShowWindow(self.hwnd, SW_HIDE);

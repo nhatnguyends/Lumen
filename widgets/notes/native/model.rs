@@ -10,6 +10,8 @@ use std::{
 // Keep the complete Electron palette, including legacy/current Slate notes.
 pub const COLORS: [&str; 7] = ["amber", "rose", "sky", "mint", "violet", "peach", "slate"];
 pub const MIN_SIZE: i32 = 160;
+pub const POPOUT_MIN_W: i32 = 220;
+pub const POPOUT_MIN_H: i32 = 160;
 pub const DESIGNS: [&str; 4] = ["lumen", "notebook", "index", "honey"];
 pub fn images_dir(root: &Path) -> std::path::PathBuf {
     root.join("config/notes-images")
@@ -204,6 +206,16 @@ pub fn now() -> u64 {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PopoutBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    #[serde(default)]
+    pub open: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Note {
     pub id: String,
     #[serde(default)]
@@ -215,6 +227,8 @@ pub struct Note {
     pub color: String,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popout: Option<PopoutBounds>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -354,6 +368,12 @@ impl Board {
                 return Err("Invalid note data; source left untouched".into());
             }
         }
+        for n in &mut self.notes {
+            if let Some(p) = &mut n.popout {
+                p.width = p.width.clamp(POPOUT_MIN_W, 1600);
+                p.height = p.height.clamp(POPOUT_MIN_H, 1200);
+            }
+        }
         self.size = [
             self.size[0].clamp(MIN_SIZE, 1600),
             self.size[1].clamp(MIN_SIZE, 1200),
@@ -417,6 +437,7 @@ impl Board {
             images: vec![],
             color: COLORS[self.notes.len() % COLORS.len()].into(),
             pinned: false,
+            popout: None,
             created_at: stamp,
             updated_at: stamp,
         });
@@ -816,5 +837,26 @@ mod tests {
         assert!(images_dir(&root).join(&b.notes[0].images[0]).exists());
         assert!(!b.notes[0].rtf.as_deref().unwrap().contains("\\pict"));
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn popout_bounds_persist_and_round_trip() {
+        let mut b = Board::default();
+        b.create().unwrap();
+        b.notes[0].popout = Some(PopoutBounds {
+            x: -420,
+            y: 120,
+            width: 80,
+            height: 2400,
+            open: true,
+        });
+        let raw = serde_json::to_vec(&b).unwrap();
+        let mut restored: Board = serde_json::from_slice(&raw).unwrap();
+        restored.validate().unwrap();
+        let p = restored.notes[0].popout.as_ref().unwrap();
+        assert_eq!(p.x, -420);
+        assert_eq!(p.y, 120);
+        assert_eq!(p.width, POPOUT_MIN_W);
+        assert_eq!(p.height, 1200);
+        assert!(p.open);
     }
 }

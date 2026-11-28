@@ -37,10 +37,10 @@ struct State {
     caret_on: bool,
 }
 const CLASS: &str = "LumenNativeNotesEditor";
-const LABELS: [&str; 6] = ["B", "I", "U", "S", "•", "1."];
+pub(super) const TOOLBAR_LABELS: [&str; 6] = ["B", "I", "U", "S", "•", "1."];
 const CARET: usize = 110;
 const PASTE_IMAGE: u32 = WM_APP + 106;
-unsafe fn blink_ms() -> u32 {
+pub(super) unsafe fn blink_ms() -> u32 {
     let ms = GetCaretBlinkTime();
     if ms == 0 || ms > 2000 {
         530
@@ -49,6 +49,9 @@ unsafe fn blink_ms() -> u32 {
     }
 }
 thread_local! {static PRINTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
+pub(super) fn is_printing() -> bool {
+    PRINTING.with(|p| p.get())
+}
 #[repr(C, packed(4))]
 struct Stream {
     cookie: usize,
@@ -121,7 +124,7 @@ struct ParaFormat2 {
     border_width: u16,
     borders: u16,
 }
-unsafe fn ensure_richedit_loaded() -> Result<(), String> {
+pub(super) unsafe fn ensure_richedit_loaded() -> Result<(), String> {
     static RICH_EDIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let module = *RICH_EDIT.get_or_init(|| LoadLibraryW(wide("Msftedit.dll").as_ptr()) as usize);
     if module == 0 {
@@ -140,7 +143,7 @@ fn prepare_note_rtf(note: &model::Note) -> String {
     }
     rtf
 }
-unsafe fn stream_note_rtf(edit: HWND, note: &model::Note) -> bool {
+pub(super) unsafe fn stream_note_rtf(edit: HWND, note: &model::Note) -> bool {
     let rtf = prepare_note_rtf(note);
     let mut bytes = Bytes {
         data: rtf.into_bytes(),
@@ -154,7 +157,27 @@ unsafe fn stream_note_rtf(edit: HWND, note: &model::Note) -> bool {
     SendMessageW(edit, WM_USER + 73, 2, &mut stream as *mut _ as isize);
     stream.error == 0
 }
-unsafe fn set_edit_default_char_format(edit: HWND, body_size: f32, clear_styles: bool) {
+pub(super) unsafe fn read_richedit_rtf(edit: HWND) -> Option<String> {
+    let mut bytes = Bytes {
+        data: vec![],
+        offset: 0,
+    };
+    let mut stream = Stream {
+        cookie: &mut bytes as *mut _ as usize,
+        error: 0,
+        callback: Some(write),
+    };
+    SendMessageW(edit, WM_USER + 74, 2, &mut stream as *mut _ as isize);
+    if stream.error != 0 {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&bytes.data)
+            .trim_end_matches('\0')
+            .to_string(),
+    )
+}
+pub(super) unsafe fn set_edit_default_char_format(edit: HWND, body_size: f32, clear_styles: bool) {
     if edit.is_null() {
         return;
     }
@@ -175,7 +198,7 @@ unsafe fn set_edit_default_char_format(edit: HWND, body_size: f32, clear_styles:
         SendMessageW(edit, WM_USER + 68, 4, &cf as *const _ as isize); // SCF_ALL
     }
 }
-unsafe fn set_edit_zoom(edit: HWND, dpi: f32, initial_dpi: f32) {
+pub(super) unsafe fn set_edit_zoom(edit: HWND, dpi: f32, initial_dpi: f32) {
     let mut numerator = (dpi * 96.).round().max(1.) as usize;
     let mut denominator = (initial_dpi * 96.).round().max(1.) as usize;
     let (mut a, mut b) = (numerator, denominator);
@@ -188,7 +211,7 @@ unsafe fn set_edit_zoom(edit: HWND, dpi: f32, initial_dpi: f32) {
     denominator /= a;
     SendMessageW(edit, WM_USER + 225, numerator, denominator as isize);
 }
-unsafe fn apply_edit_line_spacing(
+pub(super) unsafe fn apply_edit_line_spacing(
     edit: HWND,
     dpi: f32,
     leading: f32,
@@ -218,7 +241,7 @@ unsafe fn apply_edit_line_spacing(
     SendMessageW(edit, WM_USER + 71, 0, &pf2 as *const _ as isize);
     SendMessageW(edit, WM_USER + 55, 0, &prev_sel as *const _ as isize);
 }
-unsafe fn print_richedit_to_image(
+pub(super) unsafe fn print_richedit_to_image(
     edit: HWND,
     width: i32,
     height: i32,
@@ -662,7 +685,7 @@ impl Editor {
             );
         }
         if s.note.is_some() && !typography::compact_card([r[2] - r[0], r[3] - r[1]]) {
-            let count = LABELS.len() as f32;
+            let count = TOOLBAR_LABELS.len() as f32;
             let bw = ((r[2] - r[0] - 24.) / count).min(25.);
             let left = r[2] - 12. - bw * count;
             if left - r[0] > 54. {
@@ -680,7 +703,7 @@ impl Editor {
             }
             let active = s.active_formats();
             let light = crate::contrast::luminance(ink) < 0.5;
-            for (i, label) in LABELS.iter().enumerate() {
+            for (i, label) in TOOLBAR_LABELS.iter().enumerate() {
                 let x = left + i as f32 * bw;
                 let y = r[3] - 32.;
                 let btn = [x, y, x + bw - 3., y + 25.];
@@ -730,47 +753,66 @@ impl Editor {
             }
         }
         if GetFocus() == s.edit && s.caret_on {
-            let mut info: GUITHREADINFO = zeroed();
-            info.cbSize = size_of::<GUITHREADINFO>() as u32;
-            let cr = if GetGUIThreadInfo(0, &mut info) != 0
-                && info.hwndCaret == s.edit
-                && info.rcCaret.bottom > info.rcCaret.top
-            {
-                Some(info.rcCaret)
-            } else {
-                let mut sel_start = 0u32;
-                let mut sel_end = 0u32;
-                SendMessageW(
-                    s.edit,
-                    0x00B0,
-                    &mut sel_start as *mut _ as usize,
-                    &mut sel_end as *mut _ as isize,
-                );
-                let mut pt = POINT { x: 0, y: 0 };
-                SendMessageW(
-                    s.edit,
-                    WM_USER + 214,
-                    &mut pt as *mut _ as usize,
-                    sel_end as isize,
-                );
-                let h = (s.leading * d).round().max(12.) as i32;
-                Some(RECT {
-                    left: pt.x,
-                    top: pt.y,
-                    right: pt.x + 1,
-                    bottom: pt.y + h,
-                })
-            };
-            if let Some(cr) = cr {
-                let x = r[0] + tr[0] + cr.left as f32 / d;
-                let y = r[1] + tr[1] + oy + cr.top as f32 / d;
-                let ch = ((cr.bottom - cr.top) as f32 / d).max(1.);
-                let top = y.max(r[1] + tr[1]);
-                let bottom = (y + ch).min(r[1] + tr[3] + oy);
-                if bottom > top && x >= r[0] + tr[0] - 1. && x <= r[0] + tr[2] + 1. {
-                    c.line(&[(x, top), (x, bottom)], ink, 255, 1.);
-                }
-            }
+            draw_richedit_caret(
+                &c,
+                s.edit,
+                [r[0] + tr[0], r[1] + tr[1] + oy],
+                [r[0] + tr[0], r[1] + tr[1], r[0] + tr[2], r[1] + tr[3] + oy],
+                s.leading,
+                d,
+                ink,
+            );
+        }
+    }
+}
+pub(super) unsafe fn draw_richedit_caret(
+    c: &Canvas,
+    edit: HWND,
+    origin: [f32; 2],
+    bounds: [f32; 4],
+    leading: f32,
+    dpi: f32,
+    ink: u32,
+) {
+    let mut info: GUITHREADINFO = zeroed();
+    info.cbSize = size_of::<GUITHREADINFO>() as u32;
+    let cr = if GetGUIThreadInfo(0, &mut info) != 0
+        && info.hwndCaret == edit
+        && info.rcCaret.bottom > info.rcCaret.top
+    {
+        Some(info.rcCaret)
+    } else {
+        let mut sel_start = 0u32;
+        let mut sel_end = 0u32;
+        SendMessageW(
+            edit,
+            0x00B0,
+            &mut sel_start as *mut _ as usize,
+            &mut sel_end as *mut _ as isize,
+        );
+        let mut pt = POINT { x: 0, y: 0 };
+        SendMessageW(
+            edit,
+            WM_USER + 214,
+            &mut pt as *mut _ as usize,
+            sel_end as isize,
+        );
+        let h = (leading * dpi).round().max(12.) as i32;
+        Some(RECT {
+            left: pt.x,
+            top: pt.y,
+            right: pt.x + 1,
+            bottom: pt.y + h,
+        })
+    };
+    if let Some(cr) = cr {
+        let x = origin[0] + cr.left as f32 / dpi;
+        let y = origin[1] + cr.top as f32 / dpi;
+        let ch = ((cr.bottom - cr.top) as f32 / dpi).max(1.);
+        let top = y.max(bounds[1]);
+        let bottom = (y + ch).min(bounds[3]);
+        if bottom > top && x >= bounds[0] - 1. && x <= bounds[2] + 1. {
+            c.line(&[(x, top), (x, bottom)], ink, 255, 1.);
         }
     }
 }
@@ -937,7 +979,11 @@ fn parse_hdrop_paths(data: &[u8]) -> Vec<String> {
     }
     out
 }
-unsafe fn paste_from_clipboard(hwnd: HWND, parent: HWND) -> LRESULT {
+pub(super) unsafe fn paste_clipboard_or_notify_image(
+    hwnd: HWND,
+    target: HWND,
+    paste_msg: u32,
+) -> LRESULT {
     use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
     let [png_fmt, mime_png_fmt] = png_clipboard_formats();
     let has_dib = IsClipboardFormatAvailable(8) != 0
@@ -946,10 +992,13 @@ unsafe fn paste_from_clipboard(hwnd: HWND, parent: HWND) -> LRESULT {
         || (png_fmt != 0 && IsClipboardFormatAvailable(png_fmt) != 0)
         || (mime_png_fmt != 0 && IsClipboardFormatAvailable(mime_png_fmt) != 0);
     if clipboard_has_image_drop() || (has_dib && !clipboard_text_blocks_image()) {
-        PostMessageW(parent, PASTE_IMAGE, 0, 0);
+        PostMessageW(target, paste_msg, 0, 0);
         return 0;
     }
     SendMessageW(hwnd, WM_USER + 64, 13, 0) // EM_PASTESPECIAL / CF_UNICODETEXT
+}
+unsafe fn paste_from_clipboard(hwnd: HWND, parent: HWND) -> LRESULT {
+    paste_clipboard_or_notify_image(hwnd, parent, PASTE_IMAGE)
 }
 // Match the old editor's text-only paste. RichEdit still supplies native Unicode
 // clipboard, selection and undo; HTML/OLE objects are not added to note storage.
@@ -1069,45 +1118,7 @@ impl State {
         if self.note.is_none() || self.edit.is_null() {
             return [false; 6];
         }
-        let mut cf: CharFormat = zeroed();
-        cf.size = size_of::<CharFormat>() as u32;
-        SendMessageW(self.edit, WM_USER + 58, 1, &mut cf as *mut _ as isize);
-        let mut pf: ParaFormat = zeroed();
-        pf.size = size_of::<ParaFormat>() as u32;
-        SendMessageW(self.edit, WM_USER + 61, 0, &mut pf as *mut _ as isize);
-
-        let mut bullet = pf.numbering == 1;
-        let mut numbered = pf.numbering > 1;
-        if !bullet && !numbered {
-            let mut sel_start = 0u32;
-            SendMessageW(self.edit, 0x00B0, &mut sel_start as *mut _ as usize, 0);
-            let text = window_text(self.edit);
-            let mut utf16_pos = 0usize;
-            for line in text.split('\n') {
-                let line_clean = line.trim_end_matches('\r');
-                let next_pos = utf16_pos + line.encode_utf16().count() + 1;
-                if (sel_start as usize) < next_pos {
-                    let trimmed = line_clean.trim_start();
-                    if trimmed.starts_with("• ") || trimmed.starts_with("- ") {
-                        bullet = true;
-                    } else if let Some(dot) = trimmed.find(". ") {
-                        if dot > 0 && trimmed[..dot].chars().all(|c| c.is_ascii_digit()) {
-                            numbered = true;
-                        }
-                    }
-                    break;
-                }
-                utf16_pos = next_pos;
-            }
-        }
-        [
-            cf.effects & 1 != 0,
-            cf.effects & 2 != 0,
-            cf.effects & 4 != 0,
-            cf.effects & 8 != 0,
-            bullet,
-            numbered,
-        ]
+        active_edit_formats(self.edit)
     }
     unsafe fn close(&mut self) {
         self.changed();
@@ -1136,22 +1147,9 @@ impl State {
         }
         let text = window_text(self.edit);
         let event = if let Some(note) = &mut self.note {
-            let mut bytes = Bytes {
-                data: vec![],
-                offset: 0,
-            };
-            let mut stream = Stream {
-                cookie: &mut bytes as *mut _ as usize,
-                error: 0,
-                callback: Some(write),
-            };
-            SendMessageW(self.edit, WM_USER + 74, 2, &mut stream as *mut _ as isize);
-            if stream.error != 0 {
+            let Some(rtf) = read_richedit_rtf(self.edit) else {
                 return;
-            }
-            let rtf = String::from_utf8_lossy(&bytes.data)
-                .trim_end_matches('\0')
-                .to_string();
+            };
             if note.body == text && note.rtf.as_ref() == Some(&rtf) {
                 return;
             }
@@ -1173,271 +1171,16 @@ impl State {
         if self.note.is_none() {
             return;
         }
-        if index < 4 {
-            let mask = [1, 2, 4, 8][index];
-            let mut f: CharFormat = zeroed();
-            f.size = size_of::<CharFormat>() as u32;
-            SendMessageW(self.edit, WM_USER + 58, 1, &mut f as *mut _ as isize);
-            f.effects ^= mask;
-            f.mask = mask;
-            SendMessageW(self.edit, WM_USER + 68, 1, &f as *const _ as isize);
-        } else {
-            let mut f: ParaFormat = zeroed();
-            f.size = size_of::<ParaFormat>() as u32;
-            SendMessageW(self.edit, WM_USER + 61, 0, &mut f as *mut _ as isize);
-            let target = if index == 4 { 1 } else { 2 };
-            f.numbering = if f.numbering == target { 0 } else { target };
-            f.mask = 0x20;
-            SendMessageW(self.edit, WM_USER + 71, 0, &f as *const _ as isize);
-        }
+        toggle_edit_format(self.edit, index);
         SetFocus(self.edit);
         self.changed = true;
         self.changed();
     }
     unsafe fn paste_clipboard_image(&mut self) {
-        use windows_sys::Win32::System::{
-            DataExchange::{CloseClipboard, GetClipboardData},
-            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
-        };
-        fn extract_bitfield(pixel: u32, mask: u32) -> u8 {
-            if mask == 0 {
-                return 0;
-            }
-            let shift = mask.trailing_zeros();
-            let bits = (mask >> shift).count_ones();
-            let val = (pixel & mask) >> shift;
-            let max = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
-            ((val as u64 * 255) / (max.max(1) as u64)).min(255) as u8
-        }
-        fn decode_dib_to_rgba(data: &[u8]) -> Option<image::RgbaImage> {
-            if data.len() < 40 {
-                return None;
-            }
-            let header_size = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-            let w = i32::from_le_bytes(data[4..8].try_into().ok()?);
-            let h_raw = i32::from_le_bytes(data[8..12].try_into().ok()?);
-            let bpp = u16::from_le_bytes(data[14..16].try_into().ok()?) as usize;
-            let comp = u32::from_le_bytes(data[16..20].try_into().ok()?);
-            let clr_used = u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
-            if header_size < 40
-                || header_size > data.len()
-                || w <= 0
-                || h_raw == 0
-                || w > 8192
-                || h_raw.abs() > 8192
-                || !matches!(bpp, 24 | 32)
-                || !matches!(comp, 0 | 3)
-            {
-                return None;
-            }
-            let mask_bytes = if comp == 3 && header_size == 40 { 12 } else { 0 };
-            let palette_bytes = if comp == 3 && header_size == 40 && clr_used == 3 {
-                0
-            } else if clr_used > 0 {
-                clr_used * 4
-            } else {
-                0
-            };
-            let pixel_offset = header_size + mask_bytes + palette_bytes;
-            let width = w as usize;
-            let height = h_raw.unsigned_abs() as usize;
-            let stride = ((width * bpp + 31) / 32) * 4;
-            if pixel_offset + stride * height > data.len() {
-                return None;
-            }
-            let mut r_mask = 0x00ff_0000u32;
-            let mut g_mask = 0x0000_ff00u32;
-            let mut b_mask = 0x0000_00ffu32;
-            let mut a_mask = 0u32;
-            if comp == 3 && data.len() >= 52 {
-                r_mask = u32::from_le_bytes(data[40..44].try_into().ok()?);
-                g_mask = u32::from_le_bytes(data[44..48].try_into().ok()?);
-                b_mask = u32::from_le_bytes(data[48..52].try_into().ok()?);
-                if header_size >= 56 && data.len() >= 56 {
-                    a_mask = u32::from_le_bytes(data[52..56].try_into().ok()?);
-                }
-            }
-            let pixels = &data[pixel_offset..];
-            let mut rgba = vec![255u8; width * height * 4];
-            let mut any_alpha = false;
-            for y in 0..height {
-                let src_y = if h_raw > 0 { height - 1 - y } else { y };
-                let row = &pixels[src_y * stride..src_y * stride + width * (bpp / 8)];
-                for x in 0..width {
-                    let s = x * (bpp / 8);
-                    let d = (y * width + x) * 4;
-                    if bpp == 32 && comp == 3 {
-                        let px = u32::from_le_bytes([row[s], row[s + 1], row[s + 2], row[s + 3]]);
-                        rgba[d] = extract_bitfield(px, r_mask);
-                        rgba[d + 1] = extract_bitfield(px, g_mask);
-                        rgba[d + 2] = extract_bitfield(px, b_mask);
-                        if a_mask != 0 {
-                            let a = extract_bitfield(px, a_mask);
-                            if a != 0 {
-                                any_alpha = true;
-                            }
-                            rgba[d + 3] = a;
-                        }
-                    } else {
-                        rgba[d] = row[s + 2];
-                        rgba[d + 1] = row[s + 1];
-                        rgba[d + 2] = row[s];
-                        if bpp == 32 {
-                            let a = row[s + 3];
-                            if a != 0 {
-                                any_alpha = true;
-                            }
-                            rgba[d + 3] = a;
-                        }
-                    }
-                }
-            }
-            if bpp == 32 && (comp == 0 || a_mask != 0) && !any_alpha {
-                for p in rgba.chunks_exact_mut(4) {
-                    p[3] = 255;
-                }
-            }
-            image::RgbaImage::from_raw(width as u32, height as u32, rgba)
-        }
-        unsafe fn decode_hbitmap_to_rgba(hbitmap: HBITMAP) -> Option<image::RgbaImage> {
-            if hbitmap.is_null() {
-                return None;
-            }
-            let mut bitmap: BITMAP = zeroed();
-            if GetObjectW(hbitmap, size_of::<BITMAP>() as i32, &mut bitmap as *mut _ as _) == 0 {
-                return None;
-            }
-            let w = bitmap.bmWidth;
-            let h = bitmap.bmHeight.abs();
-            if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
-                return None;
-            }
-            let mut bmi: BITMAPINFO = zeroed();
-            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = w;
-            bmi.bmiHeader.biHeight = -h;
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = 0; // BI_RGB
-            let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
-            let dc = GetDC(null_mut());
-            let rows = GetDIBits(
-                dc,
-                hbitmap,
-                0,
-                h as u32,
-                bgra.as_mut_ptr() as _,
-                &mut bmi,
-                DIB_RGB_COLORS,
-            );
-            ReleaseDC(null_mut(), dc);
-            if rows == 0 {
-                return None;
-            }
-            let all_zero_alpha = bgra.chunks_exact(4).all(|p| p[3] == 0);
-            let mut rgba = vec![255u8; bgra.len()];
-            for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
-                dst[3] = if all_zero_alpha { 255 } else { src[3] };
-            }
-            image::RgbaImage::from_raw(w as u32, h as u32, rgba)
-        }
         let Some(note) = &mut self.note else {
             return;
         };
-        if !open_clipboard_retry(self.hwnd) {
-            return;
-        }
-        let saved_names = (|| -> Vec<String> {
-            let Some(dir) = Some(model::images_dir(&self.root)) else {
-                return Vec::new();
-            };
-            if std::fs::create_dir_all(&dir).is_err() {
-                return Vec::new();
-            }
-            let mut out = Vec::new();
-            let base_idx = note.images.len();
-            let next_name = |offset: usize| format!("img-{}-{}.png", model::now(), base_idx + offset);
-            for png_fmt in png_clipboard_formats() {
-                if png_fmt == 0 {
-                    continue;
-                }
-                let handle = GetClipboardData(png_fmt);
-                if !handle.is_null() {
-                    let size = GlobalSize(handle);
-                    let ptr = GlobalLock(handle) as *const u8;
-                    if !ptr.is_null() && size > 8 {
-                        let data = std::slice::from_raw_parts(ptr, size);
-                        let decoded = image::load_from_memory(data).ok();
-                        GlobalUnlock(handle);
-                        if let Some(img) = decoded {
-                            let name = next_name(0);
-                            if img.into_rgba8().save(dir.join(&name)).is_ok() {
-                                out.push(name);
-                                return out;
-                            }
-                        }
-                    } else if !ptr.is_null() {
-                        GlobalUnlock(handle);
-                    }
-                }
-            }
-            for fmt in [17u32, 8u32] {
-                let handle = GetClipboardData(fmt); // CF_DIBV5 then CF_DIB
-                if !handle.is_null() {
-                    let size = GlobalSize(handle);
-                    if size >= 40 {
-                        let ptr = GlobalLock(handle) as *const u8;
-                        if !ptr.is_null() {
-                            let data = std::slice::from_raw_parts(ptr, size);
-                            let decoded = decode_dib_to_rgba(data);
-                            GlobalUnlock(handle);
-                            if let Some(img) = decoded {
-                                let name = next_name(0);
-                                if img.save(dir.join(&name)).is_ok() {
-                                    out.push(name);
-                                    return out;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let bmp_handle = GetClipboardData(2); // CF_BITMAP
-            if !bmp_handle.is_null() {
-                if let Some(img) = decode_hbitmap_to_rgba(bmp_handle as HBITMAP) {
-                    let name = next_name(0);
-                    if img.save(dir.join(&name)).is_ok() {
-                        out.push(name);
-                        return out;
-                    }
-                }
-            }
-            let drop_handle = GetClipboardData(15); // CF_HDROP
-            if !drop_handle.is_null() {
-                let size = GlobalSize(drop_handle);
-                let ptr = GlobalLock(drop_handle) as *const u8;
-                if !ptr.is_null() && size >= 20 {
-                    let data = std::slice::from_raw_parts(ptr, size);
-                    let paths = parse_hdrop_paths(data);
-                    GlobalUnlock(drop_handle);
-                    for path_str in paths {
-                        let p = std::path::Path::new(&path_str);
-                        if is_image_path(p) {
-                            if let Some(name) = save_image_file(&self.root, p, base_idx + out.len()) {
-                                out.push(name);
-                            }
-                        }
-                    }
-                } else if !ptr.is_null() {
-                    GlobalUnlock(drop_handle);
-                }
-            }
-            out
-        })();
-        CloseClipboard();
+        let saved_names = save_clipboard_images(self.hwnd, &self.root, note.images.len());
         if !saved_names.is_empty() {
             note.images.extend(saved_names);
             note.updated_at = model::now();
@@ -1451,7 +1194,7 @@ impl State {
         if self.note.is_none() || typography::compact_card([width, height]) {
             return None;
         }
-        let count = LABELS.len() as f32;
+        let count = TOOLBAR_LABELS.len() as f32;
         let bw = ((width - 24.) / count).min(25.);
         let left = width - 12. - bw * count;
         Some([left, height - 32., left + bw * count, height - 7.])
@@ -1461,12 +1204,322 @@ impl State {
         if !inside(p, tr) {
             return None;
         }
-        let bw = (tr[2] - tr[0]) / LABELS.len() as f32;
-        (0..LABELS.len()).find(|&i| {
+        let bw = (tr[2] - tr[0]) / TOOLBAR_LABELS.len() as f32;
+        (0..TOOLBAR_LABELS.len()).find(|&i| {
             let x = tr[0] + i as f32 * bw;
             p[0] >= x && p[0] < x + bw - 3.
         })
     }
+}
+pub(super) unsafe fn active_edit_formats(edit: HWND) -> [bool; 6] {
+    if edit.is_null() {
+        return [false; 6];
+    }
+    let mut cf: CharFormat = zeroed();
+    cf.size = size_of::<CharFormat>() as u32;
+    SendMessageW(edit, WM_USER + 58, 1, &mut cf as *mut _ as isize);
+    let mut pf: ParaFormat = zeroed();
+    pf.size = size_of::<ParaFormat>() as u32;
+    SendMessageW(edit, WM_USER + 61, 0, &mut pf as *mut _ as isize);
+
+    let mut bullet = pf.numbering == 1;
+    let mut numbered = pf.numbering > 1;
+    if !bullet && !numbered {
+        let mut sel_start = 0u32;
+        SendMessageW(edit, 0x00B0, &mut sel_start as *mut _ as usize, 0);
+        let text = window_text(edit);
+        let mut utf16_pos = 0usize;
+        for line in text.split('\n') {
+            let line_clean = line.trim_end_matches('\r');
+            let next_pos = utf16_pos + line.encode_utf16().count() + 1;
+            if (sel_start as usize) < next_pos {
+                let trimmed = line_clean.trim_start();
+                if trimmed.starts_with("• ") || trimmed.starts_with("- ") {
+                    bullet = true;
+                } else if let Some(dot) = trimmed.find(". ") {
+                    if dot > 0 && trimmed[..dot].chars().all(|c| c.is_ascii_digit()) {
+                        numbered = true;
+                    }
+                }
+                break;
+            }
+            utf16_pos = next_pos;
+        }
+    }
+    [
+        cf.effects & 1 != 0,
+        cf.effects & 2 != 0,
+        cf.effects & 4 != 0,
+        cf.effects & 8 != 0,
+        bullet,
+        numbered,
+    ]
+}
+pub(super) unsafe fn toggle_edit_format(edit: HWND, index: usize) {
+    if edit.is_null() {
+        return;
+    }
+    if index < 4 {
+        let mask = [1, 2, 4, 8][index];
+        let mut f: CharFormat = zeroed();
+        f.size = size_of::<CharFormat>() as u32;
+        SendMessageW(edit, WM_USER + 58, 1, &mut f as *mut _ as isize);
+        f.effects ^= mask;
+        f.mask = mask;
+        SendMessageW(edit, WM_USER + 68, 1, &f as *const _ as isize);
+    } else {
+        let mut f: ParaFormat = zeroed();
+        f.size = size_of::<ParaFormat>() as u32;
+        SendMessageW(edit, WM_USER + 61, 0, &mut f as *mut _ as isize);
+        let target = if index == 4 { 1 } else { 2 };
+        f.numbering = if f.numbering == target { 0 } else { target };
+        f.mask = 0x20;
+        SendMessageW(edit, WM_USER + 71, 0, &f as *const _ as isize);
+    }
+}
+pub(super) unsafe fn save_clipboard_images(
+    hwnd: HWND,
+    root: &Path,
+    base_idx: usize,
+) -> Vec<String> {
+    use windows_sys::Win32::System::{
+        DataExchange::{CloseClipboard, GetClipboardData},
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+    };
+    fn extract_bitfield(pixel: u32, mask: u32) -> u8 {
+        if mask == 0 {
+            return 0;
+        }
+        let shift = mask.trailing_zeros();
+        let bits = (mask >> shift).count_ones();
+        let val = (pixel & mask) >> shift;
+        let max = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        ((val as u64 * 255) / (max.max(1) as u64)).min(255) as u8
+    }
+    fn decode_dib_to_rgba(data: &[u8]) -> Option<image::RgbaImage> {
+        if data.len() < 40 {
+            return None;
+        }
+        let header_size = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+        let w = i32::from_le_bytes(data[4..8].try_into().ok()?);
+        let h_raw = i32::from_le_bytes(data[8..12].try_into().ok()?);
+        let bpp = u16::from_le_bytes(data[14..16].try_into().ok()?) as usize;
+        let comp = u32::from_le_bytes(data[16..20].try_into().ok()?);
+        let clr_used = u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
+        if header_size < 40
+            || header_size > data.len()
+            || w <= 0
+            || h_raw == 0
+            || w > 8192
+            || h_raw.abs() > 8192
+            || !matches!(bpp, 24 | 32)
+            || !matches!(comp, 0 | 3)
+        {
+            return None;
+        }
+        let mask_bytes = if comp == 3 && header_size == 40 { 12 } else { 0 };
+        let palette_bytes = if comp == 3 && header_size == 40 && clr_used == 3 {
+            0
+        } else if clr_used > 0 {
+            clr_used * 4
+        } else {
+            0
+        };
+        let pixel_offset = header_size + mask_bytes + palette_bytes;
+        let width = w as usize;
+        let height = h_raw.unsigned_abs() as usize;
+        let stride = ((width * bpp + 31) / 32) * 4;
+        if pixel_offset + stride * height > data.len() {
+            return None;
+        }
+        let mut r_mask = 0x00ff_0000u32;
+        let mut g_mask = 0x0000_ff00u32;
+        let mut b_mask = 0x0000_00ffu32;
+        let mut a_mask = 0u32;
+        if comp == 3 && data.len() >= 52 {
+            r_mask = u32::from_le_bytes(data[40..44].try_into().ok()?);
+            g_mask = u32::from_le_bytes(data[44..48].try_into().ok()?);
+            b_mask = u32::from_le_bytes(data[48..52].try_into().ok()?);
+            if header_size >= 56 && data.len() >= 56 {
+                a_mask = u32::from_le_bytes(data[52..56].try_into().ok()?);
+            }
+        }
+        let pixels = &data[pixel_offset..];
+        let mut rgba = vec![255u8; width * height * 4];
+        let mut any_alpha = false;
+        for y in 0..height {
+            let src_y = if h_raw > 0 { height - 1 - y } else { y };
+            let row = &pixels[src_y * stride..src_y * stride + width * (bpp / 8)];
+            for x in 0..width {
+                let s = x * (bpp / 8);
+                let d = (y * width + x) * 4;
+                if bpp == 32 && comp == 3 {
+                    let px = u32::from_le_bytes([row[s], row[s + 1], row[s + 2], row[s + 3]]);
+                    rgba[d] = extract_bitfield(px, r_mask);
+                    rgba[d + 1] = extract_bitfield(px, g_mask);
+                    rgba[d + 2] = extract_bitfield(px, b_mask);
+                    if a_mask != 0 {
+                        let a = extract_bitfield(px, a_mask);
+                        if a != 0 {
+                            any_alpha = true;
+                        }
+                        rgba[d + 3] = a;
+                    }
+                } else {
+                    rgba[d] = row[s + 2];
+                    rgba[d + 1] = row[s + 1];
+                    rgba[d + 2] = row[s];
+                    if bpp == 32 {
+                        let a = row[s + 3];
+                        if a != 0 {
+                            any_alpha = true;
+                        }
+                        rgba[d + 3] = a;
+                    }
+                }
+            }
+        }
+        if bpp == 32 && (comp == 0 || a_mask != 0) && !any_alpha {
+            for p in rgba.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+        }
+        image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+    }
+    unsafe fn decode_hbitmap_to_rgba(hbitmap: HBITMAP) -> Option<image::RgbaImage> {
+        if hbitmap.is_null() {
+            return None;
+        }
+        let mut bitmap: BITMAP = zeroed();
+        if GetObjectW(hbitmap, size_of::<BITMAP>() as i32, &mut bitmap as *mut _ as _) == 0 {
+            return None;
+        }
+        let w = bitmap.bmWidth;
+        let h = bitmap.bmHeight.abs();
+        if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+            return None;
+        }
+        let mut bmi: BITMAPINFO = zeroed();
+        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = 0; // BI_RGB
+        let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
+        let dc = GetDC(null_mut());
+        let rows = GetDIBits(
+            dc,
+            hbitmap,
+            0,
+            h as u32,
+            bgra.as_mut_ptr() as _,
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(null_mut(), dc);
+        if rows == 0 {
+            return None;
+        }
+        let all_zero_alpha = bgra.chunks_exact(4).all(|p| p[3] == 0);
+        let mut rgba = vec![255u8; bgra.len()];
+        for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = if all_zero_alpha { 255 } else { src[3] };
+        }
+        image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+    }
+    if !open_clipboard_retry(hwnd) {
+        return Vec::new();
+    }
+    let dir = model::images_dir(root);
+    let saved_names = (|| -> Vec<String> {
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let next_name = |offset: usize| format!("img-{}-{}.png", model::now(), base_idx + offset);
+        for png_fmt in png_clipboard_formats() {
+            if png_fmt == 0 {
+                continue;
+            }
+            let handle = GetClipboardData(png_fmt);
+            if !handle.is_null() {
+                let size = GlobalSize(handle);
+                let ptr = GlobalLock(handle) as *const u8;
+                if !ptr.is_null() && size > 8 {
+                    let data = std::slice::from_raw_parts(ptr, size);
+                    let decoded = image::load_from_memory(data).ok();
+                    GlobalUnlock(handle);
+                    if let Some(img) = decoded {
+                        let name = next_name(0);
+                        if img.into_rgba8().save(dir.join(&name)).is_ok() {
+                            out.push(name);
+                            return out;
+                        }
+                    }
+                } else if !ptr.is_null() {
+                    GlobalUnlock(handle);
+                }
+            }
+        }
+        for fmt in [17u32, 8u32] {
+            let handle = GetClipboardData(fmt); // CF_DIBV5 then CF_DIB
+            if !handle.is_null() {
+                let size = GlobalSize(handle);
+                if size >= 40 {
+                    let ptr = GlobalLock(handle) as *const u8;
+                    if !ptr.is_null() {
+                        let data = std::slice::from_raw_parts(ptr, size);
+                        let decoded = decode_dib_to_rgba(data);
+                        GlobalUnlock(handle);
+                        if let Some(img) = decoded {
+                            let name = next_name(0);
+                            if img.save(dir.join(&name)).is_ok() {
+                                out.push(name);
+                                return out;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let bmp_handle = GetClipboardData(2); // CF_BITMAP
+        if !bmp_handle.is_null() {
+            if let Some(img) = decode_hbitmap_to_rgba(bmp_handle as HBITMAP) {
+                let name = next_name(0);
+                if img.save(dir.join(&name)).is_ok() {
+                    out.push(name);
+                    return out;
+                }
+            }
+        }
+        let drop_handle = GetClipboardData(15); // CF_HDROP
+        if !drop_handle.is_null() {
+            let size = GlobalSize(drop_handle);
+            let ptr = GlobalLock(drop_handle) as *const u8;
+            if !ptr.is_null() && size >= 20 {
+                let data = std::slice::from_raw_parts(ptr, size);
+                let paths = parse_hdrop_paths(data);
+                GlobalUnlock(drop_handle);
+                for path_str in paths {
+                    let p = std::path::Path::new(&path_str);
+                    if is_image_path(p) {
+                        if let Some(name) = save_image_file(root, p, base_idx + out.len()) {
+                            out.push(name);
+                        }
+                    }
+                }
+            } else if !ptr.is_null() {
+                GlobalUnlock(drop_handle);
+            }
+        }
+        out
+    })();
+    CloseClipboard();
+    saved_names
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {

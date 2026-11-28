@@ -631,7 +631,7 @@ impl App {
         if hwnd == self.hwnd {
             if self.is_duplicate {
                 crate::multi_monitor::record_duplicate_bounds(hwnd, self.dpi);
-            } else {
+            } else if !crate::multi_monitor::is_primary_displaced("launcher") {
                 let mut r: RECT = zeroed();
                 GetWindowRect(hwnd, &mut r);
                 self.dock.position = Some([r.left, r.top]);
@@ -640,6 +640,7 @@ impl App {
                     ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
                 ]);
                 self.save_bounds();
+                crate::multi_monitor::record_primary_bounds(hwnd, "launcher", self.dpi);
             }
         }
     }
@@ -1183,13 +1184,16 @@ impl App {
         }
         InvalidateRect(hwnd, null(), 0);
     }
-    unsafe fn sync_multi_monitor(&mut self, hwnd: HWND) {
+    unsafe fn sync_multi_monitor(&mut self, hwnd: HWND, reposition_existing: bool) {
         if self.is_duplicate {
             return;
         }
-        let mut changed = self
-            .packages
-            .sync_duplicates(self.glass.clone(), self.inspect, self.smoke);
+        let mut changed = self.packages.sync_duplicates(
+            self.glass.clone(),
+            self.inspect,
+            self.smoke,
+            reposition_existing,
+        );
         let visible = IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0;
         if !crate::multi_monitor::is_enabled() || !visible {
             if !self.duplicate_docks.is_empty() {
@@ -1210,12 +1214,25 @@ impl App {
                 changed = true;
             }
             for disp in targets {
-                if self.duplicate_docks.contains_key(&disp.id) {
-                    continue;
-                }
                 let Some(dst_work) = disp.work else {
                     continue;
                 };
+                if let Some(existing) = self.duplicate_docks.get(&disp.id) {
+                    if reposition_existing {
+                        let dst_dpi = crate::multi_monitor::display_dpi(dst_work);
+                        crate::multi_monitor::place_duplicate_window(
+                            existing.hwnd,
+                            "launcher",
+                            &disp.id,
+                            hwnd,
+                            dst_work,
+                            dst_dpi,
+                            crate::geometry::DOCK_MIN,
+                            false,
+                        );
+                    }
+                    continue;
+                }
                 let dst_dpi = crate::multi_monitor::display_dpi(dst_work);
                 let rect = crate::multi_monitor::compute_duplicate_rect(
                     "launcher",
@@ -2679,6 +2696,25 @@ pub(crate) unsafe fn apply_window_mode(hwnd: HWND, _floating: bool, inspect: boo
         pin_to_desktop(hwnd);
     }
 }
+pub(crate) unsafe fn apply_floating_mode(hwnd: HWND, floating: bool, inspect: bool) {
+    if floating {
+        crate::desktop_layer::register(hwnd, false);
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+        crate::fusion::set_excluded(hwnd, true);
+    } else {
+        apply_window_mode(hwnd, false, inspect);
+        crate::fusion::set_excluded(hwnd, false);
+    }
+}
 /// Same z-order strategy as src/main/win32.ts: immediately ABOVE the highest
 /// desktop surface, below ordinary applications. Never reparents into Explorer.
 pub(crate) unsafe fn pin_to_desktop(hwnd: HWND) {
@@ -2843,11 +2879,25 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
     }) else {
         return;
     };
+    let mut restored_dock = false;
     if !is_dup {
-        crate::multi_monitor::refresh_displays();
+        crate::multi_monitor::refresh_displays_now();
+        restored_dock = crate::multi_monitor::restore_primary_window(
+            hwnd,
+            "launcher",
+            crate::geometry::DOCK_MIN,
+        );
+        if let Ok(app) = (*pointer).try_borrow() {
+            app.packages.restore_primary_layouts();
+        }
     }
+    let clamp_prev_dpi = if restored_dock {
+        crate::geometry::window_dpi(hwnd)
+    } else {
+        prev_dpi
+    };
     let (dpi, clamped) =
-        crate::geometry::clamp_window_to_work(hwnd, crate::geometry::DOCK_MIN, prev_dpi);
+        crate::geometry::clamp_window_to_work(hwnd, crate::geometry::DOCK_MIN, clamp_prev_dpi);
     let dup_hwnds: Vec<HWND> = if let Ok(mut app) = (*pointer).try_borrow_mut() {
         if !is_dup {
             app.display_sig = crate::geometry::display_topology_signature();
@@ -2862,7 +2912,7 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
             }
             SetTimer(hwnd, WALLPAPER_DEBOUNCE_TIMER, 150, None);
         }
-        if dpi_changed || clamped {
+        if dpi_changed || clamped || restored_dock {
             app.frame = None;
             app.background = None;
             app.list_base = None;
@@ -2886,6 +2936,7 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
             app.background_key.clear();
         }
         let dups = if !is_dup {
+            app.sync_multi_monitor(hwnd, true);
             if let Some(host) = &mut app.general {
                 host.refresh_displays();
             }
@@ -2905,9 +2956,6 @@ unsafe fn sync_display_change(hwnd: HWND, pointer: *const RefCell<App>) {
         }
     }
     if !is_dup {
-        if let Ok(mut app) = (*pointer).try_borrow_mut() {
-            app.sync_multi_monitor(hwnd);
-        }
         crate::fusion::refresh();
         if !settings_hwnd.is_null() && IsWindow(settings_hwnd) != 0 {
             SendMessageW(settings_hwnd, WM_DISPLAYCHANGE, 0, 0);
@@ -3458,7 +3506,7 @@ unsafe extern "system" fn wndproc(
             }
             if app.is_duplicate {
                 crate::multi_monitor::record_duplicate_bounds(hwnd, app.dpi);
-            } else {
+            } else if !crate::multi_monitor::is_primary_displaced("launcher") {
                 let mut rect: RECT = zeroed();
                 GetWindowRect(hwnd, &mut rect);
                 app.dock.position = Some([rect.left, rect.top]);
@@ -3467,6 +3515,7 @@ unsafe extern "system" fn wndproc(
                     ((rect.bottom - rect.top) as f32 / app.dpi).round() as i32,
                 ]);
                 app.save_bounds();
+                crate::multi_monitor::record_primary_bounds(hwnd, "launcher", app.dpi);
             }
             let accent = app.glass.borrow().wallpaper_accent_for(hwnd);
             app.set_accent(accent);
@@ -3952,10 +4001,10 @@ unsafe extern "system" fn wndproc(
                 app.settings.hwnd = null_mut();
                 DestroyWindow(settings_hwnd);
             }
-            let mut rect: RECT = zeroed();
-            GetWindowRect(hwnd, &mut rect);
-            app.dock.position = Some([rect.left, rect.top]);
-            if !app.smoke {
+            if !app.smoke && !crate::multi_monitor::is_primary_displaced("launcher") {
+                let mut rect: RECT = zeroed();
+                GetWindowRect(hwnd, &mut rect);
+                app.dock.position = Some([rect.left, rect.top]);
                 app.dock.size = Some([
                     ((rect.right - rect.left) as f32 / app.dpi).round() as i32,
                     ((rect.bottom - rect.top) as f32 / app.dpi).round() as i32,
@@ -4004,7 +4053,7 @@ unsafe extern "system" fn wndproc(
         }
         m if m == crate::multi_monitor::SYNC_MESSAGE => {
             if !app.is_duplicate {
-                app.sync_multi_monitor(hwnd);
+                app.sync_multi_monitor(hwnd, false);
             }
             0
         }
@@ -4632,6 +4681,48 @@ mod tests {
             let normal = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST == 0;
             DestroyWindow(hwnd);
             assert!(!floating && normal);
+        }
+    }
+    #[test]
+    fn floating_mode_toggles_topmost_and_fusion_exclusion() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            crate::fusion::init(Rc::new(RefCell::new(Glass::new(0., 1.))));
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                wide("STATIC").as_ptr(),
+                wide("Lumen floating mode test").as_ptr(),
+                WS_POPUP,
+                -20000,
+                -20000,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            crate::fusion::register_widget(hwnd);
+            crate::fusion::prepare(hwnd, 34.);
+            apply_floating_mode(hwnd, true, false);
+            assert_ne!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert!(!crate::desktop_layer::contains(hwnd));
+            assert!(crate::fusion::is_excluded(hwnd));
+
+            apply_floating_mode(hwnd, false, false);
+            assert_eq!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            assert!(crate::desktop_layer::contains(hwnd));
+            assert!(!crate::fusion::is_excluded(hwnd));
+
+            DestroyWindow(hwnd);
+            crate::fusion::shutdown();
         }
     }
     #[test]

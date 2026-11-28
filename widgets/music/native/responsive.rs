@@ -347,7 +347,7 @@ impl State {
         );
     }
     unsafe fn corner_open(&mut self, c: &Canvas, w: f32) {
-        self.media_button(c, [w - 124., 12., w - 92., 44.], Action::Browse, true);
+        self.media_button(c, [w - 156., 12., w - 124., 44.], Action::Browse, true);
     }
     unsafe fn label_backing(&self, c: &Canvas, dc: HDC, r: [f32; 4]) {
         if let Some(bg) = &self.background {
@@ -754,12 +754,12 @@ impl State {
                 self.media_button(c, br, action.clone(), enabled);
             }
             if !browse_inline {
-                if w >= 220. {
+                if w >= 240. {
                     self.corner_open(c, w);
                 } else if self.playback.signed_in {
                     self.media_button(c, [18., 12., 46., 40.], Action::Browse, true);
-                } else if w >= 196. {
-                    self.media_button(c, [w - 118., 12., w - 90., 40.], Action::Browse, true);
+                } else if w >= 232. {
+                    self.media_button(c, [w - 152., 12., w - 124., 40.], Action::Browse, true);
                 }
             }
             return;
@@ -835,12 +835,12 @@ impl State {
             self.media_button(c, br, action, enabled);
         }
         if !browse_by_title {
-            if w >= 220. {
+            if w >= 240. {
                 self.corner_open(c, w);
             } else if self.playback.signed_in {
                 self.media_button(c, [18., 12., 46., 40.], Action::Browse, true);
-            } else if w >= 196. {
-                self.media_button(c, [w - 118., 12., w - 90., 40.], Action::Browse, true);
+            } else if w >= 232. {
+                self.media_button(c, [w - 152., 12., w - 124., 40.], Action::Browse, true);
             }
         }
     }

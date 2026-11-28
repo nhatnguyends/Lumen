@@ -69,6 +69,12 @@ impl State {
             Row::slider(105, "Background opacity", self.config.opacity, 0., 100., "%"),
             Row::choices(106, "Surface palette", &self.config.palette, crate::settings_ui::palette_choices()),
             Row::section("Layout"),
+            Row::toggle(
+                203,
+                "Floating mode",
+                "Pop out above all windows and detach from fuse.",
+                self.config.floating,
+            ),
             Row::choices(201, "Music design", &self.config.design, vec![
                 Choice::new("coverflow", "Coverflow", None),
                 Choice::new("compact", "Compact", None),
@@ -167,9 +173,18 @@ impl State {
             }
             (203, Value::Bool(value)) => {
                 self.config.floating = value;
+                self.background = None;
+                self.overlay = None;
+                self.clear_spin_base();
+                self.frost = None;
+                self.card_cache.clear();
+                self.window_origin = [i32::MIN, i32::MIN];
+                self.fusion_revision = 0;
+                self.save_floating();
                 unsafe {
                     PostMessageW(self.hwnd, WM_APP + 82, 0, 0);
                 }
+                return true;
             }
             _ => return false,
         }

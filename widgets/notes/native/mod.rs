@@ -4,6 +4,7 @@ mod icons;
 mod layout;
 mod lenses;
 pub mod model;
+mod popout;
 mod richtext;
 mod settings;
 mod theme;
@@ -83,6 +84,7 @@ enum Action {
     Hide,
     Folder,
     Card(String),
+    PopOut(String),
     Pin(String),
     Color(String),
     Delete(String),
@@ -204,6 +206,16 @@ pub unsafe fn translate(msg: &MSG) -> bool {
     let mut class = [0u16; 80];
     let n = GetClassNameW(root, class.as_mut_ptr(), 80);
     let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+    if class == popout::CLASS {
+        let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+        if msg.wParam == VK_ESCAPE as usize
+            || ctrl && matches!(msg.wParam, 0x4e | 0x57 | 0x42 | 0x49 | 0x55 | 0x53)
+        {
+            SendMessageW(root, KEY, msg.wParam, 0);
+            return true;
+        }
+        return false;
+    }
     if class != CLASS && class != "LumenNativeNotesEditor" {
         return false;
     }
@@ -349,6 +361,22 @@ impl Host {
             state.shadow = WindowShadow::new(hwnd);
             state.update_local_blur();
         }
+        popout::register_board(hwnd, root.to_path_buf());
+        if !smoke && !crate::multi_monitor::is_duplicate(hwnd) {
+            let popouts: Vec<model::Note> = s
+                .borrow()
+                .board
+                .notes
+                .iter()
+                .filter(|n| n.popout.as_ref().is_some_and(|p| p.open))
+                .cloned()
+                .collect();
+            for note in popouts {
+                if let Err(e) = popout::open(root, note, None, inspect, smoke) {
+                    crate::logger::warn("notes", format!("failed restoring floating note: {e}"));
+                }
+            }
+        }
         println!(
             "native-notes-ready notes={} pid={}",
             s.borrow().board.notes.len(),
@@ -435,7 +463,7 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         unsafe {
-            let hwnd = {
+            let (hwnd, root, smoke) = {
                 let mut s = self.state.borrow_mut();
                 if let Some(e) = s.editor.take() {
                     e.flush();
@@ -447,8 +475,9 @@ impl Drop for Host {
                 s.shadow.take();
                 s.rich_raster.take();
                 s.text_cache.clear();
-                s.hwnd
+                (s.hwnd, s.root.clone(), s.smoke)
             };
+            popout::unregister_board(hwnd, &root, smoke);
             DestroyWindow(hwnd);
         }
     }
@@ -553,7 +582,20 @@ impl State {
         let blur_changed =
             loaded.blur != self.board.blur || loaded.frosted != self.board.frosted;
         let floating_changed = loaded.floating != self.board.floating;
+        let removed_ids: Vec<String> = self
+            .board
+            .notes
+            .iter()
+            .filter(|old| !loaded.notes.iter().any(|n| n.id == old.id))
+            .map(|old| old.id.clone())
+            .collect();
+        for id in removed_ids {
+            popout::close(&id);
+        }
         self.board = loaded;
+        for note in &self.board.notes {
+            popout::sync_note(note);
+        }
         self.card_cache.clear();
         self.text_cache.clear();
         self.layout_cache = None;
@@ -592,7 +634,9 @@ impl State {
                             || old.body != note.body
                             || old.rtf != note.rtf;
                         let id = note.id.clone();
+                        let updated_note = note.clone();
                         *old = note;
+                        popout::sync_note(&updated_note);
                         self.card_cache.remove(&id);
                         self.text_cache.remove(&id);
                         if layout_changed {
@@ -612,6 +656,102 @@ impl State {
                         SetFocus(self.hwnd);
                     }
                 }
+            }
+        }
+        InvalidateRect(self.hwnd, null(), 0);
+    }
+    unsafe fn process_popout_commands(&mut self) {
+        let is_dup = crate::multi_monitor::is_duplicate(self.hwnd);
+        let commands = popout::take_commands(self.hwnd);
+        if commands.is_empty() {
+            return;
+        }
+        let mut need_save = false;
+        let mut need_bounds = false;
+        let mut flush_now = false;
+        for cmd in commands {
+            match cmd {
+                popout::Command::UpdateNote(mut updated) => {
+                    if self
+                        .editor
+                        .as_ref()
+                        .and_then(|e| e.note_id())
+                        .as_deref()
+                        == Some(updated.id.as_str())
+                    {
+                        if let Some(e) = self.editor.take() {
+                            drop(e);
+                        }
+                        self.edit_order = None;
+                    }
+                    if let Some(existing) = self.board.notes.iter_mut().find(|n| n.id == updated.id)
+                    {
+                        if updated.popout.is_none() {
+                            updated.popout = existing.popout.clone();
+                        }
+                        *existing = updated.clone();
+                        self.card_cache.remove(&updated.id);
+                        self.text_cache.remove(&updated.id);
+                        self.layout_cache = None;
+                        need_save = true;
+                    }
+                }
+                popout::Command::UpdateBounds { id, bounds } => {
+                    if let Some(existing) = self.board.notes.iter_mut().find(|n| n.id == id) {
+                        if !bounds.open {
+                            flush_now = true;
+                        }
+                        existing.popout = Some(bounds);
+                        self.card_cache.remove(&id);
+                        need_bounds = true;
+                    }
+                }
+                popout::Command::CreateNew { anchor_rect } => {
+                    if !is_dup {
+                        self.finish_editor();
+                        match self.board.create() {
+                            Ok(id) => {
+                                self.query.clear();
+                                self.scroll.snap(0.);
+                                need_save = true;
+                                if let Some(note) =
+                                    self.board.notes.iter().find(|n| n.id == id).cloned()
+                                {
+                                    let inspect = (GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)
+                                        as u32
+                                        & WS_EX_APPWINDOW)
+                                        != 0;
+                                    if let Err(e) = popout::open(
+                                        &self.root,
+                                        note,
+                                        Some(popout::Anchor::Cascade([
+                                            anchor_rect[0],
+                                            anchor_rect[1],
+                                        ])),
+                                        inspect,
+                                        self.smoke,
+                                    ) {
+                                        self.status = e;
+                                    }
+                                }
+                            }
+                            Err(e) => self.status = e,
+                        }
+                    }
+                }
+                popout::Command::Closed(id) => {
+                    self.card_cache.remove(&id);
+                }
+            }
+        }
+        if !is_dup {
+            if need_save {
+                self.schedule();
+            } else if need_bounds {
+                self.schedule_bounds_only();
+            }
+            if flush_now {
+                self.flush();
             }
         }
         InvalidateRect(self.hwnd, null(), 0);
@@ -812,6 +952,9 @@ impl State {
             None
         };
         if let Some(name) = removed_name {
+            if let Some(note) = self.board.notes.iter().find(|n| n.id == note_id) {
+                popout::sync_note(note);
+            }
             self.sync_editor_images(&note_id);
             let still_used = self
                 .board
@@ -858,6 +1001,7 @@ impl State {
                 let insert_at = target_idx.min(note.images.len());
                 note.images.insert(insert_at, img);
                 note.updated_at = model::now();
+                popout::sync_note(note);
                 self.selected_image = Some((from_id.to_string(), insert_at));
                 self.sync_editor_images(from_id);
                 self.card_cache.remove(from_id);
@@ -883,6 +1027,10 @@ impl State {
                 dst.images.push(name);
                 dst.updated_at = model::now();
                 let new_idx = dst.images.len() - 1;
+                popout::sync_note(dst);
+                if let Some(src) = self.board.notes.iter().find(|n| n.id == from_id) {
+                    popout::sync_note(src);
+                }
                 self.selected_image = Some((target_id.clone(), new_idx));
                 self.sync_editor_images(from_id);
                 self.sync_editor_images(&target_id);
@@ -896,7 +1044,9 @@ impl State {
         }
     }
     unsafe fn bounds(&mut self) {
-        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi) {
+        if crate::multi_monitor::record_duplicate_bounds(self.hwnd, self.dpi)
+            || crate::multi_monitor::is_primary_displaced("notes")
+        {
             return;
         }
         let mut r: RECT = zeroed();
@@ -907,6 +1057,7 @@ impl State {
             ((r.bottom - r.top) as f32 / self.dpi).round() as i32,
         ];
         self.schedule_bounds_only();
+        crate::multi_monitor::record_primary_bounds(self.hwnd, "notes", self.dpi);
     }
     unsafe fn hide(&mut self) {
         let was_visible = IsWindowVisible(self.hwnd) != 0;
@@ -1080,6 +1231,7 @@ impl State {
         if let Some(note) = self.board.notes.iter_mut().find(|n| n.id == id) {
             note.images.extend(added);
             note.updated_at = model::now();
+            popout::sync_note(note);
         }
         self.sync_editor_images(&id);
         self.card_cache.remove(&id);
@@ -1092,6 +1244,7 @@ impl State {
         match &self.hover {
             Some(
                 Action::Card(id)
+                | Action::PopOut(id)
                 | Action::Pin(id)
                 | Action::Delete(id)
                 | Action::Color(id)
@@ -1344,12 +1497,30 @@ impl State {
                         Action::Delete(id)
                     } else if p[0] > r[2] - 70. {
                         Action::Pin(id)
+                    } else if p[0] > r[2] - 102. {
+                        Action::PopOut(id)
                     } else {
                         Action::Card(id)
                     }
                 } else {
                     Action::Card(id)
                 });
+            }
+        }
+        None
+    }
+    unsafe fn hit_card_header_strip(&mut self, p: [f32; 2]) -> Option<String> {
+        if p[1] < self.viewport()[0] || p[1] > self.viewport()[1] {
+            return None;
+        }
+        let strip_h = self.type_scale().top.min(34.);
+        for (id, r) in self.layout() {
+            if inside(p, r)
+                && p[1] < r[1] + strip_h
+                && p[0] >= r[0] + 38.
+                && p[0] <= r[2] - 102.
+            {
+                return Some(id);
             }
         }
         None
@@ -1413,6 +1584,27 @@ impl State {
                 }
             }
             Action::Card(id) => self.open_editor(Some(id)),
+            Action::PopOut(id) => {
+                self.finish_editor();
+                if let Some(note) = self.board.notes.iter().find(|n| n.id == id).cloned() {
+                    let mut wr: RECT = zeroed();
+                    GetWindowRect(self.hwnd, &mut wr);
+                    let inspect =
+                        (GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW) != 0;
+                    match popout::open(
+                        &self.root,
+                        note,
+                        Some(popout::Anchor::Beside([wr.left, wr.top, wr.right, wr.bottom])),
+                        inspect,
+                        self.smoke,
+                    ) {
+                        Ok(_) => {
+                            self.card_cache.remove(&id);
+                        }
+                        Err(e) => self.status = e,
+                    }
+                }
+            }
             Action::Color(id) => {
                 self.finish_editor();
                 self.palette_note = if self.palette_note.as_ref() == Some(&id) {
@@ -1427,6 +1619,7 @@ impl State {
                     if let Some(color) = model::COLORS.get(index) {
                         note.color = (*color).into();
                         note.updated_at = model::now();
+                        popout::sync_note(note);
                         self.schedule();
                     }
                 }
@@ -1437,11 +1630,13 @@ impl State {
                     match a {
                         Action::Pin(_) => self.board.notes[i].pinned = !self.board.notes[i].pinned,
                         _ => {
+                            popout::close(&id);
                             self.undo = Some(self.board.notes.remove(i));
                         }
                     }
                     if let Some(n) = self.board.notes.iter_mut().find(|n| n.id == id) {
                         n.updated_at = model::now();
+                        popout::sync_note(n);
                     }
                     self.schedule();
                 }
@@ -1536,6 +1731,8 @@ impl State {
         tiny: bool,
         number: Option<usize>,
         hover_t: f32,
+        popped_out: bool,
+        popout_hover: bool,
         pin_hover: bool,
         delete_hover: bool,
         type_scale: &typography::Metrics,
@@ -1612,6 +1809,15 @@ impl State {
         }
         let icon_y = y + if tiny { 8. } else { 12. };
         icons::bead(c, x + 14., icon_y, color);
+        icons::popout(
+            c,
+            (right - 98.).max(x + 40.),
+            icon_y,
+            card_ink,
+            popped_out,
+            hover_t,
+            popout_hover,
+        );
         icons::pin(
             c,
             right - 66.,
@@ -2210,11 +2416,14 @@ impl State {
                     .editor
                     .as_ref()
                     .is_some_and(|e| e.note_id().as_deref() == Some(id.as_str()));
+                let popped_out = popout::is_open(id);
+                let popout_hover =
+                    !scrolling && self.hover.as_ref() == Some(&Action::PopOut(id.clone()));
                 let pin_hover = !scrolling && self.hover.as_ref() == Some(&Action::Pin(id.clone()));
                 let delete_hover =
                     !scrolling && self.hover.as_ref() == Some(&Action::Delete(id.clone()));
                 let number = (index && !tiny).then_some(pos + 1);
-                if !has_editor && hover_t <= 0.001 && !pin_hover && !delete_hover {
+                if !has_editor && hover_t <= 0.001 && !popout_hover && !pin_hover && !delete_hover {
                     use std::hash::{Hash, Hasher};
                     let pad_px = if honey {
                         (3. * self.dpi).ceil() as u32
@@ -2234,13 +2443,14 @@ impl State {
                     }
                     let day = icons::note_day(note.updated_at);
                     let card_key = format!(
-                        "{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{}",
+                        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{}",
                         cw_px,
                         ch_px,
                         self.dpi.to_bits(),
                         self.board.design,
                         color,
                         note.pinned,
+                        popped_out,
                         ink,
                         muted,
                         number,
@@ -2294,6 +2504,8 @@ impl State {
                                     tiny,
                                     number,
                                     0.,
+                                    popped_out,
+                                    false,
                                     false,
                                     false,
                                     &type_scale,
@@ -2390,6 +2602,8 @@ impl State {
                     tiny,
                     number,
                     hover_t,
+                    popped_out,
+                    popout_hover,
                     pin_hover,
                     delete_hover,
                     &type_scale,
@@ -2732,7 +2946,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         WM_LBUTTONDBLCLK => {
             let dpi = s.dpi;
-            if s.hit(point(l).map(|v| v / dpi)).is_none() {
+            let p = point(l).map(|v| v / dpi);
+            if let Some(id) = s.hit_card_header_strip(p) {
+                s.action(Action::PopOut(id));
+            } else if s.hit(p).is_none() {
                 s.action(Action::New);
             }
             0
@@ -2876,6 +3093,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             s.consume();
             0
         }
+        popout::POPOUT_SYNC => {
+            s.process_popout_commands();
+            0
+        }
         settings::MESSAGE => {
             s.settings_changed();
             0
@@ -2990,7 +3211,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                     s.list_base = None;
                     s.background_key.clear();
                     s.update_local_blur();
-                    s.bounds();
                 }
                 if let Some(host) = &mut s.settings {
                     host.refit();
@@ -3019,9 +3239,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            if let Ok(mut s) = (*ptr).try_borrow_mut() {
-                s.bounds();
-            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -3969,6 +4186,395 @@ mod tests {
                 );
                 s.hide();
             }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn popout_button_and_header_strip_hit_targets_are_distinct() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-popout-hit-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                s.board.create().unwrap();
+                let id = s.board.notes[0].id.clone();
+                SetWindowPos(
+                    s.hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    (360. * s.dpi).round() as i32,
+                    (420. * s.dpi).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let r = s.layout()[0].1;
+                let y = r[1] + 16.;
+                assert_eq!(s.hit([r[0] + 20., y]), Some(Action::Color(id.clone())));
+                assert_eq!(s.hit([r[2] - 20., y]), Some(Action::Delete(id.clone())));
+                assert_eq!(s.hit([r[2] - 50., y]), Some(Action::Pin(id.clone())));
+                assert_eq!(s.hit([r[2] - 86., y]), Some(Action::PopOut(id.clone())));
+                assert_eq!(s.hit([r[0] + 80., y]), Some(Action::Card(id.clone())));
+                assert_eq!(
+                    s.hit_card_header_strip([r[0] + 80., y]),
+                    Some(id.clone())
+                );
+                assert_eq!(s.hit_card_header_strip([r[2] - 86., y]), None);
+                assert_eq!(s.hit_card_header_strip([r[0] + 20., y]), None);
+                s.hide();
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn popout_window_is_topmost_unowned_and_reuses_hwnd_per_note() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-popout-topmost-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            let id = {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                let id = s.board.create().unwrap();
+                s.board.notes[0].body = "Floating note".into();
+                s.action(Action::PopOut(id.clone()));
+                id
+            };
+            assert!(popout::is_open(&id));
+            let pop_hwnd = popout::open(&root, host.state.borrow().board.notes[0].clone(), None, true, true).unwrap();
+            assert_ne!(
+                GetWindowLongPtrW(pop_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0,
+                "Floating sticky note must be WS_EX_TOPMOST"
+            );
+            assert!(!crate::desktop_layer::contains(pop_hwnd));
+            assert_eq!(GetWindowLongPtrW(pop_hwnd, GWLP_HWNDPARENT), 0);
+            {
+                let mut s = host.state.borrow_mut();
+                s.action(Action::PopOut(id.clone()));
+            }
+            let second_hwnd = popout::open(&root, host.state.borrow().board.notes[0].clone(), None, true, true).unwrap();
+            assert_eq!(pop_hwnd, second_hwnd);
+            drop(host);
+            assert!(!popout::is_open(&id));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn popout_two_way_sync_and_close_preserves_widget_note() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-popout-sync-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            let id = {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                let id = s.board.create().unwrap();
+                s.board.notes[0].body = "Initial text".into();
+                s.action(Action::PopOut(id.clone()));
+                id
+            };
+            let pop_hwnd = popout::open(&root, host.state.borrow().board.notes[0].clone(), None, true, true).unwrap();
+            // Edit text in the floating note and verify board receives it.
+            let updated_note = {
+                let mut n = host.state.borrow().board.notes[0].clone();
+                n.body = "Edited from floating".into();
+                n
+            };
+            // Simulate editing via RichEdit in popout window:
+            let input_host = GetWindow(pop_hwnd, GW_CHILD);
+            let edit_hwnd = GetWindow(input_host, GW_CHILD);
+            assert!(!edit_hwnd.is_null());
+            SetWindowTextW(edit_hwnd, wide(&updated_note.body).as_ptr());
+            {
+                let mut s = host.state.borrow_mut();
+                s.process_popout_commands();
+                assert_eq!(s.board.notes[0].body, "Edited from floating");
+                // Change color from board and sync to popout.
+                s.action(Action::PickColor(id.clone(), 2)); // "sky"
+                assert_eq!(s.board.notes[0].color, "sky");
+            }
+            // Close floating note via WM_CLOSE and confirm widget still keeps the duplicate note.
+            SendMessageW(pop_hwnd, WM_CLOSE, 0, 0);
+            assert!(!popout::is_open(&id));
+            assert_eq!(IsWindow(pop_hwnd), 0);
+            {
+                let mut s = host.state.borrow_mut();
+                s.process_popout_commands();
+                assert_eq!(s.board.notes.len(), 1);
+                assert_eq!(s.board.notes[0].body, "Edited from floating");
+                assert_eq!(s.board.notes[0].color, "sky");
+                assert!(s.board.notes[0].popout.as_ref().is_some_and(|p| !p.open));
+                s.hide();
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn hiding_board_keeps_popout_alive_and_deleting_note_closes_popout() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-popout-hide-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            let id = {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                let id = s.board.create().unwrap();
+                s.action(Action::PopOut(id.clone()));
+                id
+            };
+            assert!(popout::is_open(&id));
+            host.hide();
+            assert!(
+                popout::is_open(&id),
+                "Hiding the board widget must keep floating sticky notes open"
+            );
+            {
+                let mut s = host.state.borrow_mut();
+                s.action(Action::Delete(id.clone()));
+            }
+            assert!(
+                !popout::is_open(&id),
+                "Deleting the note from the board must close its floating window"
+            );
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn popout_scrollbar_appears_when_resized_small_and_scrolls_content() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-popout-scroll-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            let id = {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                let id = s.board.create().unwrap();
+                let lines: String = (1..=24).map(|i| format!("Line {i}<br>")).collect();
+                s.board.notes[0].body = lines;
+                s.board.notes[0].color = "mint".into();
+                s.action(Action::PopOut(id.clone()));
+                id
+            };
+            let pop_hwnd = popout::open(
+                &root,
+                host.state.borrow().board.notes[0].clone(),
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+            let dpi = crate::geometry::window_dpi(pop_hwnd).max(1.);
+            SetWindowPos(
+                pop_hwnd,
+                null_mut(),
+                0,
+                0,
+                (model::POPOUT_MIN_W as f32 * dpi).round() as i32,
+                (model::POPOUT_MIN_H as f32 * dpi).round() as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let (val0, max0, bar0, rich_y0, bgra, _) = popout::test_paint_and_inspect(&id).unwrap();
+            assert_eq!(val0, 0.);
+            assert!(max0 > 20., "Long note in minimum popout must overflow: max={max0}");
+            assert!(bar0.is_some(), "Scrollbar thumb must appear on overflow");
+            assert_eq!(rich_y0, 0);
+            // Opaque mint-tinted widget card center pixel: alpha=255 and G dominates R/B.
+            assert_eq!(bgra[3], 255);
+            assert!(
+                bgra[1] > bgra[2] + 6,
+                "Opaque mint tint should match widget card color: bgra={bgra:?}"
+            );
+
+            popout::test_scroll_by(&id, 60.);
+            let (val1, _, bar1, rich_y1, _, _) = popout::test_paint_and_inspect(&id).unwrap();
+            assert!(val1 > 50., "Scroll value should advance: {val1}");
+            assert!(rich_y1 > 0, "RichEdit scroll pos should advance: {rich_y1}");
+            assert!(bar1.unwrap()[1] > bar0.unwrap()[1], "Scrollbar thumb must move down");
+
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn popout_status_bar_drag_moves_window_smoothly_and_card_popout_fades_on_idle() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-popout-drag-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            let id = {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                let id = s.board.create().unwrap();
+                s.board.notes[0].color = "sky".into();
+                s.paint();
+                let r = s.layout()[0].1;
+                // Unhovered card must fade out the pop-out icon identically to pin & trash.
+                assert_eq!(s.card_hover(&id, s.now()), 0.);
+                let frame = s.frame.as_ref().unwrap().snapshot();
+                let fw = s.frame.as_ref().unwrap().width as usize;
+                let ix = ((r[2] - 90.) * s.dpi).round() as usize;
+                let iy = ((r[1] + 18.) * s.dpi).round() as usize;
+                let px_pop = frame[(iy * fw + ix) * 4];
+                let px_adj = frame[(iy * fw + ((r[2] - 110.) * s.dpi).round() as usize) * 4];
+                assert!(
+                    px_pop.abs_diff(px_adj) <= 4,
+                    "Idle card pop-out icon must fade out when not hovered (pop={px_pop}, adj={px_adj})"
+                );
+                s.action(Action::PopOut(id.clone()));
+                id
+            };
+            let pop_hwnd = popout::open(
+                &root,
+                host.state.borrow().board.notes[0].clone(),
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+            let dpi = crate::geometry::window_dpi(pop_hwnd).max(1.);
+            let mut wr: RECT = zeroed();
+            GetWindowRect(pop_hwnd, &mut wr);
+            let x = (wr.right - wr.left) / 2;
+            let y = (20. * dpi).round() as i32;
+            let lparam = (((y as i16 as u16) as usize) << 16) | (x as i16 as u16) as usize;
+            SendMessageW(pop_hwnd, WM_LBUTTONDOWN, 1, lparam as isize);
+            assert!(popout::test_is_dragging(&id));
+            SendMessageW(pop_hwnd, WM_LBUTTONUP, 0, lparam as isize);
+            assert!(!popout::test_is_dragging(&id));
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn popout_typing_new_lines_auto_scrolls_to_keep_caret_visible() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-popout-autoscroll-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            let (id, note) = {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                let id = s.board.create().unwrap();
+                s.board.notes[0].body = "Line 1".into();
+                s.board.notes[0].popout = Some(model::PopoutBounds {
+                    x: 120,
+                    y: 120,
+                    width: model::POPOUT_MIN_W,
+                    height: model::POPOUT_MIN_H,
+                    open: true,
+                });
+                (id, s.board.notes[0].clone())
+            };
+            let pop_hwnd = popout::open(&root, note, None, true, true).unwrap();
+            let edit_hwnd = popout::test_edit_hwnd(&id).unwrap();
+            let (_, _, _, initial_rich_y, _, _) = popout::test_paint_and_inspect(&id).unwrap();
+            assert_eq!(initial_rich_y, 0);
+
+            // Simulate placing caret at end and typing 20+ new lines so content overflows.
+            let extra = (2..=24)
+                .map(|i| format!("\r\nTyped line {i}"))
+                .collect::<String>();
+            let wide: Vec<u16> = extra.encode_utf16().chain(std::iter::once(0)).collect();
+            SendMessageW(edit_hwnd, 0x00B1 /* EM_SETSEL */, usize::MAX, -1isize);
+            SendMessageW(
+                edit_hwnd,
+                0x00C2, /* EM_REPLACESEL */
+                1,
+                wide.as_ptr() as isize,
+            );
+            // Send POPOUT_REDRAW(w=1) as keyboard typing does in popout_input_proc.
+            SendMessageW(pop_hwnd, WM_APP + 109, 1, 0);
+
+            let (scroll_val, scroll_max, bar, rich_y, _, _) =
+                popout::test_paint_and_inspect(&id).unwrap();
+            assert!(
+                scroll_max > 0. && scroll_val > 0. && rich_y > 0,
+                "Typing past viewport must auto-scroll floating note (val={scroll_val}, max={scroll_max}, rich_y={rich_y})"
+            );
+            assert!(
+                bar.is_some(),
+                "Scrollbar should appear after typing overflowing text"
+            );
+
+            // Manual scroll back to top with non-keyboard redraw (w=0) must NOT snap back to caret.
+            popout::test_scroll_by(&id, -9999.);
+            SendMessageW(pop_hwnd, WM_APP + 109, 0, 0);
+            let (after_manual, _, _, after_rich_y, _, _) =
+                popout::test_paint_and_inspect(&id).unwrap();
+            assert_eq!(after_manual, 0.);
+            assert_eq!(after_rich_y, 0);
+
+            popout::close(&id);
             drop(host);
             let _ = std::fs::remove_dir_all(&root);
         }

@@ -206,17 +206,16 @@ fn logical_id(l: &CcdLink) -> String {
     let Ok(s) = store().lock() else {
         return l.source.clone();
     };
-    s.entries
-        .iter()
-        .find(|(_, v)| v.monitor_path == l.monitor)
-        .map(|(k, _)| k.clone())
-        .unwrap_or_else(|| {
-            if s.entries.contains_key(&l.source) {
-                format!("ccd:{}", l.monitor)
-            } else {
-                l.source.clone()
-            }
-        })
+    if !l.monitor.is_empty() {
+        if let Some((k, _)) = s.entries.iter().find(|(_, v)| v.monitor_path == l.monitor) {
+            return k.clone();
+        }
+    }
+    if !l.monitor.is_empty() && s.entries.contains_key(&l.source) {
+        format!("ccd:{}", l.monitor)
+    } else {
+        l.source.clone()
+    }
 }
 
 pub unsafe fn remember(id: &str, l: &CcdLink) -> Result<(), String> {
